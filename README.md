@@ -1,6 +1,6 @@
-# Instagram Scraper Pro
+# IG Scraper
 
-A Windows desktop application that collects publicly visible Instagram profile data
+A Qt desktop application that collects publicly visible Instagram profile data
 (username, email, phone, country, posts, etc.) from followers/following lists
 and exports to Google Sheets + optional webhook.
 
@@ -25,7 +25,7 @@ and exports to Google Sheets + optional webhook.
 
 ## Requirements
 
-### On your Windows machine
+### On your machine
 - Python 3.10+
 - Node.js 18+ (for Appium)
 - ADB (Android Debug Bridge) — in PATH
