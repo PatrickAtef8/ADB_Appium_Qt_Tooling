@@ -1,0 +1,23 @@
+# ================================================
+# PYTHON DEPENDENCIES (pip)
+# Run: pip install -r requirements.txt
+#
+# IMPORTANT:
+# After this, you STILL need to run these commands:
+#   npm install -g appium@3.2.2
+#   appium driver install uiautomator2@5.0.7
+# ================================================
+
+PyQt6>=6.6.0
+Appium-Python-Client>=3.1.0
+gspread>=6.0.0
+google-auth>=2.27.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+pyinstaller>=6.4.0
+python-dotenv>=1.0.0
+selenium>=4.18.0
+PyQt6-Fluent-Widgets>=1.11.1
+qtawesome>=1.4.1
+qtpy>=2.4.3
+av>=12.0.0           # PyAV: H.264 decode for embedded screen mirror

@@ -1,0 +1,72 @@
+{
+  "sheet_id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
+  "sheet_tab": "Sheet1",
+  "credentials_path": "/home/patrick/p2/upwork/upworkautomation/upworkAutomation/assets/credentials.json",
+  "webhook_url": "",
+  "filters": {
+    "skip_no_bio": false,
+    "skip_private": false,
+    "skip_no_profile_pic": false,
+    "skip_no_contact": false,
+    "min_posts": 3,
+    "require_recent_post_days": 366,
+    "keywords": [],
+    "only_keywords": []
+  },
+  "delays": {
+    "between_profiles_min": 1.0,
+    "between_profiles_max": 4.0,
+    "between_scrolls_min": 1.0,
+    "between_scrolls_max": 3.0,
+    "run_min_profiles": 3,
+    "run_max_profiles": 10,
+    "rest_min_minutes": 30,
+    "rest_max_minutes": 60,
+    "session_break_every": 3,
+    "session_break_duration": 30
+  },
+  "schedule": {
+    "enabled": false,
+    "start_hour": 9,
+    "start_minute": 0,
+    "end_hour": 10,
+    "end_minute": 0
+  },
+  "appium": {
+    "host": "127.0.0.1",
+    "port": 4723
+  },
+  "devices": [
+    {
+      "serial": "emulator-5554"
+    },
+    {
+      "serial": null
+    },
+    {
+      "serial": null
+    }
+  ],
+  "target_list": [
+    "adidas",
+    "nike",
+    "apple"
+  ],
+  "blacklist": [],
+  "last_target": "adidas",
+  "last_mode": "following",
+  "last_count": 5,
+  "last_device": "",
+  "targets_per_phone": [
+    [
+      "cbc"
+    ],
+    [],
+    []
+  ],
+  "sheets": {
+    "id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
+    "tab": "Sheet1",
+    "creds": "/home/patrick/p2/upwork/upworkautomation/upworkAutomation/assets/credentials.json"
+  }
+}
