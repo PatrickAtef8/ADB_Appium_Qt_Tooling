@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import csv
 import os
 import subprocess
@@ -11,11 +9,11 @@ from datetime import datetime, time as dtime
 from typing import Dict, List, Optional, Tuple
 
 from PyQt6.QtCore    import Qt, QThread, QTime, pyqtSignal, QObject
-from PyQt6.QtGui     import QFont
+from PyQt6.QtGui     import QFont, QColor, QIcon
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QMessageBox, QSizePolicy, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QRadioButton, QButtonGroup
 )
 
 from qfluentwidgets import (
@@ -45,42 +43,38 @@ from src.utils.filters              import parse_keywords
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Typography helpers
+# Typography helpers - Scaled Up
 # ─────────────────────────────────────────────────────────────────────────────
 
 class T:
     @staticmethod
     def title():
-        f = QFont("Segoe UI"); f.setPointSize(15); f.setWeight(QFont.Weight.Bold); return f
+        f = QFont("Inter, Segoe UI", 22); f.setWeight(QFont.Weight.Bold); return f
     @staticmethod
     def heading():
-        f = QFont("Segoe UI"); f.setPointSize(12); f.setWeight(QFont.Weight.DemiBold); return f
+        f = QFont("Inter, Segoe UI", 15); f.setWeight(QFont.Weight.DemiBold); return f
     @staticmethod
     def body():
-        f = QFont("Segoe UI"); f.setPointSize(10); return f
+        f = QFont("Inter, Segoe UI", 12); return f
     @staticmethod
     def caption():
-        f = QFont("Segoe UI"); f.setPointSize(9); return f
+        f = QFont("Inter, Segoe UI", 11); return f
     @staticmethod
     def button():
-        f = QFont("Segoe UI"); f.setPointSize(10); f.setWeight(QFont.Weight.DemiBold); return f
+        f = QFont("Inter, Segoe UI", 12); f.setWeight(QFont.Weight.Medium); return f
     @staticmethod
     def mono():
-        f = QFont("Consolas"); f.setPointSize(9); return f
+        f = QFont("JetBrains Mono, Consolas", 11); return f
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AccountDetectionWorker — detects Instagram accounts in background thread
+# AccountDetectionWorker
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AccountDetectionWorker(QThread):
     """
     Runs get_instagram_accounts() in a background thread so the UI never
     freezes while waiting for ADB + uiautomator to respond.
-
-    Signals:
-      finished(row_idx, accounts)  — emitted when detection completes
-      error(row_idx)               — emitted if detection fails entirely
     """
     finished = pyqtSignal(int, list)
     error    = pyqtSignal(int)
@@ -103,9 +97,6 @@ class AccountSwitchWorker(QThread):
     """
     Runs switch_instagram_account() in a background thread so the UI
     never freezes during the switch process.
-
-    Signals:
-      finished(row_idx, success)  — emitted when switch attempt completes
     """
     finished = pyqtSignal(int, bool)
 
@@ -124,16 +115,18 @@ class AccountSwitchWorker(QThread):
             self.finished.emit(self.row_idx, False)
 
 
-# PhoneWorker — restored working logic from v1, signals unchanged
+# ─────────────────────────────────────────────────────────────────────────────
+# PhoneWorker
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PhoneWorkerSignals(QObject):
-    log      = pyqtSignal(str)
-    account  = pyqtSignal(dict)
-    progress = pyqtSignal(int, int)
-    finished = pyqtSignal(int, int)
-    error    = pyqtSignal(int, str)
-    status   = pyqtSignal(int, str)
+    log             = pyqtSignal(str)
+    account         = pyqtSignal(dict)
+    progress        = pyqtSignal(int, int)
+    finished        = pyqtSignal(int, int)
+    error           = pyqtSignal(int, str)
+    status          = pyqtSignal(int, str)
+    account_switched = pyqtSignal(int, str)   # (phone_index, new_account_name)
 
 
 class PhoneWorker(QThread):
@@ -168,13 +161,19 @@ class PhoneWorker(QThread):
             self._log(f"📱 Starting Appium session on port {self.appium_port}…")
 
             # ── Detect accounts BEFORE Appium starts ──────────────────────────
-            # get_instagram_accounts uses monkey + uiautomator independently.
-            # It must run before Appium takes control of the device, otherwise
-            # the two sessions conflict.
+            # get_instagram_accounts uses ADB + uiautomator independently.
+            # Must run before Appium takes control to avoid session conflicts.
             self._log("🔍 Detecting Instagram accounts…")
             device_accounts = get_instagram_accounts(self.serial)
             self._log(f"✅ Accounts found: {device_accounts}")
-            acc_idx = 0
+            # get_instagram_accounts() always returns the currently active
+            # account first (Instagram shows it at the top of its switcher).
+            # We build a stable ordered list and track position by name so
+            # the round-robin is immune to list-order changes across calls.
+            # current_account  = the account that is active RIGHT NOW.
+            # acc_idx          = its position in device_accounts.
+            current_account = device_accounts[0] if device_accounts else ""
+            acc_idx         = 0   # index of current_account in device_accounts
 
             self._controller = AppiumController(
                 host=cfg["appium"]["host"], port=self.appium_port
@@ -201,19 +200,110 @@ class PhoneWorker(QThread):
                 else:
                     self._log(f"⚠️ Duplicate skipped: @{acc['username']}")
 
-            self._scraper = InstagramScraper(
-                controller=self._controller,
-                on_account_found=on_account,
-                on_log=self._log,
-                on_progress=lambda d, t: self.signals.progress.emit(d, t),
-            )
-
             delays         = cfg["delays"]
             filters        = cfg["filters"]
             mode           = cfg.get("last_mode", "followers")
             max_per_target = int(cfg.get("last_count", 100))
             schedule       = cfg.get("schedule", {})
-            switch_every   = int(delays.get("session_break_every", 100))
+
+            switch_mode    = delays.get("switch_mode", "profiles")   # "profiles" | "hours"
+            switch_every   = int(delays.get("session_break_every", 100))   # used when mode=profiles
+            switch_hours   = float(delays.get("switch_hours", 1))          # used when mode=hours
+
+            since_last_switch  = 0                    # profile counter (mode=profiles)
+            last_switch_time   = time.time()          # wall-clock anchor (mode=hours)
+
+            def _check_and_switch(collected_so_far: int):
+                """
+                Called by the scraper after every collected profile.
+                Supports two switch modes:
+                  • profiles — switch after N collected profiles (original behaviour)
+                  • hours    — switch after N hours of wall-clock time
+
+                The switching mechanics are identical in both cases:
+                  1. Round-robin to the next account.
+                  2. Appium dismisses the list and navigates to Home.
+                  3. Appium session is released so ADB has the accessibility lock.
+                  4. switch_instagram_account() does the pure-ADB switch.
+                  5. Appium session is reattached for continued scraping.
+                """
+                nonlocal since_last_switch, last_switch_time, acc_idx, current_account
+
+                if len(device_accounts) <= 1 or self._stop_flag:
+                    since_last_switch += 1
+                    return
+
+                since_last_switch += 1
+
+                # ── Decide whether it's time to switch ───────────────────────
+                if switch_mode == "hours":
+                    elapsed_hours = (time.time() - last_switch_time) / 3600.0
+                    should_switch = (switch_hours > 0 and elapsed_hours >= switch_hours)
+                else:
+                    should_switch = (switch_every > 0 and since_last_switch >= switch_every)
+
+                if not should_switch:
+                    return
+
+                # ── Strict round-robin: advance by 1 position ────────────────
+                next_idx       = (acc_idx + 1) % len(device_accounts)
+                target_account = device_accounts[next_idx]
+
+                if switch_mode == "hours":
+                    elapsed_str = f"{(time.time() - last_switch_time) / 3600:.1f}h"
+                    self._log(
+                        f"🔄 Auto-switching from [{current_account}] (idx={acc_idx}) "
+                        f"→ [{target_account}] (idx={next_idx}) "
+                        f"after {elapsed_str}…"
+                    )
+                else:
+                    self._log(
+                        f"🔄 Auto-switching from [{current_account}] (idx={acc_idx}) "
+                        f"→ [{target_account}] (idx={next_idx}) "
+                        f"after {since_last_switch} profiles…"
+                    )
+
+                # Use Appium to dismiss the list and go to Home feed
+                if self._scraper:
+                    self._scraper._appium_navigate_to_home()
+
+                # Release UiAutomator2 lock so ADB gets clean accessibility access
+                self._log("🔓 Releasing Appium session for ADB switch…")
+                self._controller.release_for_adb()
+
+                success = switch_instagram_account(
+                    self.serial, target_account, current_account
+                )
+
+                # Reconnect Appium for continued scraping
+                self._log("🔗 Reconnecting Appium session after switch…")
+                self._controller.reattach_after_adb()
+
+                if success:
+                    acc_idx         = next_idx
+                    current_account = target_account
+                    self._log(f"✅ Switched to [{target_account}] (idx={acc_idx}), will reopen list…")
+                else:
+                    self._log(f"⚠️ Switch to [{target_account}] failed — keeping current account [{current_account}]")
+
+                # Notify UI
+                self.signals.account_switched.emit(self.phone_index, current_account)
+
+                # Tell scraper to re-navigate before next profile
+                if self._scraper:
+                    self._scraper._need_reopen_list = True
+
+                # Reset counters regardless of success
+                since_last_switch = 0
+                last_switch_time  = time.time()
+
+            self._scraper = InstagramScraper(
+                controller=self._controller,
+                on_account_found=on_account,
+                on_log=self._log,
+                on_progress=lambda d, t: self.signals.progress.emit(d, t),
+                on_switch_check=_check_and_switch,
+            )
 
             for target in self.targets:
                 if self._stop_flag:
@@ -226,17 +316,10 @@ class PhoneWorker(QThread):
                 self._log(f"🎯 Processing target: @{target}")
                 self.signals.status.emit(idx, f"@{target}")
 
-                run_n = min(
-                    random.randint(
-                        int(delays.get("run_min_profiles", 3)),
-                        int(delays.get("run_max_profiles", 10)),
-                    ),
-                    max_per_target,
-                )
                 count = self._scraper.run(
                     target_username=target,
                     mode=mode,
-                    max_count=run_n,
+                    max_count=max_per_target,
                     filters=filters,
                     delays=delays,
                     fetch_details=True,
@@ -245,30 +328,18 @@ class PhoneWorker(QThread):
                 total_collected += count
                 self._log(f"✅ @{target} done — {count} this run, {total_collected} total")
 
-                # ── Auto account switch ───────────────────────────────────────
-                # Fires after each target batch when total_collected crosses
-                # a switch_every boundary. Stops Appium first, switches via
-                # monkey+uiautomator (same logic as manual switch), then
-                # restarts Appium on the new account.
-                if (len(device_accounts) > 1
-                        and total_collected > 0
-                        and switch_every > 0
-                        and total_collected % switch_every == 0):
-                    acc_idx = (acc_idx + 1) % len(device_accounts)
-                    target_account = device_accounts[acc_idx]
-                    self._log(f"🔄 Auto-switching to [{target_account}]…")
-                    self._controller.stop_session()
-                    switch_instagram_account(self.serial, target_account)
-                    self._controller.start_session(self.serial)
-                    self._log(f"✅ Resumed Appium on [{target_account}]")
-                    time.sleep(3)
+                if self._stop_flag:
+                    break
 
-                if target != self.targets[-1] and not self._stop_flag:
+                # Rest between targets (skip for the last target)
+                if (len(self.targets) > 1
+                        and target != self.targets[-1]
+                        and not self._stop_flag):
                     rest_s = random.randint(
-                        int(delays.get("rest_min_minutes", 30)) * 60,
-                        int(delays.get("rest_max_minutes", 60)) * 60,
+                        int(delays.get("rest_min_minutes", 1)) * 60,
+                        int(delays.get("rest_max_minutes", 5)) * 60,
                     )
-                    self._log(f"😴 Resting {rest_s // 60}m {rest_s % 60}s…")
+                    self._log(f"😴 Resting {rest_s // 60}m {rest_s % 60}s before next target…")
                     self._sleep(rest_s)
 
             self.signals.finished.emit(idx, total_collected)
@@ -307,14 +378,16 @@ class PageWidget(ScrollArea):
         super().__init__(parent=parent)
         self.view       = QWidget(self)
         self.vBoxLayout = QVBoxLayout(self.view)
-        self.vBoxLayout.setContentsMargins(30, 18, 30, 30)
-        self.vBoxLayout.setSpacing(14)
+        self.vBoxLayout.setContentsMargins(50, 40, 50, 50)
+        self.vBoxLayout.setSpacing(32)
         self.setWidget(self.view)
         self.setWidgetResizable(True)
         self.setObjectName(title.replace(" ", ""))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
         lbl = TitleLabel(title, self)
         lbl.setFont(T.title())
+        lbl.setStyleSheet("font-size: 28pt; margin-bottom: 15px; background: transparent;")
         self.vBoxLayout.addWidget(lbl)
 
     def add(self, w):          self.vBoxLayout.addWidget(w)
@@ -323,7 +396,7 @@ class PageWidget(ScrollArea):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dashboard page — v2 UI (65/35 split with mirror placeholder)
+# Dashboard page
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DashboardPage(QWidget):
@@ -339,7 +412,6 @@ class DashboardPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # ── LEFT PANEL (65%) ──────────────────────────────────────────────
         left_scroll = ScrollArea(self)
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -347,141 +419,204 @@ class DashboardPage(QWidget):
 
         left_inner = QWidget()
         left_lay   = QVBoxLayout(left_inner)
-        left_lay.setContentsMargins(20, 18, 12, 18)
-        left_lay.setSpacing(12)
+        left_lay.setContentsMargins(40, 40, 30, 40)
+        left_lay.setSpacing(24)
         left_scroll.setWidget(left_inner)
 
         title_lbl = TitleLabel("Dashboard", left_inner)
         title_lbl.setFont(T.title())
+        title_lbl.setStyleSheet("font-size: 28pt; margin-bottom: 15px; background: transparent;")
         left_lay.addWidget(title_lbl)
 
         # ── Device rows ───────────────────────────────────────────────────
         dev_card = CardWidget(left_inner)
         dev_lay  = QVBoxLayout(dev_card)
-        dev_lay.setSpacing(8)
+        dev_lay.setContentsMargins(24, 24, 24, 24)
+        dev_lay.setSpacing(20)
 
         hdr_row = QHBoxLayout()
         h1 = StrongBodyLabel("📱 Connected Phones", dev_card)
         h1.setFont(T.heading())
+        h1.setStyleSheet("background: transparent;")
         hdr_row.addWidget(h1)
         hdr_row.addStretch()
         self.btn_refresh = PushButton(FIF.SYNC, "Refresh", dev_card)
-        self.btn_refresh.setFont(T.button())
-        self.btn_refresh.setFixedHeight(32)
+        self.btn_refresh.setMinimumHeight(40)
+        self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         hdr_row.addWidget(self.btn_refresh)
         dev_lay.addLayout(hdr_row)
 
-        note = CaptionLabel(
-            "Appium starts automatically — no manual command needed.", dev_card
-        )
-        note.setFont(T.caption())
-        dev_lay.addWidget(note)
-
         for i in range(3):
             row = QHBoxLayout()
-            row.setSpacing(6)
-            lbl_num = CaptionLabel(f"Phone {i+1}", dev_card)
-            lbl_num.setFont(T.body()); lbl_num.setFixedWidth(52)
+            row.setSpacing(16)
+
+            lbl_num = StrongBodyLabel(f"P{i+1}", dev_card)
+            lbl_num.setFont(T.body())
+            lbl_num.setFixedWidth(40)
+            lbl_num.setStyleSheet("background: transparent;")
+
             combo_dev = ComboBox(dev_card)
-            combo_dev.setFont(T.body()); combo_dev.setMinimumHeight(32)
+            combo_dev.setFont(T.body())
+            combo_dev.setMinimumHeight(44)
+            combo_dev.setPlaceholderText("Select Device")
             combo_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
             combo_acc = ComboBox(dev_card)
-            combo_acc.setFont(T.caption()); combo_acc.setMinimumHeight(32)
-            combo_acc.setFixedWidth(110); combo_acc.setPlaceholderText("Accounts")
+            combo_acc.setFont(T.body())
+            combo_acc.setMinimumHeight(44)
+            combo_acc.setFixedWidth(160)
+            combo_acc.setPlaceholderText("Accounts")
+
             lbl_port = CaptionLabel(f":{4723 + i}", dev_card)
-            lbl_port.setFont(T.caption()); lbl_port.setFixedWidth(62)
+            lbl_port.setFont(T.caption())
+            lbl_port.setFixedWidth(60)
+            lbl_port.setStyleSheet("background: transparent;")
+
             lbl_status = CaptionLabel("● idle", dev_card)
-            lbl_status.setFont(T.caption()); lbl_status.setFixedWidth(90)
+            lbl_status.setFont(T.caption())
+            lbl_status.setFixedWidth(100)
+            lbl_status.setStyleSheet("background: transparent;")
+
             btn_view = PushButton("👁 View", dev_card)
-            btn_view.setFont(T.button()); btn_view.setFixedWidth(80); btn_view.setFixedHeight(32)
-            row.addWidget(lbl_num); row.addWidget(combo_dev); row.addWidget(combo_acc)
-            row.addWidget(lbl_port); row.addWidget(lbl_status); row.addWidget(btn_view)
+            btn_view.setFont(T.button())
+            btn_view.setMinimumHeight(40)
+            btn_view.setFixedWidth(90)
+            btn_view.setCursor(Qt.CursorShape.PointingHandCursor)
+
+            row.addWidget(lbl_num)
+            row.addWidget(combo_dev)
+            row.addWidget(combo_acc)
+            row.addWidget(lbl_port)
+            row.addWidget(lbl_status)
+            row.addWidget(btn_view)
             dev_lay.addLayout(row)
             self.device_rows.append((combo_dev, combo_acc, lbl_port, lbl_status, btn_view))
+
         left_lay.addWidget(dev_card)
 
         # ── Targets ───────────────────────────────────────────────────────
         tgt_card = CardWidget(left_inner)
         tgt_lay  = QVBoxLayout(tgt_card)
-        tgt_lay.setSpacing(8)
-        tgt_lay.addWidget(StrongBodyLabel("🎯 Targets per Phone", tgt_card))
-        tgt_lay.addWidget(CaptionLabel(
-            "One username per line. Only phones with targets will run.", tgt_card
-        ))
+        tgt_lay.setContentsMargins(24, 24, 24, 24)
+        tgt_lay.setSpacing(16)
+        lbl_tgt = StrongBodyLabel("🎯 Targets per Phone", tgt_card)
+        lbl_tgt.setFont(T.heading())
+        lbl_tgt.setStyleSheet("background: transparent;")
+        tgt_lay.addWidget(lbl_tgt)
+
+        targets_grid = QHBoxLayout()
+        targets_grid.setSpacing(20)
         for i in range(3):
-            row = QHBoxLayout()
-            lbl = StrongBodyLabel(f"P{i+1}:", tgt_card)
-            lbl.setFont(T.body()); lbl.setFixedWidth(28)
+            col = QVBoxLayout()
+            lbl = CaptionLabel(f"Phone {i+1}", tgt_card)
+            lbl.setFont(T.caption())
+            lbl.setStyleSheet("background: transparent;")
             txt = TextEdit(tgt_card)
             txt.setFont(T.body())
             txt.setPlaceholderText("username1\nusername2")
-            txt.setMinimumHeight(72); txt.setMaximumHeight(110)
-            row.addWidget(lbl); row.addWidget(txt)
-            tgt_lay.addLayout(row)
+            txt.setMinimumHeight(140)
+            col.addWidget(lbl)
+            col.addWidget(txt)
+            targets_grid.addLayout(col)
             self.target_rows.append(txt)
+        tgt_lay.addLayout(targets_grid)
         left_lay.addWidget(tgt_card)
 
-        # ── Mode + Count ──────────────────────────────────────────────────
+        # ── Configuration & Controls ──────────────────────────────────────
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(24)
+
+        # Mode & Count Card
         mode_card = CardWidget(left_inner)
-        mode_lay  = QHBoxLayout(mode_card)
-        mode_lay.setSpacing(16)
-        mode_lay.addWidget(CaptionLabel("Mode:", mode_card))
+        mode_lay = QVBoxLayout(mode_card)
+        mode_lay.setContentsMargins(24, 24, 24, 24)
+        lbl_mode = StrongBodyLabel("⚙️ Run Settings", mode_card)
+        lbl_mode.setFont(T.heading())
+        lbl_mode.setStyleSheet("background: transparent;")
+        mode_lay.addWidget(lbl_mode)
+
+        mode_form = QHBoxLayout()
+        lbl_m = CaptionLabel("Mode:", mode_card)
+        lbl_m.setFont(T.body())
+        lbl_m.setStyleSheet("background: transparent;")
+        mode_form.addWidget(lbl_m)
         self.combo_mode = ComboBox(mode_card)
+        self.combo_mode.setFont(T.body())
+        self.combo_mode.setMinimumHeight(40)
         self.combo_mode.addItems(["followers", "following"])
-        self.combo_mode.setFont(T.body()); self.combo_mode.setMinimumHeight(32)
-        mode_lay.addWidget(self.combo_mode)
-        mode_lay.addWidget(CaptionLabel("Max/target:", mode_card))
+        mode_form.addWidget(self.combo_mode)
+        mode_form.addSpacing(15)
+        lbl_mx = CaptionLabel("Max:", mode_card)
+        lbl_mx.setFont(T.body())
+        lbl_mx.setStyleSheet("background: transparent;")
+        mode_form.addWidget(lbl_mx)
         self.spin_count = SpinBox(mode_card)
+        self.spin_count.setFont(T.body())
+        self.spin_count.setMinimumHeight(40)
         self.spin_count.setRange(1, 50000); self.spin_count.setValue(100)
-        self.spin_count.setFont(T.body()); self.spin_count.setMinimumHeight(32)
-        mode_lay.addWidget(self.spin_count)
-        mode_lay.addStretch()
-        left_lay.addWidget(mode_card)
+        mode_form.addWidget(self.spin_count)
+        mode_lay.addLayout(mode_form)
+        bottom_row.addWidget(mode_card, 1)
 
-        # ── Schedule ──────────────────────────────────────────────────────
+        # Schedule Card
         sched_card = CardWidget(left_inner)
-        sched_lay  = QVBoxLayout(sched_card)
-        sched_lay.setSpacing(6)
-        sched_lay.addWidget(StrongBodyLabel("⏰ Working Hours", sched_card))
-        self.chk_schedule = CheckBox("Enable schedule", sched_card)
-        self.chk_schedule.setFont(T.body())
+        sched_lay = QVBoxLayout(sched_card)
+        sched_lay.setContentsMargins(24, 24, 24, 24)
+        self.chk_schedule = CheckBox("Working Hours", sched_card)
+        self.chk_schedule.setFont(T.heading())
+        self.chk_schedule.setStyleSheet("background: transparent;")
         sched_lay.addWidget(self.chk_schedule)
-        row_t = QHBoxLayout()
-        row_t.addWidget(CaptionLabel("From:", sched_card))
+
+        time_row = QHBoxLayout()
         self.time_start = TimeEdit(sched_card)
-        self.time_start.setDisplayFormat("HH:mm"); self.time_start.setMinimumHeight(30)
-        row_t.addWidget(self.time_start)
-        row_t.addWidget(CaptionLabel("To:", sched_card))
+        self.time_start.setFont(T.body())
+        self.time_start.setMinimumHeight(40)
+        self.time_start.setDisplayFormat("HH:mm")
         self.time_end = TimeEdit(sched_card)
-        self.time_end.setDisplayFormat("HH:mm"); self.time_end.setMinimumHeight(30)
-        row_t.addWidget(self.time_end)
-        row_t.addStretch()
-        sched_lay.addLayout(row_t)
-        left_lay.addWidget(sched_card)
+        self.time_end.setFont(T.body())
+        self.time_end.setMinimumHeight(40)
+        self.time_end.setDisplayFormat("HH:mm")
+        time_row.addWidget(self.time_start)
+        lbl_dash = CaptionLabel("-", sched_card)
+        lbl_dash.setStyleSheet("background: transparent;")
+        time_row.addWidget(lbl_dash)
+        time_row.addWidget(self.time_end)
+        sched_lay.addLayout(time_row)
+        bottom_row.addWidget(sched_card, 1)
 
-        # ── Controls ──────────────────────────────────────────────────────
+        left_lay.addLayout(bottom_row)
+
+        # ── Action Buttons ────────────────────────────────────────────────
         ctrl_row = QHBoxLayout()
-        self.btn_start = PrimaryPushButton(FIF.PLAY, "START", left_inner)
-        self.btn_start.setFont(T.button()); self.btn_start.setMinimumHeight(42)
-        self.btn_stop  = PushButton(FIF.CLOSE, "STOP ALL", left_inner)
-        self.btn_stop.setFont(T.button());  self.btn_stop.setMinimumHeight(42)
-        self.btn_stop.setEnabled(False);    self.btn_stop.setObjectName("btn_stop_danger")
-        self.lbl_overall_status = CaptionLabel("Ready", left_inner)
-        self.lbl_overall_status.setFont(T.body())
-        ctrl_row.addWidget(self.btn_start)
-        ctrl_row.addWidget(self.btn_stop)
-        ctrl_row.addSpacing(12)
-        ctrl_row.addWidget(self.lbl_overall_status)
-        ctrl_row.addStretch()
-        left_lay.addLayout(ctrl_row)
-        left_lay.addStretch(1)
+        ctrl_row.setSpacing(20)
+        self.btn_start = PrimaryPushButton(FIF.PLAY, "START SCRAPING", left_inner)
+        self.btn_start.setFont(T.button())
+        self.btn_start.setMinimumHeight(60)
+        self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
 
+        self.btn_stop = PushButton(FIF.CLOSE, "STOP ALL", left_inner)
+        self.btn_stop.setFont(T.button())
+        self.btn_stop.setMinimumHeight(60)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setObjectName("btn_stop_danger")
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.lbl_overall_status = StrongBodyLabel("Ready", left_inner)
+        self.lbl_overall_status.setFont(T.body())
+        self.lbl_overall_status.setStyleSheet("color: #64748b; margin-left: 15px; background: transparent;")
+
+        ctrl_row.addWidget(self.btn_start, 2)
+        ctrl_row.addWidget(self.btn_stop, 1)
+        ctrl_row.addWidget(self.lbl_overall_status, 1)
+        left_lay.addLayout(ctrl_row)
+
+        left_lay.addStretch(1)
         outer.addWidget(left_scroll, stretch=65)
         outer.addStretch(35)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Filters page — v2 UI (added only-keywords field)
+# Filters page
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FiltersPage(PageWidget):
@@ -493,53 +628,43 @@ class FiltersPage(PageWidget):
         # Skip conditions
         skip_card = CardWidget(self)
         skip_lay  = QVBoxLayout(skip_card)
-        skip_lay.setSpacing(8)
-        skip_lay.addWidget(StrongBodyLabel("🚫 Skip Conditions", skip_card))
+        skip_lay.setContentsMargins(30, 30, 30, 30)
+        skip_lay.setSpacing(16)
+        lbl_skip = StrongBodyLabel("🚫 Skip Conditions", skip_card)
+        lbl_skip.setFont(T.heading())
+        lbl_skip.setStyleSheet("background: transparent;")
+        skip_lay.addWidget(lbl_skip)
+
+        conditions_grid = QHBoxLayout()
+        col1 = QVBoxLayout(); col2 = QVBoxLayout()
         self.chk_skip_no_bio     = CheckBox("No bio", skip_card)
         self.chk_skip_private    = CheckBox("Private account", skip_card)
         self.chk_skip_no_pic     = CheckBox("No profile picture", skip_card)
         self.chk_skip_no_contact = CheckBox(
             "No email AND no phone in bio/contact (recommended)", skip_card
         )
+        for c in [self.chk_skip_no_bio, self.chk_skip_private,
+                  self.chk_skip_no_pic, self.chk_skip_no_contact]:
+            c.setFont(T.body()); c.setStyleSheet("background: transparent;")
         self.chk_skip_no_contact.setChecked(True)
-        for chk in [self.chk_skip_no_bio, self.chk_skip_private,
-                    self.chk_skip_no_pic, self.chk_skip_no_contact]:
-            chk.setFont(T.body()); skip_lay.addWidget(chk)
+        col1.addWidget(self.chk_skip_no_bio); col1.addWidget(self.chk_skip_private)
+        col2.addWidget(self.chk_skip_no_pic); col2.addWidget(self.chk_skip_no_contact)
+        conditions_grid.addLayout(col1); conditions_grid.addLayout(col2)
+        skip_lay.addLayout(conditions_grid)
 
         row_p = QHBoxLayout()
-        from PyQt6.QtWidgets import QSpinBox as _FilterSpinBox
-        self.spin_min_posts = _FilterSpinBox(skip_card)
+        self.spin_min_posts = SpinBox(skip_card)
         self.spin_min_posts.setRange(0, 10000)
-        self.spin_min_posts.setFixedWidth(130)
-        self.spin_min_posts.setFixedHeight(32)
-        self.spin_min_posts.setFont(T.body())
-        self.spin_min_posts.setKeyboardTracking(True)
-        self.spin_min_posts.setStyleSheet("""
-            QSpinBox {
-                border: 1px solid #475569; border-radius: 6px;
-                padding: 2px 6px; background: transparent;
-            }
-            QSpinBox:focus { border: 2px solid #3b82f6; }
-        """)
-        self.spin_recent_days = _FilterSpinBox(skip_card)
+        self.spin_min_posts.setFont(T.body()); self.spin_min_posts.setMinimumHeight(40); self.spin_min_posts.setFixedWidth(150)
+        self.spin_recent_days = SpinBox(skip_card)
         self.spin_recent_days.setRange(0, 3650)
         self.spin_recent_days.setValue(365)
-        self.spin_recent_days.setFixedWidth(130)
-        self.spin_recent_days.setFixedHeight(32)
-        self.spin_recent_days.setFont(T.body())
-        self.spin_recent_days.setKeyboardTracking(True)
-        self.spin_recent_days.setStyleSheet("""
-            QSpinBox {
-                border: 1px solid #475569; border-radius: 6px;
-                padding: 2px 6px; background: transparent;
-            }
-            QSpinBox:focus { border: 2px solid #3b82f6; }
-        """)
-        row_p.addWidget(CaptionLabel("Min posts:", skip_card))
-        row_p.addWidget(self.spin_min_posts)
-        row_p.addSpacing(16)
-        row_p.addWidget(CaptionLabel("Post within (days):", skip_card))
-        row_p.addWidget(self.spin_recent_days)
+        self.spin_recent_days.setFont(T.body()); self.spin_recent_days.setMinimumHeight(40); self.spin_recent_days.setFixedWidth(150)
+        lbl_mp = CaptionLabel("Min posts:", skip_card); lbl_mp.setFont(T.body()); lbl_mp.setStyleSheet("background: transparent;")
+        lbl_rd = CaptionLabel("Post within (days):", skip_card); lbl_rd.setFont(T.body()); lbl_rd.setStyleSheet("background: transparent;")
+        row_p.addWidget(lbl_mp); row_p.addWidget(self.spin_min_posts)
+        row_p.addSpacing(30)
+        row_p.addWidget(lbl_rd); row_p.addWidget(self.spin_recent_days)
         row_p.addStretch()
         skip_lay.addLayout(row_p)
         self.add(skip_card)
@@ -547,45 +672,60 @@ class FiltersPage(PageWidget):
         # Keyword filtering
         kw_card = CardWidget(self)
         kw_lay  = QVBoxLayout(kw_card)
-        kw_lay.setSpacing(8)
-        kw_lay.addWidget(StrongBodyLabel("🔍 Keyword Filtering", kw_card))
-        kw_lay.addWidget(CaptionLabel(
-            "Skip profiles if Bio/Username contains these (comma-separated):", kw_card
-        ))
+        kw_lay.setContentsMargins(30, 30, 30, 30)
+        kw_lay.setSpacing(16)
+        lbl_kw = StrongBodyLabel("🔍 Keyword Filtering", kw_card)
+        lbl_kw.setFont(T.heading()); lbl_kw.setStyleSheet("background: transparent;")
+        kw_lay.addWidget(lbl_kw)
+
+        kw_form = QHBoxLayout()
+        col_skip = QVBoxLayout()
+        lbl_sk = CaptionLabel("Skip if Bio/Username contains (comma-separated):", kw_card)
+        lbl_sk.setFont(T.caption()); lbl_sk.setStyleSheet("background: transparent;")
+        col_skip.addWidget(lbl_sk)
         self.txt_skip_keywords = TextEdit(kw_card)
         self.txt_skip_keywords.setFont(T.body())
         self.txt_skip_keywords.setPlaceholderText("crypto, scam, bot, test")
-        self.txt_skip_keywords.setMaximumHeight(80)
-        kw_lay.addWidget(self.txt_skip_keywords)
-        kw_lay.addWidget(CaptionLabel(
-            "ONLY include profiles containing these keywords (blank = allow all):", kw_card
-        ))
+        self.txt_skip_keywords.setMinimumHeight(140)
+        col_skip.addWidget(self.txt_skip_keywords)
+
+        col_only = QVBoxLayout()
+        lbl_on = CaptionLabel("ONLY include profiles containing these (blank = allow all):", kw_card)
+        lbl_on.setFont(T.caption()); lbl_on.setStyleSheet("background: transparent;")
+        col_only.addWidget(lbl_on)
         self.txt_only_keywords = TextEdit(kw_card)
         self.txt_only_keywords.setFont(T.body())
         self.txt_only_keywords.setPlaceholderText("fitness, coach, realestate")
-        self.txt_only_keywords.setMaximumHeight(80)
-        kw_lay.addWidget(self.txt_only_keywords)
+        self.txt_only_keywords.setMinimumHeight(140)
+        col_only.addWidget(self.txt_only_keywords)
+
+        kw_form.addLayout(col_skip); kw_form.addLayout(col_only)
+        kw_lay.addLayout(kw_form)
         self.add(kw_card)
 
         # Blacklist
         bl_card = CardWidget(self)
         bl_lay  = QVBoxLayout(bl_card)
-        bl_lay.setSpacing(8)
-        bl_lay.addWidget(StrongBodyLabel("🏴 Blacklist", bl_card))
+        bl_lay.setContentsMargins(30, 30, 30, 30)
+        bl_lay.setSpacing(16)
+        lbl_bl = StrongBodyLabel("🏴 Blacklist", bl_card)
+        lbl_bl.setFont(T.heading()); lbl_bl.setStyleSheet("background: transparent;")
+        bl_lay.addWidget(lbl_bl)
         bl_lay.addWidget(CaptionLabel(
             "Usernames in this list will NEVER be scraped again. One per line.", bl_card
         ))
         self.txt_blacklist = TextEdit(bl_card)
         self.txt_blacklist.setFont(T.mono())
         self.txt_blacklist.setPlaceholderText("already_scraped_user1\nalready_scraped_user2")
-        self.txt_blacklist.setMinimumHeight(150)
+        self.txt_blacklist.setMinimumHeight(200)
         bl_lay.addWidget(self.txt_blacklist)
+
         bl_btns = QHBoxLayout()
         self.btn_save_bl  = PrimaryPushButton(FIF.SAVE,   "Save Blacklist", bl_card)
         self.btn_load_bl  = PushButton(FIF.FOLDER,        "Reload",         bl_card)
         self.btn_clear_bl = PushButton(FIF.DELETE,        "Clear All",      bl_card)
         for b in [self.btn_save_bl, self.btn_load_bl, self.btn_clear_bl]:
-            b.setFont(T.button()); bl_btns.addWidget(b)
+            b.setFont(T.button()); b.setMinimumHeight(44); bl_btns.addWidget(b)
         bl_btns.addStretch()
         bl_lay.addLayout(bl_btns)
         self.add(bl_card)
@@ -593,7 +733,7 @@ class FiltersPage(PageWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Results page — v2 UI (65/35 split with mirror placeholder)
+# Results page
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ResultsPage(QWidget):
@@ -608,7 +748,6 @@ class ResultsPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # ── LEFT PANEL (65%) ──────────────────────────────────────────────
         left_scroll = ScrollArea(self)
         left_scroll.setWidgetResizable(True)
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -616,77 +755,79 @@ class ResultsPage(QWidget):
 
         left_inner = QWidget()
         left_lay   = QVBoxLayout(left_inner)
-        left_lay.setContentsMargins(20, 18, 12, 18)
-        left_lay.setSpacing(12)
+        left_lay.setContentsMargins(40, 40, 30, 40)
+        left_lay.setSpacing(24)
         left_scroll.setWidget(left_inner)
 
         title_lbl = TitleLabel("Results & Logs", left_inner)
         title_lbl.setFont(T.title())
+        title_lbl.setStyleSheet("font-size: 28pt; margin-bottom: 15px; background: transparent;")
         left_lay.addWidget(title_lbl)
 
-        # Phone status
-        status_card = CardWidget(left_inner)
-        s_lay = QHBoxLayout(status_card)
-        s_lay.setSpacing(16)
-        s_lay.addWidget(StrongBodyLabel("📊 Phone Status:", status_card))
-        for i in range(3):
-            lbl = CaptionLabel(f"Phone {i+1}: idle", status_card)
-            lbl.setFont(T.body())
-            self.phone_status_labels.append(lbl)
-            s_lay.addWidget(lbl)
-        s_lay.addStretch()
-        left_lay.addWidget(status_card)
-
-        # Progress
+        # Status & Progress Card
         prog_card = CardWidget(left_inner)
         p_lay = QVBoxLayout(prog_card)
-        p_lay.setSpacing(6)
-        p_lay.addWidget(StrongBodyLabel("📈 Overall Progress", prog_card))
+        p_lay.setContentsMargins(30, 30, 30, 30)
+        p_lay.setSpacing(20)
+
+        status_row = QHBoxLayout()
+        lbl_live = StrongBodyLabel("📊 Phone Status:", prog_card)
+        lbl_live.setFont(T.heading()); lbl_live.setStyleSheet("background: transparent;")
+        status_row.addWidget(lbl_live)
+        for i in range(3):
+            lbl = CaptionLabel(f"Phone {i+1}: idle", prog_card)
+            lbl.setFont(T.body())
+            lbl.setStyleSheet("color: #64748b; font-weight: 500; background: transparent;")
+            self.phone_status_labels.append(lbl)
+            status_row.addWidget(lbl)
+        status_row.addStretch()
+        p_lay.addLayout(status_row)
+
         self.progress_bar = ProgressBar(prog_card)
-        self.progress_bar.setValue(0); self.progress_bar.setMinimumHeight(12)
+        self.progress_bar.setValue(0); self.progress_bar.setMinimumHeight(14)
         p_lay.addWidget(self.progress_bar)
         self.lbl_progress = CaptionLabel("Ready", prog_card)
-        self.lbl_progress.setFont(T.body())
+        self.lbl_progress.setFont(T.body()); self.lbl_progress.setStyleSheet("background: transparent;")
         p_lay.addWidget(self.lbl_progress)
         left_lay.addWidget(prog_card)
 
         # Results table
-        left_lay.addWidget(StrongBodyLabel("📋 Collected Accounts", left_inner))
+        lbl_coll = StrongBodyLabel("📋 Collected Accounts", left_inner)
+        lbl_coll.setFont(T.heading()); lbl_coll.setStyleSheet("background: transparent;")
+        left_lay.addWidget(lbl_coll)
         self.table = TableWidget(left_inner)
+        self.table.setFont(T.body())
         self.table.setColumnCount(12)
         self.table.setHorizontalHeaderLabels([
             "Username", "Full Name", "Email", "Phone", "Country",
             "Location", "Followers", "Following", "Posts", "Bio",
             "Profile URL", "Scraped At",
         ])
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.table.setMinimumHeight(240)
-        self.table.setFont(T.body())
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setMinimumHeight(400)
         left_lay.addWidget(self.table)
 
         exp_row = QHBoxLayout()
         self.btn_export_csv = PushButton(FIF.DOWNLOAD, "Export CSV", left_inner)
-        self.btn_export_csv.setFont(T.button())
+        self.btn_export_csv.setFont(T.button()); self.btn_export_csv.setMinimumHeight(44)
         exp_row.addWidget(self.btn_export_csv); exp_row.addStretch()
         left_lay.addLayout(exp_row)
 
         # Activity log
-        left_lay.addWidget(StrongBodyLabel("📜 Activity Log", left_inner))
+        lbl_log = StrongBodyLabel("📜 Activity Log", left_inner)
+        lbl_log.setFont(T.heading()); lbl_log.setStyleSheet("background: transparent;")
+        left_lay.addWidget(lbl_log)
         self.log_area = TextEdit(left_inner)
-        self.log_area.setReadOnly(True)
-        self.log_area.setMinimumHeight(200)
-        self.log_area.setFont(T.mono())
+        self.log_area.setReadOnly(True); self.log_area.setMinimumHeight(250); self.log_area.setFont(T.mono())
         left_lay.addWidget(self.log_area)
-        left_lay.addStretch(1)
 
+        left_lay.addStretch(1)
         outer.addWidget(left_scroll, stretch=65)
         outer.addStretch(35)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Settings page — v2 UI (sp_switch_every instead of sp_break_dur)
+# Settings page
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SettingsPage(PageWidget):
@@ -698,29 +839,32 @@ class SettingsPage(PageWidget):
         # Google Sheets
         sh_card = CardWidget(self)
         sh_lay  = QVBoxLayout(sh_card)
-        sh_lay.setSpacing(8)
-        sh_lay.addWidget(StrongBodyLabel("📊 Google Sheets", sh_card))
+        sh_lay.setContentsMargins(30, 30, 30, 30)
+        sh_lay.setSpacing(20)
+        lbl_sh = StrongBodyLabel("📊 Google Sheets Integration", sh_card)
+        lbl_sh.setFont(T.heading()); lbl_sh.setStyleSheet("background: transparent;")
+        sh_lay.addWidget(lbl_sh)
 
         def _row(label, widget):
             r = QHBoxLayout()
-            lbl = CaptionLabel(label, sh_card); lbl.setFixedWidth(100)
+            lbl = CaptionLabel(label, sh_card)
+            lbl.setFixedWidth(140); lbl.setFont(T.body()); lbl.setStyleSheet("background: transparent;")
             r.addWidget(lbl); r.addWidget(widget)
             sh_lay.addLayout(r)
 
-        self.inp_sheet_id  = LineEdit(sh_card); self.inp_sheet_id.setMinimumHeight(32)
+        self.inp_sheet_id  = LineEdit(sh_card); self.inp_sheet_id.setFont(T.body()); self.inp_sheet_id.setMinimumHeight(44)
         self.inp_sheet_id.setPlaceholderText("Spreadsheet ID from URL")
-        self.inp_sheet_tab = LineEdit(sh_card); self.inp_sheet_tab.setMinimumHeight(32)
-        self.inp_creds     = LineEdit(sh_card); self.inp_creds.setMinimumHeight(32)
+        self.inp_sheet_tab = LineEdit(sh_card); self.inp_sheet_tab.setFont(T.body()); self.inp_sheet_tab.setMinimumHeight(44)
+        self.inp_creds     = LineEdit(sh_card); self.inp_creds.setFont(T.body()); self.inp_creds.setMinimumHeight(44)
         _row("Sheet ID:",  self.inp_sheet_id)
         _row("Tab Name:",  self.inp_sheet_tab)
 
         creds_row = QHBoxLayout()
-        creds_lbl = CaptionLabel("Credentials:", sh_card); creds_lbl.setFixedWidth(100)
+        creds_lbl = CaptionLabel("Credentials:", sh_card)
+        creds_lbl.setFixedWidth(140); creds_lbl.setFont(T.body()); creds_lbl.setStyleSheet("background: transparent;")
         self.btn_browse_creds = PushButton(FIF.FOLDER, "Browse", sh_card)
-        self.btn_browse_creds.setFixedHeight(32)
-        creds_row.addWidget(creds_lbl)
-        creds_row.addWidget(self.inp_creds)
-        creds_row.addWidget(self.btn_browse_creds)
+        self.btn_browse_creds.setFont(T.button()); self.btn_browse_creds.setMinimumHeight(44)
+        creds_row.addWidget(creds_lbl); creds_row.addWidget(self.inp_creds); creds_row.addWidget(self.btn_browse_creds)
         sh_lay.addLayout(creds_row)
 
         btns_row = QHBoxLayout()
@@ -728,85 +872,68 @@ class SettingsPage(PageWidget):
         self.btn_revoke_token = PushButton(FIF.DELETE,        "Revoke Token",   sh_card)
         self.lbl_sheet_status = CaptionLabel("Not connected", sh_card)
         for b in [self.btn_test_sheets, self.btn_revoke_token]:
-            b.setFixedHeight(32); btns_row.addWidget(b)
+            b.setFont(T.button()); b.setMinimumHeight(44); btns_row.addWidget(b)
+        self.lbl_sheet_status.setFont(T.body()); self.lbl_sheet_status.setStyleSheet("background: transparent;")
         btns_row.addWidget(self.lbl_sheet_status); btns_row.addStretch()
         sh_lay.addLayout(btns_row)
         self.add(sh_card)
 
-        # Webhook
-        wh_card = CardWidget(self)
-        wh_lay  = QVBoxLayout(wh_card)
-        wh_lay.addWidget(StrongBodyLabel("🔗 Webhook", wh_card))
-        wh_lay.addWidget(CaptionLabel("POST each account as JSON (blank = disabled).", wh_card))
-        wh_row = QHBoxLayout()
-        wh_row.addWidget(CaptionLabel("URL:", wh_card))
-        self.inp_webhook = LineEdit(wh_card)
-        self.inp_webhook.setPlaceholderText("https://hooks.zapier.com/…")
-        self.inp_webhook.setMinimumHeight(32)
-        wh_row.addWidget(self.inp_webhook)
-        wh_lay.addLayout(wh_row)
-        self.add(wh_card)
+        # Webhook & Appium side by side
+        wa_row = QHBoxLayout(); wa_row.setSpacing(24)
 
-        # Appium
-        ap_card = CardWidget(self)
-        ap_lay  = QVBoxLayout(ap_card)
-        ap_lay.addWidget(StrongBodyLabel("⚙️ Appium", ap_card))
+        wh_card = CardWidget(self); wh_lay = QVBoxLayout(wh_card)
+        wh_lay.setContentsMargins(30, 30, 30, 30); wh_lay.setSpacing(16)
+        lbl_wh = StrongBodyLabel("🔗 Webhook", wh_card)
+        lbl_wh.setFont(T.heading()); lbl_wh.setStyleSheet("background: transparent;")
+        wh_lay.addWidget(lbl_wh)
+        wh_lay.addWidget(CaptionLabel("POST each account as JSON (blank = disabled).", wh_card))
+        self.inp_webhook = LineEdit(wh_card); self.inp_webhook.setFont(T.body())
+        self.inp_webhook.setMinimumHeight(44); self.inp_webhook.setPlaceholderText("https://hooks.zapier.com/…")
+        wh_lay.addWidget(self.inp_webhook); wa_row.addWidget(wh_card, 1)
+
+        ap_card = CardWidget(self); ap_lay = QVBoxLayout(ap_card)
+        ap_lay.setContentsMargins(30, 30, 30, 30); ap_lay.setSpacing(16)
+        lbl_ap = StrongBodyLabel("⚙️ Appium", ap_card)
+        lbl_ap.setFont(T.heading()); lbl_ap.setStyleSheet("background: transparent;")
+        ap_lay.addWidget(lbl_ap)
         ap_lay.addWidget(CaptionLabel(
             "Ports: Phone 1=4723, Phone 2=4724, Phone 3=4725. "
             "Change host only for remote Appium.", ap_card
         ))
-        ap_row = QHBoxLayout()
-        ap_row.addWidget(CaptionLabel("Host:", ap_card))
-        self.inp_appium_host = LineEdit(ap_card)
-        self.inp_appium_host.setMinimumHeight(32)
-        ap_row.addWidget(self.inp_appium_host)
-        ap_lay.addLayout(ap_row)
-        self.add(ap_card)
+        self.inp_appium_host = LineEdit(ap_card); self.inp_appium_host.setFont(T.body())
+        self.inp_appium_host.setMinimumHeight(44)
+        ap_lay.addWidget(self.inp_appium_host); wa_row.addWidget(ap_card, 1)
+        self.add_layout(wa_row)
 
         # Delays
-        dl_card = CardWidget(self)
-        dl_lay  = QVBoxLayout(dl_card)
-        dl_lay.addWidget(StrongBodyLabel("⏱️ Randomized Delays", dl_card))
+        dl_card = CardWidget(self); dl_lay = QVBoxLayout(dl_card)
+        dl_lay.setContentsMargins(30, 30, 30, 30); dl_lay.setSpacing(20)
+        lbl_dl = StrongBodyLabel("⏱️ Randomized Delays", dl_card)
+        lbl_dl.setFont(T.heading()); lbl_dl.setStyleSheet("background: transparent;")
+        dl_lay.addWidget(lbl_dl)
         dl_lay.addWidget(CaptionLabel("All delays randomized between MIN and MAX.", dl_card))
 
         def add_delay(label, attr_min, attr_max, mn, mx, is_int=False):
-            from PyQt6.QtWidgets import QSpinBox, QDoubleSpinBox
             r = QHBoxLayout()
-            r.addWidget(CaptionLabel(label, dl_card))
+            lbl = CaptionLabel(label, dl_card); lbl.setFont(T.body())
+            lbl.setStyleSheet("background: transparent;"); r.addWidget(lbl)
             if is_int:
-                wmin = QSpinBox(dl_card)
-                wmin.setRange(int(mn), int(mx))
-                wmax = QSpinBox(dl_card)
-                wmax.setRange(int(mn), int(mx))
+                wmin = SpinBox(dl_card); wmax = SpinBox(dl_card)
+                wmin.setRange(int(mn), int(mx)); wmax.setRange(int(mn), int(mx))
             else:
-                wmin = QDoubleSpinBox(dl_card)
-                wmin.setRange(mn, mx)
-                wmin.setDecimals(1)
-                wmin.setSingleStep(0.5)
-                wmax = QDoubleSpinBox(dl_card)
-                wmax.setRange(mn, mx)
-                wmax.setDecimals(1)
-                wmax.setSingleStep(0.5)
+                wmin = DoubleSpinBox(dl_card); wmax = DoubleSpinBox(dl_card)
+                wmin.setRange(mn, mx); wmax.setRange(mn, mx)
+                wmin.setDecimals(1); wmin.setSingleStep(0.5)
+                wmax.setDecimals(1); wmax.setSingleStep(0.5)
             for w in (wmin, wmax):
-                w.setFont(T.body())
-                w.setFixedHeight(32)
-                w.setFixedWidth(110)
+                w.setFont(T.body()); w.setFixedHeight(40); w.setFixedWidth(140)
                 w.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
                 w.setKeyboardTracking(True)
-                w.setStyleSheet("""
-                    QSpinBox, QDoubleSpinBox {
-                        border: 1px solid #475569;
-                        border-radius: 6px;
-                        padding: 2px 6px;
-                        background: transparent;
-                    }
-                    QSpinBox:focus, QDoubleSpinBox:focus {
-                        border: 2px solid #3b82f6;
-                    }
-                """)
-            r.addWidget(CaptionLabel("MIN", dl_card)); r.addWidget(wmin)
-            r.addSpacing(8)
-            r.addWidget(CaptionLabel("MAX", dl_card)); r.addWidget(wmax)
+            lbl_min = CaptionLabel("MIN", dl_card); lbl_min.setFont(T.caption())
+            lbl_min.setStyleSheet("background: transparent;"); r.addWidget(lbl_min); r.addWidget(wmin)
+            r.addSpacing(15)
+            lbl_max = CaptionLabel("MAX", dl_card); lbl_max.setFont(T.caption())
+            lbl_max.setStyleSheet("background: transparent;"); r.addWidget(lbl_max); r.addWidget(wmax)
             r.addStretch()
             dl_lay.addLayout(r)
             setattr(self, attr_min, wmin); setattr(self, attr_max, wmax)
@@ -816,37 +943,77 @@ class SettingsPage(PageWidget):
         add_delay("Profiles per run:",      "sp_run_min",  "sp_run_max",  1, 500, True)
         add_delay("Rest between runs (m):", "sp_rest_min", "sp_rest_max", 1, 1440, True)
 
-        brk_row = QHBoxLayout()
-        brk_row.addWidget(CaptionLabel("Switch account every (profiles):", dl_card))
-        from PyQt6.QtWidgets import QSpinBox as _QSpinBox
-        self.sp_switch_every = _QSpinBox(dl_card)
-        self.sp_switch_every.setRange(1, 1000)
-        self.sp_switch_every.setFont(T.body())
-        self.sp_switch_every.setFixedHeight(32)
-        self.sp_switch_every.setFixedWidth(110)
-        self.sp_switch_every.setKeyboardTracking(True)
-        self.sp_switch_every.setStyleSheet("""
-            QSpinBox {
-                border: 1px solid #475569;
-                border-radius: 6px;
-                padding: 2px 6px;
-                background: transparent;
-            }
-            QSpinBox:focus { border: 2px solid #3b82f6; }
-        """)
-        brk_row.addWidget(self.sp_switch_every); brk_row.addStretch()
-        dl_lay.addLayout(brk_row)
+        # ── Account switch mode ───────────────────────────────────────────
+        lbl_sw = StrongBodyLabel("🔄 Account Switching", dl_card)
+        lbl_sw.setFont(T.heading()); lbl_sw.setStyleSheet("background: transparent;")
+        dl_lay.addWidget(lbl_sw)
+
+        sm_row = QHBoxLayout()
+        self.rb_switch_profiles = QRadioButton("Every", dl_card)
+        self.rb_switch_profiles.setFont(T.body())
+        self.rb_switch_profiles.setStyleSheet("background: transparent;")
+        self.rb_switch_profiles.setChecked(True)
+        self.sp_switch_every = SpinBox(dl_card)
+        self.sp_switch_every.setFont(T.body()); self.sp_switch_every.setRange(1, 10000)
+        self.sp_switch_every.setValue(50); self.sp_switch_every.setFixedWidth(130)
+        self.sp_switch_every.setMinimumHeight(40); self.sp_switch_every.setKeyboardTracking(True)
+
+        self.rb_switch_hours = QRadioButton("Every", dl_card)
+        self.rb_switch_hours.setFont(T.body())
+        self.rb_switch_hours.setStyleSheet("background: transparent;")
+        self.sp_switch_hours = SpinBox(dl_card)
+        self.sp_switch_hours.setFont(T.body()); self.sp_switch_hours.setRange(1, 168)
+        self.sp_switch_hours.setValue(1); self.sp_switch_hours.setFixedWidth(130)
+        self.sp_switch_hours.setMinimumHeight(40); self.sp_switch_hours.setKeyboardTracking(True)
+
+        sm_row.addWidget(self.rb_switch_profiles); sm_row.addWidget(self.sp_switch_every)
+        sm_row.addWidget(CaptionLabel("profiles", dl_card))
+        sm_row.addSpacing(40)
+        sm_row.addWidget(self.rb_switch_hours); sm_row.addWidget(self.sp_switch_hours)
+        sm_row.addWidget(CaptionLabel("hours", dl_card))
+        sm_row.addStretch()
+        dl_lay.addLayout(sm_row)
+
+        # Group the two radios so only one can be active
+        self._switch_mode_group = QButtonGroup(dl_card)
+        self._switch_mode_group.addButton(self.rb_switch_profiles, 0)
+        self._switch_mode_group.addButton(self.rb_switch_hours,    1)
+
+        # Grey-out the inactive spinbox whenever selection changes
+        def _on_switch_mode_changed():
+            by_profiles = self.rb_switch_profiles.isChecked()
+            self.sp_switch_every.setEnabled(by_profiles)
+            self.sp_switch_hours.setEnabled(not by_profiles)
+        self._switch_mode_group.buttonClicked.connect(lambda _: _on_switch_mode_changed())
+        _on_switch_mode_changed()   # apply initial state
+
         self.add(dl_card)
         self.stretch()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MainWindow — v2 UI + v1 scraping logic fully restored
+# MainWindow
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
+
+        # ====================== ADD LOGO TO TITLE BAR ======================
+        icon = QApplication.instance().windowIcon()
+        if not icon.isNull():
+            logo_label = QLabel(self.titleBar)
+            pixmap = icon.pixmap(32, 32)
+            logo_label.setPixmap(pixmap)
+            logo_label.setFixedSize(40, 40)
+            logo_label.setContentsMargins(10, 0, 0, 0)
+            logo_label.setStyleSheet("background: transparent;")
+            self.titleBar.hBoxLayout.insertWidget(
+                0, logo_label, 0,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+        # =================================================================
+
         self.cfg                = load_config()
         self._workers:          List[PhoneWorker]      = []
         self._collected         = 0
@@ -856,14 +1023,11 @@ class MainWindow(FluentWindow):
         self._scrcpy_procs:     Dict[str, subprocess.Popen] = {}
         self._appium_mgr        = AppiumManager()
         self._sheets_client:    Optional[SheetsClient] = None
-        # Keeps references to running AccountDetectionWorker threads so they
-        # are not garbage-collected before they finish.
         self._detection_workers: Dict[int, AccountDetectionWorker] = {}
-        # Keeps references to running AccountSwitchWorker threads.
-        self._switch_workers: Dict[int, AccountSwitchWorker] = {}
+        self._switch_workers:    Dict[int, AccountSwitchWorker]    = {}
 
-        self.setWindowTitle("Instagram Scraper Pro")
-        self.resize(1360, 900)
+        self.setWindowTitle("Cansa")
+        self.resize(1600, 1000)
 
         self.dashboard_page = DashboardPage(self)
         self.filters_page   = FiltersPage(self)
@@ -882,19 +1046,21 @@ class MainWindow(FluentWindow):
     def _init_persistent_mirror(self):
         self.mirror_panel = QWidget(self)
         self.mirror_panel.setObjectName("PersistentMirrorPanel")
-        self.mirror_panel.setFixedWidth(450)
+        self.mirror_panel.setFixedWidth(500)
 
         layout = QVBoxLayout(self.mirror_panel)
-        layout.setContentsMargins(8, 18, 18, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(15, 30, 30, 30)
+        layout.setSpacing(20)
 
         hdr_row = QHBoxLayout()
         mirror_title = StrongBodyLabel("📺 Live Mirror", self.mirror_panel)
         mirror_title.setFont(T.heading())
+        mirror_title.setStyleSheet("background: transparent;")
         hdr_row.addWidget(mirror_title)
         hdr_row.addStretch()
         self.lbl_mirror_device = CaptionLabel("No device selected", self.mirror_panel)
-        self.lbl_mirror_device.setFont(T.caption())
+        self.lbl_mirror_device.setFont(T.body())
+        self.lbl_mirror_device.setStyleSheet("background: transparent;")
         hdr_row.addWidget(self.lbl_mirror_device)
         layout.addLayout(hdr_row)
 
@@ -934,76 +1100,53 @@ class MainWindow(FluentWindow):
         self.stackedWidget.currentChanged.connect(self._update_mirror_visibility)
         self._update_mirror_visibility()
 
-    # ── Theme + Toggle Button (FIXED) ─────────────────────────────────────
+    # ── Theme ─────────────────────────────────────────────────────────────
     def _init_theme(self):
         setTheme(Theme.DARK)
         setThemeColor("#3b82f6")
         self._apply_stylesheet()
-        
-        # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-        # THE LIGHT/DARK BUTTON IS HERE
         btn = TransparentToolButton(FIF.BRUSH, self)
         btn.clicked.connect(self._toggle_theme)
         self.titleBar.hBoxLayout.insertWidget(0, btn, 0, Qt.AlignmentFlag.AlignLeft)
-        # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-
         if hasattr(self, "mirror"):
             self.mirror.update_theme()
 
     def _apply_stylesheet(self):
         dark = isDarkTheme()
-        if dark:
-            css = """
-                QWidget{background:#0f172a;color:#f8fafc}
-                ScrollArea{background:#0f172a;border:none}
-                QLabel,TitleLabel,StrongBodyLabel,CaptionLabel{color:#f8fafc;background:transparent}
-                CardWidget{background:#1e293b;border:1px solid #334155;border-radius:10px}
-                LineEdit,SpinBox,DoubleSpinBox,ComboBox,TextEdit,TimeEdit{
-                    background:#0f172a;border:1px solid #334155;border-radius:7px;
-                    color:#f8fafc;padding:4px;font-size:10pt}
-                LineEdit:focus,SpinBox:focus,ComboBox:focus,TimeEdit:focus{border:2px solid #3b82f6}
-                TextEdit:focus{border:2px solid #3b82f6}
-                PushButton{background:#334155;border:1px solid #475569;border-radius:7px;
-                    color:#f8fafc;padding:4px 12px;font-size:10pt}
-                PushButton:hover{background:#475569}
-                PushButton#btn_stop_danger{background:#dc2626;border:1px solid #991b1b;
-                    color:#fff;font-weight:bold}
-                PushButton#btn_stop_danger:hover{background:#b91c1c}
-                PrimaryPushButton{background:#3b82f6;border:none;border-radius:7px;
-                    color:#fff;font-weight:bold;padding:4px 12px;font-size:10pt}
-                PrimaryPushButton:hover{background:#2563eb}
-                TableWidget{background:#1e293b;border:1px solid #334155;border-radius:7px;
-                    color:#cbd5e1;gridline-color:#334155;font-size:9pt}
-                TableWidget::item{padding:4px;background:#1e293b;color:#cbd5e1}
-                TableWidget::item:selected{background:#334155;color:#f8fafc}
-                QHeaderView::section{background:#0f172a;color:#f8fafc;border:none;
-                    border-right:1px solid #334155;padding:5px;font-weight:bold;font-size:9pt}
-                ProgressBar{background:#334155;border:1px solid #475569;border-radius:3px}
-                ProgressBar::chunk{background:#3b82f6;border-radius:2px}
-                CheckBox{color:#f8fafc;background:transparent;font-size:10pt}
-                QScrollBar:vertical{background:#0f172a;width:7px;border:none}
-                QScrollBar::handle:vertical{background:#475569;border-radius:3px;min-height:16px}
-                QComboBox QAbstractItemView{background:#1e293b;color:#f8fafc;
-                    selection-background-color:#3b82f6;border:1px solid #334155}
-                #PersistentMirrorPanel{background:#0f172a;border-left:1px solid #334155}
-            """
-        else:
-            css = """
-                QWidget{background:#f8fafc;color:#0f172a}
-                CardWidget{background:#fff;border:1px solid #e2e8f0;border-radius:10px}
-                LineEdit,SpinBox,DoubleSpinBox,ComboBox,TextEdit,TimeEdit{
-                    background:#f1f5f9;border:1px solid #e2e8f0;border-radius:7px;
-                    color:#0f172a;font-size:10pt}
-                PushButton{background:#e2e8f0;border:1px solid #cbd5e1;border-radius:7px;
-                    color:#0f172a;font-size:10pt}
-                PushButton#btn_stop_danger{background:#dc2626;border:none;color:#fff;font-weight:bold}
-                PrimaryPushButton{background:#3b82f6;color:#fff;border-radius:7px;
-                    font-weight:bold;font-size:10pt}
-                TableWidget{background:#fff;color:#0f172a;border:1px solid #e2e8f0;font-size:9pt}
-                QHeaderView::section{background:#f1f5f9;color:#0f172a;border:none;font-size:9pt}
-                CheckBox{color:#0f172a;font-size:10pt}
-                #PersistentMirrorPanel{background:#f8fafc;border-left:1px solid #e2e8f0}
-            """
+        bg = "#0f172a" if dark else "#f8fafc"
+        card_bg = "#1e293b" if dark else "#ffffff"
+        text = "#f8fafc" if dark else "#0f172a"
+        border = "#334155" if dark else "#e2e8f0"
+        css = f"""
+            QWidget{{ background: {bg}; color: {text}; font-family: 'Inter', 'Segoe UI'; }}
+            ScrollArea{{ background: transparent; border: none; }}
+            CardWidget{{ background: {card_bg}; border: 1px solid {border}; border-radius: 16px; }}
+            QLabel, StrongBodyLabel, CaptionLabel, TitleLabel{{ background: transparent; }}
+            LineEdit, SpinBox, DoubleSpinBox, ComboBox, TextEdit, TimeEdit{{
+                background: {bg}; border: 1px solid {border}; border-radius: 10px;
+                padding: 8px 16px; font-size: 12pt;
+            }}
+            LineEdit:focus, SpinBox:focus, ComboBox:focus, TimeEdit:focus{{ border: 2px solid #3b82f6; }}
+            TextEdit:focus{{ border: 2px solid #3b82f6; }}
+            PushButton{{ background: {border}; border: 1px solid {border}; border-radius: 10px; padding: 8px 20px; font-weight: 500; font-size: 12pt; }}
+            PushButton:hover{{ background: #475569; }}
+            PushButton#btn_stop_danger{{ background: #ef4444; border: none; color: white; font-weight: bold; }}
+            PushButton#btn_stop_danger:hover{{ background: #dc2626; }}
+            PrimaryPushButton{{ background: #3b82f6; border: none; border-radius: 10px; color: white; font-weight: 600; padding: 8px 20px; font-size: 12pt; }}
+            PrimaryPushButton:hover{{ background: #2563eb; }}
+            TableWidget{{ background: {card_bg}; border: 1px solid {border}; border-radius: 10px; gridline-color: {border}; font-size: 11pt; }}
+            TableWidget::item{{ padding: 4px; background: {card_bg}; color: {text}; }}
+            TableWidget::item:selected{{ background: {border}; color: {text}; }}
+            QHeaderView::section{{ background: {bg}; color: {text}; border: none; border-bottom: 1px solid {border}; padding: 12px; font-weight: 600; font-size: 11pt; }}
+            ProgressBar{{ background: {border}; border-radius: 7px; border: none; }}
+            ProgressBar::chunk{{ background: #3b82f6; border-radius: 7px; }}
+            CheckBox{{ color: {text}; background: transparent; font-size: 12pt; }}
+            QScrollBar:vertical{{ background: {bg}; width: 7px; border: none; }}
+            QScrollBar::handle:vertical{{ background: {border}; border-radius: 3px; min-height: 16px; }}
+            QComboBox QAbstractItemView{{ background: {card_bg}; color: {text}; selection-background-color: #3b82f6; border: 1px solid {border}; }}
+            #PersistentMirrorPanel{{ background: {bg}; border-left: 1px solid {border}; }}
+            QRadioButton{{ background: transparent; font-size: 12pt; }}
+        """
         self.setStyleSheet(css)
 
     def _toggle_theme(self):
@@ -1052,12 +1195,10 @@ class MainWindow(FluentWindow):
             combo_dev.addItem("(not assigned)", userData=None)
             for serial, model in devices:
                 combo_dev.addItem(f"{model} [{serial}]", userData=serial)
-            # Always start unassigned — never restore last session's device choice
             combo_dev.setCurrentIndex(0)
             combo_dev.blockSignals(False)
             self._on_device_selected(i)
 
-        # Show a slide-in notification listing connected devices
         if devices:
             names = ", ".join(model for _, model in devices)
             count = len(devices)
@@ -1066,18 +1207,14 @@ class MainWindow(FluentWindow):
                 title=f"{count} {label} connected",
                 content=f"{names} — select a slot to assign.",
                 orient=Qt.Orientation.Horizontal,
-                isClosable=True,
-                duration=4000,
-                parent=self,
+                isClosable=True, duration=4000, parent=self,
             )
         else:
             InfoBar.warning(
                 title="No devices found",
                 content="Connect a phone via USB and press Refresh.",
                 orient=Qt.Orientation.Horizontal,
-                isClosable=True,
-                duration=4000,
-                parent=self,
+                isClosable=True, duration=4000, parent=self,
             )
         self._log(f"🔍 Found {len(devices)} device(s).")
 
@@ -1086,24 +1223,19 @@ class MainWindow(FluentWindow):
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[idx]
         serial = combo_dev.currentData()
 
-        # Clear previous accounts immediately
         combo_acc.clear()
-
         if not serial:
             return
 
-        # Cancel any previous detection still running for this slot
         old_worker = self._detection_workers.pop(idx, None)
         if old_worker and old_worker.isRunning():
             old_worker.terminate()
             old_worker.wait(500)
 
-        # Show loading state in the combo and status label
         combo_acc.setPlaceholderText("Detecting…")
         combo_acc.setEnabled(False)
         lbl_status.setText("⏳ detecting")
 
-        # Run detection in background — UI stays fully responsive
         worker = AccountDetectionWorker(row_idx=idx, serial=serial)
         worker.finished.connect(self._on_accounts_detected)
         worker.error.connect(self._on_accounts_error)
@@ -1111,33 +1243,25 @@ class MainWindow(FluentWindow):
         worker.start()
 
     def _on_accounts_detected(self, row_idx: int, accounts: list):
-        """Called on the main thread when AccountDetectionWorker finishes."""
         dp = self.dashboard_page
         if row_idx >= len(dp.device_rows):
             return
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[row_idx]
-
         combo_acc.clear()
         combo_acc.setEnabled(True)
         combo_acc.setPlaceholderText("Accounts")
-
         combo_acc.blockSignals(True)
         for a in accounts:
             combo_acc.addItem(a)
         combo_acc.blockSignals(False)
-
         lbl_status.setText("● idle")
-
-        # Clean up worker reference
         self._detection_workers.pop(row_idx, None)
 
     def _on_accounts_error(self, row_idx: int):
-        """Called on the main thread when AccountDetectionWorker fails."""
         dp = self.dashboard_page
         if row_idx >= len(dp.device_rows):
             return
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[row_idx]
-
         combo_acc.clear()
         combo_acc.setEnabled(True)
         combo_acc.setPlaceholderText("Accounts")
@@ -1145,29 +1269,18 @@ class MainWindow(FluentWindow):
         combo_acc.addItem("Account 1")
         combo_acc.blockSignals(False)
         lbl_status.setText("● idle")
-
         self._detection_workers.pop(row_idx, None)
 
     def _on_account_selected(self, row_idx: int):
-        """
-        Called when the user picks an account from the combo_acc dropdown.
-        Runs switch_instagram_account in a background thread — UI stays responsive.
-        Ignored during account detection (combo is disabled then) and when
-        the combo is being populated programmatically.
-        """
         dp = self.dashboard_page
         if row_idx >= len(dp.device_rows):
             return
-
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[row_idx]
-
-        # Ignore if combo is disabled (detection in progress) or no device
         if not combo_acc.isEnabled():
             return
         serial = combo_dev.currentData()
         if not serial:
             return
-
         account_index = combo_acc.currentIndex()
         if account_index < 0:
             return
@@ -1175,43 +1288,59 @@ class MainWindow(FluentWindow):
         if not account_name:
             return
 
-        # Cancel any previous switch still running for this slot
         old = self._switch_workers.pop(row_idx, None)
         if old and old.isRunning():
             old.terminate()
             old.wait(500)
 
-        # Show switching state
         lbl_status.setText("⏳ switching")
         combo_acc.setEnabled(False)
 
-        worker = AccountSwitchWorker(
-            row_idx=row_idx,
-            serial=serial,
-            account_name=account_name,
-        )
+        worker = AccountSwitchWorker(row_idx=row_idx, serial=serial, account_name=account_name)
         worker.finished.connect(self._on_switch_done)
         self._switch_workers[row_idx] = worker
         worker.start()
 
     def _on_switch_done(self, row_idx: int, success: bool):
-        """Called on the main thread when AccountSwitchWorker finishes."""
         dp = self.dashboard_page
         if row_idx >= len(dp.device_rows):
             return
-
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[row_idx]
         combo_acc.setEnabled(True)
-
         if success:
             lbl_status.setText("● idle")
-            account_name = combo_acc.currentText()
-            self._log(f"✅ [Phone {row_idx + 1}] Switched to @{account_name}")
+            self._log(f"✅ [Phone {row_idx + 1}] Switched to @{combo_acc.currentText()}")
         else:
             lbl_status.setText("⚠ switch failed")
             self._log(f"⚠️ [Phone {row_idx + 1}] Account switch failed")
-
         self._switch_workers.pop(row_idx, None)
+
+    def _on_auto_switch(self, phone_idx: int, new_account: str):
+        """
+        Called (via Qt signal from PhoneWorker) whenever an automatic
+        account switch completes during scraping.  Updates the combo_acc
+        dropdown on the dashboard so the displayed account always matches
+        the one that is actually active on the device.
+        """
+        dp = self.dashboard_page
+        if phone_idx >= len(dp.device_rows):
+            return
+        combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[phone_idx]
+
+        # Find the index of the new account name in the combo box
+        idx = combo_acc.findText(new_account)
+        if idx >= 0:
+            combo_acc.blockSignals(True)          # prevent triggering a manual switch
+            combo_acc.setCurrentIndex(idx)
+            combo_acc.blockSignals(False)
+        else:
+            # Account name not yet in list (e.g. detected after start) — add it
+            combo_acc.blockSignals(True)
+            combo_acc.addItem(new_account)
+            combo_acc.setCurrentIndex(combo_acc.count() - 1)
+            combo_acc.blockSignals(False)
+
+        self._log(f"🔄 [Phone {phone_idx + 1}] Dashboard updated → @{new_account}")
 
     def _get_assigned_devices(self) -> List[Tuple[int, str]]:
         return [
@@ -1243,9 +1372,7 @@ class MainWindow(FluentWindow):
         serial = combo_dev.currentData()
 
         if not serial:
-            InfoBar.warning(
-                "No Device", f"Phone {row_idx + 1} has no device assigned.", parent=self
-            )
+            InfoBar.warning("No Device", f"Phone {row_idx + 1} has no device assigned.", parent=self)
             return
 
         if self._mirror_phone_idx == row_idx:
@@ -1260,7 +1387,6 @@ class MainWindow(FluentWindow):
                 pass
 
         self._mirror_phone_idx = None
-
         self.mirror.attach(serial)
         self._mirror_phone_idx = row_idx
         btn_view.setText("⏹ Stop")
@@ -1268,7 +1394,7 @@ class MainWindow(FluentWindow):
         self.mirror.update_phone_index(row_idx)
         self._update_mirror_visibility()
 
-    # ── Config collect / load — v1 keys preserved ─────────────────────────
+    # ── Config collect / load ─────────────────────────────────────────────
     def _collect_cfg(self) -> dict:
         cfg = load_config()
         dp  = self.dashboard_page
@@ -1278,12 +1404,10 @@ class MainWindow(FluentWindow):
         cfg["devices"] = [
             {"serial": row[0].currentData()} for row in dp.device_rows
         ]
-
         cfg["targets_per_phone"] = [
             [t.strip().lstrip("@") for t in txt.toPlainText().splitlines() if t.strip()]
             for txt in dp.target_rows
         ]
-
         cfg["last_mode"]  = dp.combo_mode.currentText()
         cfg["last_count"] = dp.spin_count.value()
 
@@ -1296,7 +1420,6 @@ class MainWindow(FluentWindow):
             "end_hour":     te.hour(),
             "end_minute":   te.minute(),
         }
-
         cfg["filters"] = {
             "skip_no_bio":              fp.chk_skip_no_bio.isChecked(),
             "skip_private":             fp.chk_skip_private.isChecked(),
@@ -1307,24 +1430,24 @@ class MainWindow(FluentWindow):
             "keywords":                 parse_keywords(fp.txt_skip_keywords.toPlainText()),
             "only_keywords":            parse_keywords(fp.txt_only_keywords.toPlainText()),
         }
-
-        cfg["sheet_id"]          = sp.inp_sheet_id.text().strip()
-        cfg["sheet_tab"]         = sp.inp_sheet_tab.text().strip() or "Sheet1"
-        cfg["credentials_path"]  = sp.inp_creds.text().strip()
-        cfg["webhook_url"]       = sp.inp_webhook.text().strip()
-        cfg["appium"]["host"]    = sp.inp_appium_host.text().strip()
-
+        cfg["sheet_id"]         = sp.inp_sheet_id.text().strip()
+        cfg["sheet_tab"]        = sp.inp_sheet_tab.text().strip() or "Sheet1"
+        cfg["credentials_path"] = sp.inp_creds.text().strip()
+        cfg["webhook_url"]      = sp.inp_webhook.text().strip()
+        cfg["appium"]["host"]   = sp.inp_appium_host.text().strip()
         cfg["delays"] = {
-            "between_profiles_min":  sp.sp_prof_min.value(),
-            "between_profiles_max":  sp.sp_prof_max.value(),
-            "between_scrolls_min":   sp.sp_scrl_min.value(),
-            "between_scrolls_max":   sp.sp_scrl_max.value(),
-            "run_min_profiles":      sp.sp_run_min.value(),
-            "run_max_profiles":      sp.sp_run_max.value(),
-            "rest_min_minutes":      sp.sp_rest_min.value(),
-            "rest_max_minutes":      sp.sp_rest_max.value(),
-            "session_break_every":   sp.sp_switch_every.value(),
+            "between_profiles_min":   sp.sp_prof_min.value(),
+            "between_profiles_max":   sp.sp_prof_max.value(),
+            "between_scrolls_min":    sp.sp_scrl_min.value(),
+            "between_scrolls_max":    sp.sp_scrl_max.value(),
+            "run_min_profiles":       sp.sp_run_min.value(),
+            "run_max_profiles":       sp.sp_run_max.value(),
+            "rest_min_minutes":       sp.sp_rest_min.value(),
+            "rest_max_minutes":       sp.sp_rest_max.value(),
+            "session_break_every":    sp.sp_switch_every.value(),
             "session_break_duration": 30,
+            "switch_mode":            "hours" if sp.rb_switch_hours.isChecked() else "profiles",
+            "switch_hours":           sp.sp_switch_hours.value(),
         }
         return cfg
 
@@ -1379,16 +1502,21 @@ class MainWindow(FluentWindow):
         sp.sp_rest_min.setValue(int(d.get("rest_min_minutes", 30)))
         sp.sp_rest_max.setValue(int(d.get("rest_max_minutes", 60)))
         sp.sp_switch_every.setValue(int(d.get("session_break_every", 50)))
+        switch_mode = d.get("switch_mode", "profiles")
+        sp.rb_switch_hours.setChecked(switch_mode == "hours")
+        sp.rb_switch_profiles.setChecked(switch_mode != "hours")
+        sp.sp_switch_hours.setValue(int(d.get("switch_hours", 1)))
+        # Re-apply enabled state after loading
+        sp.sp_switch_every.setEnabled(switch_mode != "hours")
+        sp.sp_switch_hours.setEnabled(switch_mode == "hours")
 
-    # ── Core scraping — fully restored from v1 ────────────────────────────
+    # ── Core scraping ─────────────────────────────────────────────────────
     def _start_scraping(self):
         cfg      = self._collect_cfg()
         assigned = self._get_assigned_devices()
 
         if not assigned:
-            InfoBar.warning(
-                "No Devices", "Assign at least one phone in the Dashboard.", parent=self
-            )
+            InfoBar.warning("No Devices", "Assign at least one phone in the Dashboard.", parent=self)
             return
 
         phone_targets = self._get_phone_targets()
@@ -1443,9 +1571,7 @@ class MainWindow(FluentWindow):
 
         self.dashboard_page.btn_start.setEnabled(False)
         self.dashboard_page.btn_stop.setEnabled(True)
-        self.dashboard_page.lbl_overall_status.setText(
-            f"Running ({len(assigned)} phones)…"
-        )
+        self.dashboard_page.lbl_overall_status.setText(f"Running ({len(assigned)} phones)…")
         self.stackedWidget.setCurrentWidget(self.results_page)
 
         self._log(
@@ -1477,6 +1603,7 @@ class MainWindow(FluentWindow):
             worker.signals.finished.connect(self._on_phone_finished)
             worker.signals.error.connect(self._on_phone_error)
             worker.signals.status.connect(self._on_phone_status)
+            worker.signals.account_switched.connect(self._on_auto_switch)
             self._workers.append(worker)
             worker.start()
             self._log(
@@ -1564,12 +1691,8 @@ class MainWindow(FluentWindow):
     def _reset_ui_after_done(self):
         self.dashboard_page.btn_start.setEnabled(True)
         self.dashboard_page.btn_stop.setEnabled(False)
-        self.dashboard_page.lbl_overall_status.setText(
-            f"Done — {self._collected} collected"
-        )
-        self.results_page.lbl_progress.setText(
-            f"Done: {self._collected} total accounts"
-        )
+        self.dashboard_page.lbl_overall_status.setText(f"Done — {self._collected} collected")
+        self.results_page.lbl_progress.setText(f"Done: {self._collected} total accounts")
 
     # ── Logging ───────────────────────────────────────────────────────────
     def _log(self, msg: str):
@@ -1663,9 +1786,7 @@ class MainWindow(FluentWindow):
                         (table.item(row, col).text() if table.item(row, col) else "")
                         for col in range(table.columnCount())
                     ])
-            InfoBar.success(
-                "Exported", f"{table.rowCount()} rows saved to {path}", parent=self
-            )
+            InfoBar.success("Exported", f"{table.rowCount()} rows saved to {path}", parent=self)
         except Exception as e:
             InfoBar.error("Export Failed", str(e), parent=self)
 
@@ -1680,3 +1801,12 @@ class MainWindow(FluentWindow):
         if hasattr(self, "mirror"):
             self.mirror.detach()
         event.accept()
+
+
+if __name__ == "__main__":
+    import sys
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon("assets/Cansa.png"))
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
