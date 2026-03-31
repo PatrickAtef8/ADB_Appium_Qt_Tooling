@@ -9,7 +9,7 @@
     "skip_no_profile_pic": false,
     "skip_no_contact": false,
     "min_posts": 3,
-    "require_recent_post_days": 366,
+    "require_recent_post_days": 99,
     "keywords": [],
     "only_keywords": []
   },
@@ -20,10 +20,12 @@
     "between_scrolls_max": 3.0,
     "run_min_profiles": 3,
     "run_max_profiles": 10,
-    "rest_min_minutes": 30,
+    "rest_min_minutes": 31,
     "rest_max_minutes": 60,
-    "session_break_every": 3,
-    "session_break_duration": 30
+    "session_break_every": 1,
+    "session_break_duration": 30,
+    "switch_mode": "profiles",
+    "switch_hours": 1
   },
   "schedule": {
     "enabled": false,
@@ -55,11 +57,11 @@
   "blacklist": [],
   "last_target": "adidas",
   "last_mode": "following",
-  "last_count": 5,
+  "last_count": 100,
   "last_device": "",
   "targets_per_phone": [
     [
-      "cbc"
+      "google"
     ],
     [],
     []
@@ -68,5 +70,6 @@
     "id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
     "tab": "Sheet1",
     "creds": "/home/patrick/p2/upwork/upworkautomation/upworkAutomation/assets/credentials.json"
-  }
+  },
+  "ui_scale": 1.0
 }
