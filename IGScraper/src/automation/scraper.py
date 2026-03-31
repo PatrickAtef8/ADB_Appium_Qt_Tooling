@@ -67,12 +67,15 @@ class InstagramScraper:
         on_account_found: Optional[Callable[[dict], None]] = None,
         on_log: Optional[Callable[[str], None]] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
+        on_switch_check: Optional[Callable[[int], None]] = None,
     ):
         self.ctrl = controller
         self.on_account_found = on_account_found
         self.on_log = on_log
         self.on_progress = on_progress
+        self.on_switch_check = on_switch_check
         self._stop_flag = False
+        self._need_reopen_list = False   # set True after account switch to force re-navigation
 
     def stop(self):
         self._stop_flag = True
@@ -311,7 +314,6 @@ class InstagramScraper:
             )
             if story_indicators:
                 has_story = True
-            # Also check content description for story
             avatar_containers = row_element.find_elements(
                 AppiumBy.CLASS_NAME, "android.widget.FrameLayout"
             )
@@ -326,7 +328,7 @@ class InstagramScraper:
         except Exception:
             pass
 
-        # Detect if profile picture is present (default avatar vs real pic)
+        # Detect if profile picture is present
         try:
             img_views = row_element.find_elements(
                 AppiumBy.CLASS_NAME, "android.widget.ImageView"
@@ -352,7 +354,7 @@ class InstagramScraper:
             "post_count": 0,
             "has_profile_pic": has_profile_pic,
             "has_story": has_story,
-            "has_recent_post": True,  # assume true until profile opened
+            "has_recent_post": True,
             "is_private": False,
             "profile_url": f"https://www.instagram.com/{username}/",
             "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -439,7 +441,6 @@ class InstagramScraper:
                 contact_btn.click()
                 time.sleep(2)
 
-                # Read the contact sheet that pops up
                 try:
                     all_text_els = driver.find_elements(
                         AppiumBy.CLASS_NAME, "android.widget.TextView"
@@ -453,18 +454,13 @@ class InstagramScraper:
                         if txt and not details["phone"]:
                             if re.search(r"\+?\d[\d\s\-\(\)]{6,}", txt):
                                 details["phone"] = extract_phone(txt)
-                        # Location from contact sheet
-                        if txt and not details["location"] and len(txt) > 3:
-                            if not extract_email(txt) and not re.search(r"\d{5,}", txt):
-                                pass  # Could be location — too ambiguous here
                 except Exception:
                     pass
 
-                # Dismiss contact sheet
                 driver.back()
                 time.sleep(1)
             except Exception:
-                pass  # No contact button
+                pass
 
             # Also try "Email" link button directly
             if not details["email"]:
@@ -532,22 +528,19 @@ class InstagramScraper:
             except Exception:
                 details["is_private"] = False
 
-            # Has profile picture? (check if avatar is default)
+            # Has profile picture?
             try:
                 profile_pic = driver.find_element(
                     AppiumBy.ID,
                     "com.instagram.android:id/profile_header_avatar_container_frame"
                 )
                 desc = profile_pic.get_attribute("content-desc") or ""
-                # Default avatar has no meaningful description
                 details["has_profile_pic"] = len(desc) > 5
             except Exception:
-                details["has_profile_pic"] = True  # assume present
+                details["has_profile_pic"] = True
 
-            # Check for recent posts (look at post grid timestamps via accessibility)
-            # For non-private accounts, try to check if there are any posts visible
             if not details["is_private"] and details["post_count"] > 0:
-                details["has_recent_post"] = True  # we can't easily get post dates, assume true
+                details["has_recent_post"] = True
 
             # Country code inference
             details["country_code"] = infer_country_code(
@@ -558,6 +551,89 @@ class InstagramScraper:
             self._log(f"Could not open profile of {username}: {e}")
 
         return details
+
+    def _appium_navigate_to_home(self) -> bool:
+        """
+        Use the live Appium session to dismiss the following list, then use
+        ADB 'am start --activity-clear-top' to collapse the Instagram back
+        stack to a single root activity BEFORE releasing the session for
+        ADB-based account switching.
+
+        Why --activity-clear-top is critical
+        -------------------------------------
+        navigate_to_profile() uses 'am start -a android.intent.action.VIEW'
+        (a deep link) which PUSHES a new Activity onto Instagram's back stack.
+        After the first switch the re-navigation does this deep link again, so
+        by the time the second switch fires the stack looks like:
+
+            HomeActivity → DeepLinkProfileActivity → FollowingListSheet
+
+        Without clearing the stack, the Back presses inside
+        switch_instagram_account() Phase B must traverse ALL those layers.
+        If the loop runs out of attempts while still inside the deep-link
+        Profile activity, the next Back press exits Instagram to the launcher
+        (Instagram leaves the foreground).
+
+        --activity-clear-top pops every Activity above the main one in a
+        single command, leaving exactly:
+
+            InstagramMainActivity   (depth = 1, always safe to Back from)
+
+        This makes the stack depth identical whether it is the 1st or the
+        50th switch, so Phase B always finds the chevron on the very first
+        Profile-tab tap.
+        """
+        import subprocess
+
+        driver = self.ctrl.driver
+        serial = self.ctrl._device_serial or ""
+
+        try:
+            # Step 1: Dismiss the following list via Appium back() (max 6 presses)
+            # We check for all known list container IDs so we catch every variant.
+            LIST_IDS = [
+                "com.instagram.android:id/follow_list_container",
+                "com.instagram.android:id/row_user_container_base",
+                "com.instagram.android:id/unified_follow_list_user_container",
+            ]
+            if driver is not None:
+                for _ in range(6):
+                    list_found = False
+                    for lid in LIST_IDS:
+                        try:
+                            driver.find_element(AppiumBy.ID, lid)
+                            list_found = True
+                            break
+                        except NoSuchElementException:
+                            continue
+                    if not list_found:
+                        break
+                    driver.back()
+                    time.sleep(1.2)
+
+            # Step 2: Use ADB to collapse the entire Instagram back stack to
+            # the main activity in one shot.  This works even while the
+            # Appium session is still connected because am-start does not
+            # conflict with UiAutomator2 — it only modifies the activity
+            # manager task stack.
+            subprocess.run(
+                [
+                    "adb", "-s", serial, "shell", "am", "start",
+                    "--activity-clear-top",
+                    "-n", "com.instagram.android/"
+                         "com.instagram.mainactivity.InstagramMainActivity",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            time.sleep(2.0)   # let the animation finish
+
+            self._log("🏠 Pressed Back to clear screen before account switch")
+            return True
+
+        except Exception as e:
+            self._log(f"⚠️ _appium_navigate_to_home error (non-fatal): {e}")
+            # Even on error the ADB switch can still attempt — not fatal.
+            return False
 
     def scroll_list(self, swipe_distance: float = 0.6):
         """Scroll the followers/following list down."""
@@ -588,15 +664,16 @@ class InstagramScraper:
             blacklist = set()
 
         self._stop_flag = False
+        self._need_reopen_list = False
         collected = 0
         seen_usernames = set()
 
-        scroll_delay_min = delays.get("between_scrolls_min", 1.0)
-        scroll_delay_max = delays.get("between_scrolls_max", 3.0)
-        profile_delay_min = delays.get("between_profiles_min", 2.0)
-        profile_delay_max = delays.get("between_profiles_max", 4.0)
-        break_every = int(delays.get("session_break_every", 100))
-        break_duration = int(delays.get("session_break_duration", 30))
+        scroll_delay_min  = delays.get("between_scrolls_min",   1.0)
+        scroll_delay_max  = delays.get("between_scrolls_max",   3.0)
+        profile_delay_min = delays.get("between_profiles_min",  2.0)
+        profile_delay_max = delays.get("between_profiles_max",  4.0)
+        break_every       = int(delays.get("session_break_every",    100))
+        break_duration    = int(delays.get("session_break_duration",  30))
 
         if not self.navigate_to_profile(target_username):
             self._log(f"❌ Failed to navigate to @{target_username}")
@@ -610,6 +687,21 @@ class InstagramScraper:
         consecutive_empty = 0
 
         while collected < max_count and not self._stop_flag:
+
+            # ── Re-navigate after account switch ──────────────────────────
+            if self._need_reopen_list:
+                self._need_reopen_list = False
+                self._log(f"🔄 Re-opening {mode} list after account switch…")
+                if not self.navigate_to_profile(target_username):
+                    self._log("❌ Re-navigation failed after switch, stopping.")
+                    break
+                if not self.open_list(mode):
+                    self._log("❌ Could not reopen list after switch, stopping.")
+                    break
+                consecutive_empty = 0
+                continue   # restart while-loop on fresh list screen
+            # ─────────────────────────────────────────────────────────────
+
             accounts = self._extract_visible_accounts()
 
             if not accounts:
@@ -624,7 +716,10 @@ class InstagramScraper:
             consecutive_empty = 0
 
             for acc in accounts:
-                if self._stop_flag or collected >= max_count:
+                # Break inner loop immediately if stop or switch was requested
+                if self._stop_flag or self._need_reopen_list:
+                    break
+                if collected >= max_count:
                     break
 
                 uname = acc["username"].lower()
@@ -664,13 +759,30 @@ class InstagramScraper:
                     f"posts={acc.get('post_count', '-')}"
                 )
 
-                # Session break
-                if break_every > 0 and collected % break_every == 0:
+                # ── Account switch check ───────────────────────────────────
+                # Called after every collected profile. If the threshold is
+                # reached, on_switch_check sets _need_reopen_list = True so
+                # the outer while-loop re-navigates before the next profile.
+                if self.on_switch_check:
+                    self.on_switch_check(collected)
+                # ─────────────────────────────────────────────────────────
+
+                # Session break (pause only — no switch logic here).
+                # Skip if a switch was just triggered on this same tick:
+                # the switch already pauses for several seconds internally,
+                # and _need_reopen_list being True means we are about to
+                # re-navigate — adding another break here is redundant and
+                # would delay the re-navigation unnecessarily.
+                if (break_every > 0
+                        and collected % break_every == 0
+                        and not self._need_reopen_list):
                     self._log(f"⏸️ Session break for {break_duration}s...")
                     time.sleep(break_duration)
 
-            self.scroll_list()
-            time.sleep(_rand(scroll_delay_min, scroll_delay_max))
+            # Scroll to reveal more rows (outer loop continues)
+            if not self._need_reopen_list:
+                self.scroll_list()
+                time.sleep(_rand(scroll_delay_min, scroll_delay_max))
 
         self._log(f"🏁 Done. Collected {collected} accounts.")
         return collected
