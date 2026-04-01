@@ -444,10 +444,12 @@ class MirrorStreamWorker(QThread):
                         frames_out  += 1
                         if self._stop_requested:
                             return frames_out
-                        arr  = frame.to_ndarray(format="rgb24")
-                        fh, fw, ch = arr.shape
+                        # Convert without numpy: reformat to rgb24, read raw bytes
+                        rgb_frame = frame.reformat(format="rgb24")
+                        fw, fh    = rgb_frame.width, rgb_frame.height
+                        raw       = bytes(rgb_frame.planes[0])
                         qimg = QImage(
-                            arr.tobytes(), fw, fh, ch * fw,
+                            raw, fw, fh, fw * 3,
                             QImage.Format.Format_RGB888,
                         ).copy()
                         self.frame_ready.emit(qimg)
@@ -489,10 +491,12 @@ class MirrorStreamWorker(QThread):
             try:
                 for frame in codec_ctx.decode(None):
                     frame_count += 1
-                    arr  = frame.to_ndarray(format="rgb24")
-                    fh, fw, ch = arr.shape
+                    # Convert without numpy: reformat to rgb24, read raw bytes
+                    rgb_frame = frame.reformat(format="rgb24")
+                    fw, fh    = rgb_frame.width, rgb_frame.height
+                    raw       = bytes(rgb_frame.planes[0])
                     qimg = QImage(
-                        arr.tobytes(), fw, fh, ch * fw,
+                        raw, fw, fh, fw * 3,
                         QImage.Format.Format_RGB888,
                     ).copy()
                     self.frame_ready.emit(qimg)

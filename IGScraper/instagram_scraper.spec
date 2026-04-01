@@ -23,10 +23,13 @@ block_cipher = None
 # at runtime on the target machine because the FFmpeg DLLs are missing.
 av_datas, av_binaries, av_hiddenimports = collect_all("av")
 
+# numpy is required by PyAV's to_ndarray() — collect it fully so it's in the EXE
+np_datas, np_binaries, np_hiddenimports = collect_all("numpy")
+
 a = Analysis(
     ['main.py'],
     pathex=[str(Path('.').resolve())],          # ← original robust path
-    binaries=[*av_binaries],
+    binaries=[*av_binaries, *np_binaries],
     datas=[
         # New PNG (splash + title-bar icon) → lands in root of _MEIPASS
         ('cansa_icon.png', '.'),
@@ -39,6 +42,7 @@ a = Analysis(
         # scrcpy server JAR for Live Mirror feature
         ('src/mirror/assets/scrcpy-server.jar', 'src/mirror/assets'),
         *av_datas,
+        *np_datas,
     ],
     hiddenimports=[
         # Original hiddenimports
@@ -65,6 +69,9 @@ a = Analysis(
 
         # PyAV — required for Live Mirror H.264 decoding (collected automatically)
         *av_hiddenimports,
+
+        # numpy — required by PyAV frame conversion
+        *np_hiddenimports,
 
         # Mirror module
         'src.mirror', 'src.mirror.mirror_widget', 'src.mirror.stream_worker',

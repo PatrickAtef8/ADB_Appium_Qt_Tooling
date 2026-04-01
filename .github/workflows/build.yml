@@ -33,9 +33,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path assets
           '{"installed":{}}' | Out-File -FilePath assets/credentials.json -Encoding utf8
 
-      - name: Install PyAV (includes FFmpeg binaries for H.264 decoding)
+      - name: Install PyAV and numpy (required for H.264 frame decoding)
         working-directory: IGScraper
-        run: pip install av
+        run: pip install av numpy
 
 
       - name: Build EXE with PyInstaller
