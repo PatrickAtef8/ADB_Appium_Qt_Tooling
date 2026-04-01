@@ -447,9 +447,10 @@ class MirrorStreamWorker(QThread):
                         # Convert without numpy: reformat to rgb24, read raw bytes
                         rgb_frame = frame.reformat(format="rgb24")
                         fw, fh    = rgb_frame.width, rgb_frame.height
-                        raw       = bytes(rgb_frame.planes[0])
+                        plane     = rgb_frame.planes[0]
+                        raw       = bytes(plane)
                         qimg = QImage(
-                            raw, fw, fh, fw * 3,
+                            raw, fw, fh, plane.line_size,
                             QImage.Format.Format_RGB888,
                         ).copy()
                         self.frame_ready.emit(qimg)
@@ -494,9 +495,10 @@ class MirrorStreamWorker(QThread):
                     # Convert without numpy: reformat to rgb24, read raw bytes
                     rgb_frame = frame.reformat(format="rgb24")
                     fw, fh    = rgb_frame.width, rgb_frame.height
-                    raw       = bytes(rgb_frame.planes[0])
+                    plane     = rgb_frame.planes[0]
+                    raw       = bytes(plane)
                     qimg = QImage(
-                        raw, fw, fh, fw * 3,
+                        raw, fw, fh, plane.line_size,
                         QImage.Format.Format_RGB888,
                     ).copy()
                     self.frame_ready.emit(qimg)
