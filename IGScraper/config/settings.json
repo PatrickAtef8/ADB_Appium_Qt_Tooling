@@ -40,7 +40,7 @@
   },
   "devices": [
     {
-      "serial": "emulator-5554"
+      "serial": null
     },
     {
       "serial": null

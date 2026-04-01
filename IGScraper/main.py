@@ -28,6 +28,18 @@ _APP_BG = "#0f172a"   # must match dark `bg` in MainWindow._apply_stylesheet
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX 3: Resource path helper for PyInstaller bundled EXE
+# When running as a frozen EXE sys._MEIPASS is the temp extraction folder.
+# At development time we fall back to the directory containing this file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resource_path(relative: str) -> str:
+    """Return absolute path to a bundled resource, works for dev and PyInstaller EXE."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SplashWindow
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -100,7 +112,6 @@ class SplashWindow(QWidget):
         self._bar.setStyleSheet("background: #3b82f6; border-radius: 1px;")
 
         # ── Fade-out via setWindowOpacity (OS compositor — smooth) ────────
-        # Animate the windowOpacity property directly on self.
         self._anim_out = QPropertyAnimation(self, b"windowOpacity", self)
         self._anim_out.setDuration(self._FADE_OUT_MS)
         self._anim_out.setStartValue(1.0)
@@ -136,10 +147,8 @@ def main():
     app.setApplicationName("Cansa")
     app.setApplicationVersion("1.0")
 
-    icon_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "Cansav2.png"
-    )
+    # FIX 3: Use _resource_path so the icon is found inside the EXE bundle
+    icon_path = _resource_path("Cansav2.png")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
         print(f"✅ Application icon loaded: {icon_path}")
@@ -157,14 +166,13 @@ def main():
     splash = SplashWindow(icon_path, screen_geo)
 
     def _reveal_main():
-        # Fade main window in using setWindowOpacity — OS compositor, no lag
         anim = QPropertyAnimation(window, b"windowOpacity", window)
         anim.setDuration(500)
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
-        window.showMaximized()  # show at opacity 0, then animate to 1
+        window.showMaximized()
         anim.start()
 
     splash.finished.connect(_reveal_main)
