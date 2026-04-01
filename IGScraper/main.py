@@ -148,7 +148,7 @@ def main():
     app.setApplicationVersion("1.0")
 
     # FIX 3: Use _resource_path so the icon is found inside the EXE bundle
-    icon_path = _resource_path("Cansav2.png")
+    icon_path = _resource_path("Cansav2.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
         print(f"✅ Application icon loaded: {icon_path}")
