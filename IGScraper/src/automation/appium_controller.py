@@ -13,7 +13,19 @@ from appium import webdriver
 from appium.options.android import UiAutomator2Options
 
 INSTAGRAM_PACKAGE = "com.instagram.android"
-SCRCPY_PATH = "/usr/local/bin/scrcpy"
+# SCRCPY_PATH is now cross-platform - resolved by shutil.which() at runtime
+SCRCPY_PATH = "scrcpy"
+
+# ── Windows: suppress console windows for every subprocess call ───────────────
+_WINDOWS_NO_WINDOW: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+)
+
+
+def _run_hidden(*args, **kwargs):
+    """subprocess.run() wrapper that hides console windows on Windows."""
+    kwargs.update(_WINDOWS_NO_WINDOW)
+    return subprocess.run(*args, **kwargs)
 
 
 def _get_instagram_activity(serial: str) -> str:
@@ -24,7 +36,7 @@ def _get_instagram_activity(serial: str) -> str:
 def get_connected_devices() -> List[Tuple[str, str]]:
     """Returns list of (serial, model_name) for all connected ADB devices."""
     try:
-        result = subprocess.run(
+        result = _run_hidden(
             ["adb", "devices"], capture_output=True, text=True, timeout=10
         )
         lines = result.stdout.strip().splitlines()
@@ -36,7 +48,7 @@ def get_connected_devices() -> List[Tuple[str, str]]:
             parts = line.split("\t")
             if len(parts) == 2 and parts[1] == "device":
                 serial = parts[0]
-                name_result = subprocess.run(
+                name_result = _run_hidden(
                     ["adb", "-s", serial, "shell", "getprop", "ro.product.model"],
                     capture_output=True, text=True, timeout=5
                 )
@@ -58,12 +70,12 @@ def get_instagram_accounts(serial: str) -> List[str]:
     accounts = []
     try:
         # Make sure Instagram is open
-        top = subprocess.run(
+        top = _run_hidden(
             ["adb", "-s", serial, "shell", "dumpsys", "activity", "top"],
             capture_output=True, text=True, timeout=10
         )
         if INSTAGRAM_PACKAGE not in top.stdout:
-            subprocess.run(
+            _run_hidden(
                 ["adb", "-s", serial, "shell",
                  "monkey", "-p", INSTAGRAM_PACKAGE,
                  "-c", "android.intent.category.LAUNCHER", "1"],
@@ -71,7 +83,7 @@ def get_instagram_accounts(serial: str) -> List[str]:
             )
             for _ in range(10):
                 time.sleep(1)
-                check = subprocess.run(
+                check = _run_hidden(
                     ["adb", "-s", serial, "shell", "dumpsys", "activity", "top"],
                     capture_output=True, text=True, timeout=10
                 )
@@ -93,7 +105,7 @@ def get_instagram_accounts(serial: str) -> List[str]:
         accounts = [name for name, _ in account_rows]
 
         # Close the switcher
-        subprocess.run(
+        _run_hidden(
             ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
             capture_output=True, text=True, timeout=5
         )
@@ -107,11 +119,11 @@ def get_instagram_accounts(serial: str) -> List[str]:
 
 def _dump_ui(serial: str) -> str:
     """Dump the current UI hierarchy and return raw XML."""
-    subprocess.run(
+    _run_hidden(
         ["adb", "-s", serial, "shell", "uiautomator", "dump", "/sdcard/_ig_ui.xml"],
         capture_output=True, text=True, timeout=10
     )
-    return subprocess.run(
+    return _run_hidden(
         ["adb", "-s", serial, "shell", "cat", "/sdcard/_ig_ui.xml"],
         capture_output=True, text=True, timeout=10
     ).stdout
@@ -121,7 +133,7 @@ def _tap_bounds(serial: str, x1: int, y1: int, x2: int, y2: int):
     """Tap the centre of a bounding box."""
     x = (x1 + x2) // 2
     y = (y1 + y2) // 2
-    subprocess.run(
+    _run_hidden(
         ["adb", "-s", serial, "shell", "input", "tap", str(x), str(y)],
         capture_output=True, text=True, timeout=5
     )
@@ -254,7 +266,7 @@ def _go_to_profile_and_open_switcher(serial: str) -> str:
             time.sleep(1)
 
         # Switcher didn't appear — close whatever opened and retry
-        subprocess.run(
+        _run_hidden(
             ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
             capture_output=True, text=True, timeout=5
         )
@@ -373,7 +385,7 @@ def _navigate_to_profile_tab_via_back(serial: str) -> bool:
             return True
 
         # Nav bar not visible — press Back to go up one level
-        subprocess.run(
+        _run_hidden(
             ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
             capture_output=True, text=True, timeout=5
         )
@@ -547,14 +559,14 @@ def switch_instagram_account(
                     break
                 # List reappeared in the second dump — treat as still present
                 _log(f"  Phase A [{attempt}] list found in re-check — pressing Back")
-                subprocess.run(
+                _run_hidden(
                     ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                     capture_output=True, text=True, timeout=5
                 )
                 time.sleep(2.0)
                 continue
             _log(f"  Phase A [{attempt}] list still present — pressing Back")
-            subprocess.run(
+            _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
             )
@@ -578,7 +590,7 @@ def switch_instagram_account(
             # Safety: if the list somehow reappeared, go back to Phase A logic
             if _has_list(xml):
                 _log(f"  Phase B [{attempt}] list reappeared — pressing Back again")
-                subprocess.run(
+                _run_hidden(
                     ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                     capture_output=True, text=True, timeout=5
                 )
@@ -614,13 +626,13 @@ def switch_instagram_account(
             # If it is not (e.g. deep-link activity stack was over-popped and
             # the launcher is now on top), re-launch the main activity with
             # --activity-clear-top instead of pressing Back into the void.
-            top_check = subprocess.run(
+            top_check = _run_hidden(
                 ["adb", "-s", serial, "shell", "dumpsys", "activity", "top"],
                 capture_output=True, text=True, timeout=10
             ).stdout
             if INSTAGRAM_PACKAGE not in top_check:
                 _log(f"  Phase B [{attempt}] Instagram left foreground — re-launching main activity")
-                subprocess.run(
+                _run_hidden(
                     [
                         "adb", "-s", serial, "shell", "am", "start",
                         "--activity-clear-top",
@@ -633,7 +645,7 @@ def switch_instagram_account(
 
             # Neither chevron nor Profile tab visible — we may be on a sub-screen
             _log(f"  Phase B [{attempt}] -> no chevron or Profile tab — pressing Back")
-            subprocess.run(
+            _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
             )
@@ -680,7 +692,7 @@ def switch_instagram_account(
 
             if not switcher_xml:
                 _log("Step 2 FAILED: switcher never appeared")
-                subprocess.run(
+                _run_hidden(
                     ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                     capture_output=True, text=True, timeout=5
                 )
@@ -694,7 +706,7 @@ def switch_instagram_account(
         if not rows:
             _log("Step 3 FAILED: no rows parsed")
             _log(f"  XML snippet: {switcher_xml[switcher_xml.find('row_user_textview')-200:switcher_xml.find('row_user_textview')+200]}")
-            subprocess.run(
+            _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
             )
@@ -722,7 +734,7 @@ def switch_instagram_account(
 
         if target is None:
             _log("Step 3 FAILED: no target row found")
-            subprocess.run(
+            _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
             )
@@ -730,7 +742,7 @@ def switch_instagram_account(
 
         t_name, t_x, t_y = target
         _log(f"  tapping '{t_name}' at ({t_x},{t_y})")
-        subprocess.run(
+        _run_hidden(
             ["adb", "-s", serial, "shell", "input", "tap", str(t_x), str(t_y)],
             capture_output=True, text=True, timeout=5
         )
@@ -741,14 +753,14 @@ def switch_instagram_account(
         xml = _dump_ui(serial)
         if "unexpected error" in xml.lower():
             _log("  FAILED: unexpected error on screen")
-            subprocess.run(
+            _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
             )
             return False
 
         # Confirm Instagram is still running
-        top = subprocess.run(
+        top = _run_hidden(
             ["adb", "-s", serial, "shell", "dumpsys", "activity", "top"],
             capture_output=True, text=True, timeout=10
         ).stdout
@@ -787,9 +799,10 @@ def start_scrcpy(serial: str) -> Optional[subprocess.Popen]:
         "--stay-awake",
         "--no-audio",
     ]
-    kwargs = {}
+    kwargs = dict(_WINDOWS_NO_WINDOW)
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        # CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
     proc = subprocess.Popen(
         cmd,
@@ -844,13 +857,13 @@ class AppiumController:
 
         # Bring Instagram to foreground if it somehow ended up in background,
         # without restarting it (--activity-single-top reuses the existing task).
-        top = subprocess.run(
+        top = _run_hidden(
             ["adb", "-s", device_serial, "shell", "dumpsys", "activity", "top"],
             capture_output=True, text=True, timeout=10
         )
         if INSTAGRAM_PACKAGE not in top.stdout:
             print(f"📱 [DEBUG] Instagram not in foreground — bringing to front (no restart)")
-            subprocess.run(
+            _run_hidden(
                 ["adb", "-s", device_serial, "shell", "am", "start",
                  "-n", f"{INSTAGRAM_PACKAGE}/com.instagram.mainactivity.InstagramMainActivity",
                  "--activity-single-top"],

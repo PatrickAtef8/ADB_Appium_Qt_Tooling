@@ -8,7 +8,7 @@ import random
 from datetime import datetime, time as dtime
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore    import Qt, QThread, QTime, pyqtSignal, QObject
+from PyQt6.QtCore    import Qt, QThread, QTime, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui     import QFont, QColor, QIcon
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
@@ -65,6 +65,63 @@ class T:
     @staticmethod
     def mono():
         f = QFont("JetBrains Mono, Consolas", 11); return f
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MirrorResizeGrip  – draggable left edge for the mirror panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MirrorResizeGrip(QWidget):
+    """
+    A thin vertical strip placed on the left edge of the mirror panel.
+    Dragging it left/right resizes the panel.
+    """
+    width_changed = pyqtSignal(int)   # emits new panel width while dragging
+
+    _GRIP_W = 8   # visible width of the grip strip
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(self._GRIP_W)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self._dragging   = False
+        self._drag_start_x    = 0
+        self._panel_w_at_drag = 0
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._dragging        = True
+            self._drag_start_x    = e.globalPosition().x()
+            # container width minus the grip itself = current panel content width
+            parent_w = self.parent().width() if self.parent() else (500 + self._GRIP_W)
+            self._panel_w_at_drag = parent_w - self._GRIP_W
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._dragging:
+            delta    = int(self._drag_start_x - e.globalPosition().x())
+            new_w    = max(260, min(900, self._panel_w_at_drag + delta))
+            self.width_changed.emit(new_w)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            e.accept()
+
+    def paintEvent(self, e):
+        from PyQt6.QtGui import QPainter, QColor
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # subtle dotted handle in the centre
+        cx = self._GRIP_W // 2
+        dot_color = QColor("#475569")
+        p.setBrush(dot_color)
+        p.setPen(Qt.PenStyle.NoPen)
+        h = self.height()
+        for y in range(h // 2 - 24, h // 2 + 24, 8):
+            p.drawEllipse(cx - 2, y, 4, 4)
+        p.end()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1044,12 +1101,28 @@ class MainWindow(FluentWindow):
 
     # ── Persistent mirror panel ───────────────────────────────────────────
     def _init_persistent_mirror(self):
-        self.mirror_panel = QWidget(self)
+        # Restore saved width (default 500, clamp to valid range)
+        self._mirror_width: int = max(260, min(900, int(self.cfg.get("mirror_width", 500))))
+
+        # ── Outer container: grip + panel side by side ────────────────────
+        self._mirror_container = QWidget(self)
+        self._mirror_container.setObjectName("MirrorContainer")
+        container_lay = QHBoxLayout(self._mirror_container)
+        container_lay.setContentsMargins(0, 0, 0, 0)
+        container_lay.setSpacing(0)
+
+        # Draggable left-edge grip
+        self._resize_grip = MirrorResizeGrip(self._mirror_container)
+        self._resize_grip.width_changed.connect(self._on_mirror_resize_drag)
+        container_lay.addWidget(self._resize_grip)
+
+        # Actual panel (everything that was there before)
+        self.mirror_panel = QWidget(self._mirror_container)
         self.mirror_panel.setObjectName("PersistentMirrorPanel")
-        self.mirror_panel.setFixedWidth(500)
+        container_lay.addWidget(self.mirror_panel, stretch=1)
 
         layout = QVBoxLayout(self.mirror_panel)
-        layout.setContentsMargins(15, 30, 30, 30)
+        layout.setContentsMargins(10, 30, 30, 30)
         layout.setSpacing(20)
 
         hdr_row = QHBoxLayout()
@@ -1058,6 +1131,26 @@ class MainWindow(FluentWindow):
         mirror_title.setStyleSheet("background: transparent;")
         hdr_row.addWidget(mirror_title)
         hdr_row.addStretch()
+
+        # Width control buttons  ─  and  +
+        self._btn_mirror_shrink = PushButton("−", self.mirror_panel)
+        self._btn_mirror_shrink.setFixedSize(30, 30)
+        self._btn_mirror_shrink.setFont(T.heading())
+        self._btn_mirror_shrink.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_mirror_shrink.setToolTip("Shrink mirror panel")
+        self._btn_mirror_shrink.clicked.connect(lambda: self._step_mirror_width(-60))
+
+        self._btn_mirror_grow = PushButton("+", self.mirror_panel)
+        self._btn_mirror_grow.setFixedSize(30, 30)
+        self._btn_mirror_grow.setFont(T.heading())
+        self._btn_mirror_grow.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_mirror_grow.setToolTip("Grow mirror panel")
+        self._btn_mirror_grow.clicked.connect(lambda: self._step_mirror_width(+60))
+
+        hdr_row.addWidget(self._btn_mirror_shrink)
+        hdr_row.addWidget(self._btn_mirror_grow)
+        hdr_row.addSpacing(8)
+
         self.lbl_mirror_device = CaptionLabel("No device selected", self.mirror_panel)
         self.lbl_mirror_device.setFont(T.body())
         self.lbl_mirror_device.setStyleSheet("background: transparent;")
@@ -1070,23 +1163,95 @@ class MainWindow(FluentWindow):
         )
         self.mirror.detached.connect(self._on_mirror_detached)
         layout.addWidget(self.mirror, stretch=1)
-        self.mirror_panel.hide()
+        self._mirror_container.hide()
+
+    # ── Mirror width helpers ──────────────────────────────────────────────
+    def _on_mirror_resize_drag(self, new_width: int):
+        self._mirror_width = new_width
+        self._reposition_mirror()
+
+    def _step_mirror_width(self, delta: int):
+        self._mirror_width = max(260, min(900, self._mirror_width + delta))
+        self._reposition_mirror()
+
+    def _reposition_mirror(self):
+        """Reposition the mirror container to match _mirror_width."""
+        if not hasattr(self, "_mirror_container"):
+            return
+        grip_w = MirrorResizeGrip._GRIP_W
+        total_w = self._mirror_width + grip_w
+        tb_h = self.titleBar.height()
+        h = self.height() - tb_h
+
+        self._mirror_container.setGeometry(
+            self.width() - total_w, tb_h, total_w, h,
+        )
+
+        # Force the mirror_panel's layout to fully re-activate so MirrorWidget
+        # fills the new size.  Simply calling setGeometry on the container is
+        # not enough — Qt won't re-run the layout pass on children that were
+        # already laid out at a smaller size unless we explicitly tell every
+        # layout in the chain to invalidate and re-activate.
+        lay = self.mirror_panel.layout()
+        if lay:
+            lay.invalidate()
+            lay.activate()
+
+        if hasattr(self, "mirror"):
+            self.mirror.updateGeometry()
+            self.mirror.update()
+            # MirrorWidget may render video into a manually-placed child surface
+            # that doesn't respond to layout signals.  Explicitly set its geometry
+            # to fill the available space inside mirror_panel so the video always
+            # covers the full panel regardless of how MirrorWidget is implemented.
+            mp = self.mirror_panel
+            margins = mp.layout().contentsMargins()
+            spacing = mp.layout().spacing()
+            # Header row is the first item in the layout; measure its actual height
+            header_h = 0
+            lay = mp.layout()
+            if lay.count() > 0:
+                first_item = lay.itemAt(0)
+                if first_item and first_item.layout():
+                    header_h = first_item.layout().sizeHint().height() + spacing
+                elif first_item and first_item.widget():
+                    header_h = first_item.widget().sizeHint().height() + spacing
+            target_w = mp.width()  - margins.left() - margins.right()
+            target_h = mp.height() - margins.top()  - margins.bottom() - header_h
+            if target_w > 10 and target_h > 10:
+                self.mirror.setGeometry(margins.left(), margins.top() + header_h,
+                                        target_w, target_h)
+
+        # Save width to config immediately
+        self.cfg["mirror_width"] = self._mirror_width
+
+        # When the device screen is idle (no active touches/frames arriving),
+        # the video surface never gets a new frame to trigger a repaint at the
+        # new size.  Fire a one-shot timer to force a repaint after Qt has
+        # finished its geometry pass — this makes resizing reliable whether
+        # the screen is active or completely idle.
+        QTimer.singleShot(50, self._nudge_mirror_repaint)
+
+    def _nudge_mirror_repaint(self):
+        """Force the mirror video surface to repaint at its current size."""
+        if not hasattr(self, "mirror"):
+            return
+        self.mirror.repaint()
+        # Also repaint every child widget inside MirrorWidget — the actual
+        # video surface is typically a child QWidget, not MirrorWidget itself.
+        for child in self.mirror.findChildren(QWidget):
+            child.repaint()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if hasattr(self, "mirror_panel"):
-            tb_h = self.titleBar.height()
-            self.mirror_panel.setGeometry(
-                self.width() - self.mirror_panel.width(),
-                tb_h,
-                self.mirror_panel.width(),
-                self.height() - tb_h,
-            )
+        self._reposition_mirror()
 
     def _update_mirror_visibility(self):
         current = self.stackedWidget.currentWidget()
         show = current in [self.dashboard_page, self.results_page]
-        self.mirror_panel.setVisible(show)
+        self._mirror_container.setVisible(show)
+        if show:
+            self._reposition_mirror()
 
     # ── Navigation ────────────────────────────────────────────────────────
     def _init_nav(self):
@@ -1145,6 +1310,9 @@ class MainWindow(FluentWindow):
             QScrollBar::handle:vertical{{ background: {border}; border-radius: 3px; min-height: 16px; }}
             QComboBox QAbstractItemView{{ background: {card_bg}; color: {text}; selection-background-color: #3b82f6; border: 1px solid {border}; }}
             #PersistentMirrorPanel{{ background: {bg}; border-left: 1px solid {border}; }}
+            #MirrorContainer{{ background: {bg}; }}
+            MirrorResizeGrip{{ background: transparent; }}
+            MirrorResizeGrip:hover{{ background: rgba(59,130,246,0.15); }}
             QRadioButton{{ background: transparent; font-size: 12pt; }}
         """
         self.setStyleSheet(css)
@@ -1792,7 +1960,9 @@ class MainWindow(FluentWindow):
 
     # ── Cleanup ───────────────────────────────────────────────────────────
     def closeEvent(self, event):
-        save_config(self._collect_cfg())
+        cfg = self._collect_cfg()
+        cfg["mirror_width"] = getattr(self, "_mirror_width", 500)
+        save_config(cfg)
         for w in self._workers:
             w.stop()
         for w in self._workers:

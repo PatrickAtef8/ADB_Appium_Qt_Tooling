@@ -24,6 +24,11 @@ from typing import Optional
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
+# ── Windows: suppress console windows ────────────────────────────────────────
+_WINDOWS_NO_WINDOW: dict = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+)
+
 DEBUG_LOG = True
 LOG_PATH  = Path.home() / "mirror_debug.log"
 
@@ -77,7 +82,7 @@ def _adb(serial: str, *args: str) -> list[str]:
 def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
     _log.log(f"  RUN: {' '.join(cmd)}")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **_WINDOWS_NO_WINDOW)
         if r.stdout.strip():
             _log.log(f"  STDOUT: {r.stdout.strip()[:300]}")
         if r.stderr.strip():
@@ -233,6 +238,7 @@ class MirrorStreamWorker(QThread):
                 server_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **_WINDOWS_NO_WINDOW,
             )
         except Exception as e:
             self.state_changed.emit(f"error:Cannot launch server — {e}")

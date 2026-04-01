@@ -29,6 +29,9 @@ a = Analysis(
         ('config/settings.json', 'config'),
         ('config/blacklist.json', 'config'),
         ('assets/credentials.json', 'assets'),
+
+        # scrcpy server JAR for Live Mirror feature
+        ('src/mirror/assets/scrcpy-server.jar', 'src/mirror/assets'),
     ],
     hiddenimports=[
         # Original hiddenimports
@@ -52,6 +55,13 @@ a = Analysis(
         # New additions from your updated spec
         'PyQt6',
         'qfluentwidgets',
+
+        # PyAV — required for Live Mirror H.264 decoding
+        'av', 'av.codec', 'av.codec.context', 'av.packet',
+        'av.video', 'av.video.frame', 'av.video.format',
+
+        # Mirror module
+        'src.mirror', 'src.mirror.mirror_widget', 'src.mirror.stream_worker',
     ],
     hookspath=[],
     hooksconfig={},
