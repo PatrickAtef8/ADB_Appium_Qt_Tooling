@@ -10,7 +10,7 @@ a = Analysis(
     datas=[
         ('config/settings.json', 'config'),
         ('config/blacklist.json', 'config'),
-        ('assets/credentials.json.template', 'assets'),
+        ('assets/credentials.json', 'assets'),
     ],
     hiddenimports=[
         'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets',
