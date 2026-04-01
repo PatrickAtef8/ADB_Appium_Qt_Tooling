@@ -14,13 +14,19 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
 
 block_cipher = None
+
+# Collect ALL PyAV files: Python modules + FFmpeg DLLs + data files
+# Without this, av imports successfully on the build machine but crashes
+# at runtime on the target machine because the FFmpeg DLLs are missing.
+av_datas, av_binaries, av_hiddenimports = collect_all("av")
 
 a = Analysis(
     ['main.py'],
     pathex=[str(Path('.').resolve())],          # ← original robust path
-    binaries=[],
+    binaries=[*av_binaries],
     datas=[
         # New PNG (splash + title-bar icon) → lands in root of _MEIPASS
         ('cansa_icon.png', '.'),
@@ -32,6 +38,7 @@ a = Analysis(
 
         # scrcpy server JAR for Live Mirror feature
         ('src/mirror/assets/scrcpy-server.jar', 'src/mirror/assets'),
+        *av_datas,
     ],
     hiddenimports=[
         # Original hiddenimports
@@ -56,9 +63,8 @@ a = Analysis(
         'PyQt6',
         'qfluentwidgets',
 
-        # PyAV — required for Live Mirror H.264 decoding
-        'av', 'av.codec', 'av.codec.context', 'av.packet',
-        'av.video', 'av.video.frame', 'av.video.format',
+        # PyAV — required for Live Mirror H.264 decoding (collected automatically)
+        *av_hiddenimports,
 
         # Mirror module
         'src.mirror', 'src.mirror.mirror_widget', 'src.mirror.stream_worker',

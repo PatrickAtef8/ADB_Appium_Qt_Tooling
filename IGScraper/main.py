@@ -5,8 +5,37 @@ Entry point — launches the PyQt6 GUI.
 
 import sys
 import os
+import traceback
+import datetime
+import pathlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ── Global crash log (writes to Desktop so it's always findable) ─────────────
+_LOG_DIR  = pathlib.Path.home() / "Desktop"
+_LOG_FILE = _LOG_DIR / "cansa_crash.log"
+
+def _write_crash(msg: str):
+    try:
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n=== {datetime.datetime.now()} ===\n{msg}\n")
+    except Exception:
+        pass
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    _write_crash(msg)
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _excepthook
+
+# Also catch threading exceptions (QThread run() exceptions end up here)
+import threading
+def _thread_excepthook(args):
+    msg = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    _write_crash(f"[Thread: {args.thread}]\n{msg}")
+threading.excepthook = _thread_excepthook
 
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 from PyQt6.QtGui import QIcon, QPixmap, QScreen

@@ -35,8 +35,14 @@ LOG_PATH  = Path.home() / "mirror_debug.log"
 try:
     import av
     _AV_AVAILABLE = True
-except ImportError:
+    _AV_VERSION   = getattr(av, "__version__", "unknown")
+except ImportError as _av_err:
     _AV_AVAILABLE = False
+    _AV_VERSION   = f"MISSING: {_av_err}"
+except Exception as _av_err:
+    # DLL load failure on Windows shows up as OSError/Exception, not ImportError
+    _AV_AVAILABLE = False
+    _AV_VERSION   = f"DLL ERROR: {_av_err}"
 
 _SERVER_JAR         = Path(__file__).parent / "assets" / "scrcpy-server.jar"
 _DEVICE_SERVER_PATH = "/data/local/tmp/scrcpy-server.jar"
@@ -58,7 +64,7 @@ class _Logger:
             with open(path, "w") as f:
                 f.write(f"=== mirror_debug.log started {datetime.datetime.now()} ===\n")
                 f.write(f"Python: {sys.version}\n")
-                f.write(f"PyAV: {_AV_AVAILABLE}\n")
+                f.write(f"PyAV available: {_AV_AVAILABLE}  version: {_AV_VERSION}\n")
                 f.write(f"server jar: {_SERVER_JAR.exists()}  ({_SERVER_JAR})\n\n")
 
     def log(self, msg: str):
@@ -170,10 +176,22 @@ class MirrorStreamWorker(QThread):
     stop = request_stop
 
     def run(self):
+        try:
+            self._run_safe()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            _log.log(f"FATAL UNCAUGHT in run(): {e}\n{tb}")
+            try:
+                self.state_changed.emit(f"error:Fatal crash — {e} (see ~/mirror_debug.log)")
+            except Exception:
+                pass
+
+    def _run_safe(self):
         _log.log(f"=== run() START serial={self.serial} ===")
 
         if not _AV_AVAILABLE:
-            self.state_changed.emit("error:PyAV not installed — pip install av")
+            self.state_changed.emit(f"error:PyAV unavailable — {_AV_VERSION}")
             return
 
         self.state_changed.emit("connecting")
