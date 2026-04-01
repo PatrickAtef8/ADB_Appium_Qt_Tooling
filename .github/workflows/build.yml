@@ -27,7 +27,6 @@ jobs:
       - name: Create placeholder credentials (CI only)
         working-directory: IGScraper
         run: |
-          mkdir -p assets
           echo '{"installed":{}}' > assets/credentials.json
 
       - name: Build EXE with PyInstaller
