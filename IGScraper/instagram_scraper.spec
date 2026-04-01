@@ -85,5 +85,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='Cansav2.png',               # ← sets the .exe icon (PyInstaller converts PNG)
+    icon='Cansav2.ico',               # ← sets the .exe icon (PyInstaller converts PNG)
 )
