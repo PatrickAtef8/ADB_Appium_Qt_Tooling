@@ -192,41 +192,100 @@ class InstagramScraper:
         return False
 
     def open_list(self, mode: str) -> bool:
-        """Open followers or following list."""
+        """Open followers or following list.
+
+        Corner-case handled: when the scraping account already *follows* the
+        target, Instagram shows both a "Following" action-button (to unfollow)
+        AND the "Following" stat counter in the header.  A naïve
+        textContains() search always picks the first match — which is the
+        action-button — and never opens the list.
+
+        Fix strategy (tried in order):
+        1. Look inside the known profile-header stats container IDs so we only
+           ever touch the counter row, not the action button.
+        2. Among ALL TextViews that contain the mode word, pick the one whose
+           text also contains a digit (e.g. "523 following") — the action
+           button text is plain "Following" with no number.
+        3. Fall back to descriptionContains (accessibility label on the stat).
+        """
         driver = self.ctrl.driver
         self._log(f"Opening {mode} list...")
         time.sleep(2)
 
-        try:
-            el = driver.find_element(
-                AppiumBy.ANDROID_UIAUTOMATOR,
-                f'new UiSelector().textContains("{mode}").clickable(true)'
-            )
-            self._log(f"✅ Found {mode} button: '{el.text}'")
-            el.click()
-            time.sleep(2.5)
-            return True
-        except Exception:
-            pass
+        mode_lower = mode.lower()
 
+        # ── Strategy 1: target the profile-header stats container directly ──
+        # Instagram wraps the three stat counters (posts / followers / following)
+        # inside one of these resource-ids.  Searching *inside* that container
+        # guarantees we never hit the action button which lives elsewhere.
+        STAT_ID_MAP = {
+            "following": [
+                "com.instagram.android:id/profile_header_following_container",
+                "com.instagram.android:id/row_profile_header_following_text",
+            ],
+            "followers": [
+                "com.instagram.android:id/profile_header_followers_container",
+                "com.instagram.android:id/row_profile_header_followers_text",
+            ],
+        }
+        STAT_FALLBACK_IDS = [
+            "com.instagram.android:id/profile_header_count_container",
+            "com.instagram.android:id/profile_stats_container",
+        ]
+        for res_id in STAT_ID_MAP.get(mode_lower, STAT_FALLBACK_IDS):
+            try:
+                el = driver.find_element(AppiumBy.ID, res_id)
+                self._log(f"✅ Found {mode} stat container by ID: '{el.text}'")
+                el.click()
+                time.sleep(2.5)
+                return True
+            except Exception:
+                continue
+
+        # ── Strategy 2: pick the TextView whose text contains a digit ────────
+        # The stat label looks like "1,234 following" or "following\n1,234"
+        # depending on the layout.  The action button text is simply "Following".
+        # We collect all matching TextViews and prefer the one with a digit.
         try:
             elements = self._find_all(
                 AppiumBy.XPATH,
-                f'//android.widget.TextView[contains(translate(@text,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"{mode.lower()}")]'
+                f'//android.widget.TextView[contains('
+                f'translate(@text,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")'
+                f',"{mode_lower}")]'
             )
+            digit_match = None
+            first_match = None
             for el in elements:
-                if mode.lower() in el.text.lower():
-                    el.click()
-                    time.sleep(2.5)
-                    return True
+                try:
+                    txt = el.text.strip()
+                    if mode_lower not in txt.lower():
+                        continue
+                    if first_match is None:
+                        first_match = el
+                    # Prefer the element whose text also contains a digit
+                    if re.search(r'\d', txt):
+                        digit_match = el
+                        break
+                except Exception:
+                    continue
+
+            target = digit_match or first_match
+            if target:
+                self._log(f"✅ Found {mode} via text scan: '{target.text}'")
+                target.click()
+                time.sleep(2.5)
+                return True
         except Exception:
             pass
 
+        # ── Strategy 3: accessibility description on the stat button ─────────
         try:
             el = driver.find_element(
                 AppiumBy.ANDROID_UIAUTOMATOR,
                 f'new UiSelector().descriptionContains("{mode}")'
             )
+            desc = el.get_attribute("content-desc")
+            self._log(f"✅ Found {mode} via description: '{desc}'")
             el.click()
             time.sleep(2.5)
             return True

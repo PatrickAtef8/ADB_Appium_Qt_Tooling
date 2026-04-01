@@ -1,26 +1,26 @@
 {
   "sheet_id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
   "sheet_tab": "Sheet1",
-  "credentials_path": "/home/patrick/p2/upwork/upworkautomation/upworkAutomation/assets/credentials.json",
-  "webhook_url": "",
+  "credentials_path": "assets/credentials.json",
+  "webhook_url": "https://webhook.site/293bd19e-1c26-40fe-ba95-64f06b92f05c",
   "filters": {
     "skip_no_bio": false,
     "skip_private": false,
     "skip_no_profile_pic": false,
     "skip_no_contact": false,
-    "min_posts": 3,
-    "require_recent_post_days": 99,
+    "min_posts": 0,
+    "require_recent_post_days": 365,
     "keywords": [],
     "only_keywords": []
   },
   "delays": {
-    "between_profiles_min": 1.0,
+    "between_profiles_min": 2.0,
     "between_profiles_max": 4.0,
     "between_scrolls_min": 1.0,
     "between_scrolls_max": 3.0,
     "run_min_profiles": 3,
     "run_max_profiles": 10,
-    "rest_min_minutes": 31,
+    "rest_min_minutes": 30,
     "rest_max_minutes": 60,
     "session_break_every": 1,
     "session_break_duration": 30,
@@ -31,7 +31,7 @@
     "enabled": false,
     "start_hour": 9,
     "start_minute": 0,
-    "end_hour": 10,
+    "end_hour": 19,
     "end_minute": 0
   },
   "appium": {
@@ -49,27 +49,19 @@
       "serial": null
     }
   ],
-  "target_list": [
-    "adidas",
-    "nike",
-    "apple"
-  ],
+  "target_list": [],
   "blacklist": [],
-  "last_target": "adidas",
+  "last_target": "",
   "last_mode": "following",
-  "last_count": 100,
+  "last_count": 10,
   "last_device": "",
   "targets_per_phone": [
     [
       "bmw"
     ],
-    [],
+    [
+      "natgeo"
+    ],
     []
-  ],
-  "sheets": {
-    "id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
-    "tab": "Sheet1",
-    "creds": "/home/patrick/p2/upwork/upworkautomation/upworkAutomation/assets/credentials.json"
-  },
-  "ui_scale": 1.0
+  ]
 }

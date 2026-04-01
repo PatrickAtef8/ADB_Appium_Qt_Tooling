@@ -133,7 +133,7 @@ class SplashWindow(QWidget):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Instagram Scraper")
+    app.setApplicationName("Cansa")
     app.setApplicationVersion("1.0")
 
     icon_path = os.path.join(
