@@ -4,7 +4,7 @@
 # PyInstaller spec for Cansa EXE (merged v1 + v2)
 #
 # • All original datas (config + assets)
-# • Cansav2.png bundled in root (for splash + title-bar icon)
+# • cansa_icon.png bundled in root (for splash + title-bar icon)
 # • All original hiddenimports + new ones (PyQt6 + qfluentwidgets)
 # • Icon set on the final EXE
 #
@@ -23,7 +23,7 @@ a = Analysis(
     binaries=[],
     datas=[
         # New PNG (splash + title-bar icon) → lands in root of _MEIPASS
-        ('Cansav2.png', '.'),
+        ('cansa_icon.png', '.'),
 
         # Original config & assets
         ('config/settings.json', 'config'),
@@ -85,5 +85,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='Cansav2.ico',               # ← sets the .exe icon (PyInstaller converts PNG)
+    icon='cansa_icon.ico',               # ← sets the .exe icon (PyInstaller converts PNG)
 )
