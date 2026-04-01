@@ -11,14 +11,14 @@ import pathlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── Global crash log (writes to Desktop so it's always findable) ─────────────
-_LOG_DIR  = pathlib.Path.home() / "Desktop"
-_LOG_FILE = _LOG_DIR / "cansa_crash.log"
+# ── Global crash log ─────────────────────────────────────────────────────────
+# On Windows: writes to %USERPROFILE%\cansa_crash.log (always writable)
+# On Linux:   writes to ~/cansa_crash.log
+_LOG_FILE = pathlib.Path.home() / "cansa_crash.log"
 
 def _write_crash(msg: str):
     try:
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+        with open(_LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n=== {datetime.datetime.now()} ===\n{msg}\n")
     except Exception:
         pass

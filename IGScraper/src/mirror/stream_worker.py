@@ -61,7 +61,7 @@ class _Logger:
         self._path    = path
         self._lock    = threading.Lock()
         if enabled:
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(f"=== mirror_debug.log started {datetime.datetime.now()} ===\n")
                 f.write(f"Python: {sys.version}\n")
                 f.write(f"PyAV available: {_AV_AVAILABLE}  version: {_AV_VERSION}\n")
@@ -73,7 +73,7 @@ class _Logger:
         print(line, flush=True)
         if self._enabled:
             with self._lock:
-                with open(self._path, "a") as f:
+                with open(self._path, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
 
 _log = _Logger(LOG_PATH, DEBUG_LOG)
@@ -88,7 +88,7 @@ def _adb(serial: str, *args: str) -> list[str]:
 def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
     _log.log(f"  RUN: {' '.join(cmd)}")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **_WINDOWS_NO_WINDOW)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, **_WINDOWS_NO_WINDOW)
         if r.stdout.strip():
             _log.log(f"  STDOUT: {r.stdout.strip()[:300]}")
         if r.stderr.strip():

@@ -25,6 +25,10 @@ _WINDOWS_NO_WINDOW: dict = (
 def _run_hidden(*args, **kwargs):
     """subprocess.run() wrapper that hides console windows on Windows."""
     kwargs.update(_WINDOWS_NO_WINDOW)
+    # Force UTF-8 encoding so Windows cp1252 charmap never causes a crash
+    if kwargs.get("text") or kwargs.get("capture_output"):
+        kwargs.setdefault("encoding", "utf-8")
+        kwargs.setdefault("errors", "replace")
     return subprocess.run(*args, **kwargs)
 
 
