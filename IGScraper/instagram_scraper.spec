@@ -37,7 +37,7 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [],
-    name='InstagramScraperPro',
+    name='Cansa',
     debug=False, bootloader_ignore_signals=False,
     strip=False, upx=True, upx_exclude=[],
     runtime_tmpdir=None, console=False,
