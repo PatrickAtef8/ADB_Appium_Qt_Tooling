@@ -93,11 +93,17 @@ class SplashWindow(QWidget):
         pixmap = QPixmap(image_path)
 
         if not pixmap.isNull():
-            pixmap = pixmap.scaled(
-                300, 300,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            # Only scale DOWN to 300×300 — never upscale.
+            # Upscaling a small ICO frame (e.g. 32×32) to 300×300 produces
+            # a blurry, pixelated logo. If the source is already ≤300px on
+            # both axes, display it at native size so it stays crisp.
+            src_w, src_h = pixmap.width(), pixmap.height()
+            if src_w > 300 or src_h > 300:
+                pixmap = pixmap.scaled(
+                    300, 300,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
 
         logo_lbl.setPixmap(pixmap)
         logo_lbl.setStyleSheet("background: transparent;")
@@ -174,12 +180,13 @@ def main():
     screen: QScreen = QApplication.primaryScreen()
     screen_geo = screen.availableGeometry()
 
-    # ── Splash image: prefer ICO (always bundled, renders reliably in EXE)
-    # PNG can silently fail to load inside a frozen PyInstaller bundle on
-    # Windows before the event loop is running, leaving the logo blank.
-    # ICO is the same asset PyInstaller already embeds for the exe icon,
-    # so it is guaranteed present and QPixmap handles it fine on all OSes.
-    splash_img = ico_path if os.path.exists(ico_path) else png_path
+    # ── Splash image ───────────────────────────────────────────────────────
+    # PNG is used on both platforms for a crisp, full-resolution logo.
+    # On Windows frozen EXE this previously failed silently because PyInstaller
+    # did not bundle Qt's imageformats plugin DLLs (qpng.dll etc.) — fixed in
+    # the spec by explicitly including the imageformats folder.
+    # ICO is kept only as an emergency fallback.
+    splash_img = png_path if os.path.exists(png_path) else ico_path
     if not os.path.exists(splash_img):
         print(f"⚠️ Splash image not found: {splash_img}")
     else:

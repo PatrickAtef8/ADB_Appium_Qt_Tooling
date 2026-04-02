@@ -7,16 +7,33 @@
 # • cansa_icon.png bundled in root (for splash + title-bar icon)
 # • All original hiddenimports + new ones (PyQt6 + qfluentwidgets)
 # • Icon set on the final EXE
+# • Qt imageformats plugins explicitly bundled so QPixmap can load PNG/JPG
+#   inside the frozen EXE on Windows (without these DLLs PNG returns null)
 #
 # HOW TO BUILD:
 # cd IGScraper
 # pyinstaller instagram_scraper.spec
 # ─────────────────────────────────────────────────────────────────────────────
 
+import os
+import PyQt6
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
 
 block_cipher = None
+
+# ── Qt imageformats plugins ───────────────────────────────────────────────────
+# PyInstaller does NOT automatically bundle Qt's image-format plugin DLLs
+# (qjpeg.dll, qpng.dll, etc.).  Without them, QPixmap silently returns a
+# null pixmap for PNG/JPG files inside the frozen EXE on Windows — the image
+# is bundled but simply cannot be decoded.  ICO works without a plugin because
+# Qt has built-in ICO support, which is why the app icon showed but the splash
+# PNG did not.  We resolve this by explicitly copying the entire imageformats
+# folder from the PyQt6 installation into the bundle.
+_qt_root = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6")
+_imageformats_src = os.path.join(_qt_root, "plugins", "imageformats")
+# Destination inside _MEIPASS must match Qt's expected plugin search path.
+_imageformats_dst = os.path.join("PyQt6", "Qt6", "plugins", "imageformats")
 
 # Collect ALL PyAV files: Python modules + FFmpeg DLLs + data files
 # Without this, av imports successfully on the build machine but crashes
@@ -28,11 +45,15 @@ np_datas, np_binaries, np_hiddenimports = collect_all("numpy")
 
 a = Analysis(
     ['main.py'],
-    pathex=[str(Path('.').resolve())],          # ← original robust path
+    pathex=[str(Path('.').resolve())],          # <- original robust path
     binaries=[*av_binaries, *np_binaries],
     datas=[
-        # New PNG (splash + title-bar icon) → lands in root of _MEIPASS
+        # PNG (splash logo) -> lands in root of _MEIPASS
+        # Requires imageformats plugins below to actually decode on Windows.
         ('cansa_icon.png', '.'),
+
+        # Qt image-format plugins: lets QPixmap load PNG/JPG in frozen EXE
+        (_imageformats_src, _imageformats_dst),
 
         # Original config & assets
         ('config/settings.json', 'config'),
@@ -67,10 +88,10 @@ a = Analysis(
         'PyQt6',
         'qfluentwidgets',
 
-        # PyAV — required for Live Mirror H.264 decoding (collected automatically)
+        # PyAV -- required for Live Mirror H.264 decoding (collected automatically)
         *av_hiddenimports,
 
-        # numpy — required by PyAV frame conversion
+        # numpy -- required by PyAV frame conversion
         *np_hiddenimports,
 
         # Mirror module
@@ -108,5 +129,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='cansa_icon.ico',               # ← sets the .exe icon (PyInstaller converts PNG)
+    icon='cansa_icon.ico',               # <- sets the .exe icon
 )
