@@ -12,7 +12,7 @@ from PyQt6.QtCore    import Qt, QThread, QTime, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui     import QFont, QColor, QIcon, QPixmap, QImageReader
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QMessageBox, QSizePolicy, QTableWidgetItem,
+    QLabel, QMessageBox, QPushButton, QSizePolicy, QTableWidgetItem,
     QVBoxLayout, QWidget, QRadioButton, QButtonGroup
 )
 
@@ -1237,18 +1237,26 @@ class MainWindow(FluentWindow):
         hdr_row.addStretch()
 
         # Width control buttons  ─  and  +
-        _zoom_font = QFont("Inter, Segoe UI", _pts(10)); _zoom_font.setWeight(QFont.Weight.Medium)
+        _zoom_ss = (
+            "QPushButton {"
+            "  background: #1e293b; color: #f8fafc;"
+            "  border: 1px solid #475569; border-radius: 4px;"
+            "  font-size: 16px; font-weight: bold;"
+            "}"
+            "QPushButton:hover { background: #334155; }"
+            "QPushButton:pressed { background: #0f172a; }"
+        )
 
-        self._btn_mirror_shrink = PushButton("−", self.mirror_panel)
+        self._btn_mirror_shrink = QPushButton("−", self.mirror_panel)
         self._btn_mirror_shrink.setFixedSize(_px(30), _px(30))
-        self._btn_mirror_shrink.setFont(_zoom_font)
+        self._btn_mirror_shrink.setStyleSheet(_zoom_ss)
         self._btn_mirror_shrink.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_shrink.setToolTip("Shrink mirror panel")
         self._btn_mirror_shrink.clicked.connect(lambda: self._step_mirror_width(-60))
 
-        self._btn_mirror_grow = PushButton("+", self.mirror_panel)
+        self._btn_mirror_grow = QPushButton("+", self.mirror_panel)
         self._btn_mirror_grow.setFixedSize(_px(30), _px(30))
-        self._btn_mirror_grow.setFont(_zoom_font)
+        self._btn_mirror_grow.setStyleSheet(_zoom_ss)
         self._btn_mirror_grow.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_grow.setToolTip("Grow mirror panel")
         self._btn_mirror_grow.clicked.connect(lambda: self._step_mirror_width(+60))
