@@ -41,6 +41,12 @@ from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 from PyQt6.QtGui import QIcon, QPixmap, QScreen
 from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal, QRect
 
+# ── Windows DPI: prevent Qt from scaling up beyond 100% on 96-dpi screens ────
+# Must be set BEFORE QApplication is constructed.
+QApplication.setHighDpiScaleFactorRoundingPolicy(
+    Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+)
+
 from src.ui.main_window import MainWindow
 
 
@@ -168,11 +174,18 @@ def main():
     screen: QScreen = QApplication.primaryScreen()
     screen_geo = screen.availableGeometry()
 
-    # ── Splash uses PNG (HIGH QUALITY) ─────────────────────────────────────
-    if not os.path.exists(png_path):
-        print(f"⚠️ PNG not found: {png_path}")
+    # ── Splash image: prefer ICO (always bundled, renders reliably in EXE)
+    # PNG can silently fail to load inside a frozen PyInstaller bundle on
+    # Windows before the event loop is running, leaving the logo blank.
+    # ICO is the same asset PyInstaller already embeds for the exe icon,
+    # so it is guaranteed present and QPixmap handles it fine on all OSes.
+    splash_img = ico_path if os.path.exists(ico_path) else png_path
+    if not os.path.exists(splash_img):
+        print(f"⚠️ Splash image not found: {splash_img}")
+    else:
+        print(f"✅ Splash image: {splash_img}")
 
-    splash = SplashWindow(png_path, screen_geo)
+    splash = SplashWindow(splash_img, screen_geo)
 
     def _reveal_main():
         anim = QPropertyAnimation(window, b"windowOpacity", window)

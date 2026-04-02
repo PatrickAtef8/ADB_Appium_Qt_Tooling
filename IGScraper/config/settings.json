@@ -39,7 +39,7 @@
   },
   "devices": [
     {
-      "serial": "emulator-5554"
+      "serial": null
     },
     {
       "serial": null
@@ -63,5 +63,5 @@
     ],
     []
   ],
-  "mirror_width": 681
+  "mirror_width": 695
 }
