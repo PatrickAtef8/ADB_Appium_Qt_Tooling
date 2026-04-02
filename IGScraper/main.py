@@ -47,6 +47,15 @@ QApplication.setHighDpiScaleFactorRoundingPolicy(
     Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
 )
 
+# ── Cross-platform font scaling ───────────────────────────────────────────────
+# Windows GDI renders the same point-size fonts ~15 % larger than Linux/X11.
+# _pts() corrects for this so the splash and main window look identical on
+# both platforms.
+def _pts(base_pt: int) -> int:
+    if sys.platform == "win32":
+        return max(6, round(base_pt * 0.85))
+    return base_pt
+
 from src.ui.main_window import MainWindow
 
 
@@ -131,10 +140,22 @@ class SplashWindow(QWidget):
         else:
             print(f"⚠️ Splash image could not be loaded: {image_path}")
 
-        # Store for possible deferred reload on Windows
-        self._logo_lbl   = logo_lbl
-        self._image_path = image_path
-        self._pixmap     = pixmap
+        # Store for possible deferred reload on Windows.
+        # _logo_loaded_ok is True only when we KNOW the pixmap rendered correctly
+        # (loaded via QImageReader and non-null with real dimensions).
+        # On Windows, the pre-show QIcon fallback can produce a non-null but
+        # visually blank pixmap, so we must NOT rely solely on isNull() to decide
+        # whether to retry after the window is shown.
+        self._logo_lbl       = logo_lbl
+        self._image_path     = image_path
+        self._pixmap         = pixmap
+        # PNG loaded via QImageReader before show() is reliable — mark as ok.
+        # QIcon fallback (ICO / edge-case PNG) is NOT reliable on Windows pre-show.
+        self._logo_loaded_ok = (
+            not pixmap.isNull()
+            and image_path.lower().endswith(".png")
+            and pixmap.width() > 1
+        )
 
         logo_lbl.setPixmap(pixmap)
         logo_lbl.setStyleSheet("background: transparent;")
@@ -142,20 +163,20 @@ class SplashWindow(QWidget):
         title_lbl = QLabel("Cansa", self)
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_lbl.setStyleSheet(
-            "color: #f8fafc;"
-            "font-size: 48pt;"
-            "font-weight: 700;"
-            "letter-spacing: 6px;"
-            "background: transparent;"
+            f"color: #f8fafc;"
+            f"font-size: {_pts(48)}pt;"
+            f"font-weight: 700;"
+            f"letter-spacing: 6px;"
+            f"background: transparent;"
         )
 
         tag_lbl = QLabel("Instagram Automation Suite", self)
         tag_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         tag_lbl.setStyleSheet(
-            "color: #3b82f6;"
-            "font-size: 14pt;"
-            "letter-spacing: 3px;"
-            "background: transparent;"
+            f"color: #3b82f6;"
+            f"font-size: {_pts(14)}pt;"
+            f"letter-spacing: 3px;"
+            f"background: transparent;"
         )
 
         layout.addWidget(logo_lbl)
@@ -184,22 +205,31 @@ class SplashWindow(QWidget):
         self._hold_timer.start()
 
     def _ensure_logo_loaded(self):
-        """Re-attempt image load now that the window is fully shown."""
-        if not self._pixmap.isNull():
-            return   # already loaded fine first time
+        """Re-attempt image load now that the window is fully shown.
+
+        On Windows the platform plugin (Qt's windows backend) is not fully
+        initialised until after the first native window is shown.  Any pixmap
+        loaded *before* show() — even via QImageReader — may render as a blank
+        transparent image.  We therefore always retry with QImageReader here
+        (post-show) and only skip if we already confirmed a good load earlier.
+        """
+        if self._logo_loaded_ok:
+            return   # already confirmed a clean load
 
         path = self._image_path
         pixmap = QPixmap()
 
-        # Try QImageReader first (PNG)
+        # QImageReader is reliable post-show on all platforms.
         if path.lower().endswith(".png"):
             reader = QImageReader(path)
             reader.setAutoTransform(True)
             img = reader.read()
             if not img.isNull():
                 pixmap = QPixmap.fromImage(img)
+            else:
+                print(f"⚠️ QImageReader post-show error ({path}): {reader.errorString()}")
 
-        # Try QIcon (works for ICO and sometimes PNG after window is shown)
+        # ICO / any remaining miss — QIcon is reliable once a window exists.
         if pixmap.isNull():
             icon = QIcon(path)
             if not icon.isNull():
@@ -212,9 +242,12 @@ class SplashWindow(QWidget):
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-            self._pixmap = pixmap
+            self._pixmap        = pixmap
+            self._logo_loaded_ok = True
             self._logo_lbl.setPixmap(pixmap)
             self._logo_lbl.update()
+        else:
+            print(f"⚠️ Splash logo could not be loaded even post-show: {path}")
 
     def _on_done(self):
         self.finished.emit()

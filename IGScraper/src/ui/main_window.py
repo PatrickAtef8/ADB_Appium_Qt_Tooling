@@ -43,30 +43,61 @@ from src.utils.filters              import parse_keywords
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DPI scaling helper
+# ─────────────────────────────────────────────────────────────────────────────
+# On Linux (typically 96 dpi) Qt uses point sizes at a 1:1 ratio with the
+# physical screen.  On Windows, even at 96 dpi, the platform plugin applies
+# an extra scaling pass that makes identical point-size fonts render ~25-33 %
+# larger.  We detect the device pixel ratio at import time and compute a
+# correction factor so that fonts and fixed pixel sizes look the same on both
+# platforms.
+#
+# Reference DPR = 1.0  (standard 96-dpi Linux monitor)
+# Windows 96 dpi reports DPR ≈ 1.0 but its GDI font metrics are larger,
+# so we apply a small blanket correction whenever running on Windows.
+
+import sys as _sys
+
+def _dpi_scale() -> float:
+    """Return a multiplier < 1.0 on Windows to counteract Qt's upscaling."""
+    if _sys.platform == "win32":
+        # Windows GDI renders fonts ~15% larger than Linux for the same pt size.
+        # Subtract that overshoot so the UI looks identical to Linux.
+        return 0.85
+    return 1.0
+
+def _pts(base_pt: int) -> int:
+    """Scale a point size for the current platform."""
+    return max(6, round(base_pt * _dpi_scale()))
+
+def _px(base_px: int) -> int:
+    """Scale a pixel dimension for the current platform."""
+    return max(1, round(base_px * _dpi_scale()))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Typography helpers - Scaled for cross-platform (Windows/Linux)
-# Fonts are intentionally 2pt smaller than pre-v1 to avoid the "everything
-# looks huge" effect that Qt produces on Windows 96-dpi screens.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class T:
     @staticmethod
     def title():
-        f = QFont("Inter, Segoe UI", 18); f.setWeight(QFont.Weight.Bold); return f
+        f = QFont("Inter, Segoe UI", _pts(18)); f.setWeight(QFont.Weight.Bold); return f
     @staticmethod
     def heading():
-        f = QFont("Inter, Segoe UI", 13); f.setWeight(QFont.Weight.DemiBold); return f
+        f = QFont("Inter, Segoe UI", _pts(13)); f.setWeight(QFont.Weight.DemiBold); return f
     @staticmethod
     def body():
-        f = QFont("Inter, Segoe UI", 10); return f
+        f = QFont("Inter, Segoe UI", _pts(10)); return f
     @staticmethod
     def caption():
-        f = QFont("Inter, Segoe UI", 9); return f
+        f = QFont("Inter, Segoe UI", _pts(9)); return f
     @staticmethod
     def button():
-        f = QFont("Inter, Segoe UI", 10); f.setWeight(QFont.Weight.Medium); return f
+        f = QFont("Inter, Segoe UI", _pts(10)); f.setWeight(QFont.Weight.Medium); return f
     @staticmethod
     def mono():
-        f = QFont("JetBrains Mono, Consolas", 9); return f
+        f = QFont("JetBrains Mono, Consolas", _pts(9)); return f
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -446,7 +477,7 @@ class PageWidget(ScrollArea):
 
         lbl = TitleLabel(title, self)
         lbl.setFont(T.title())
-        lbl.setStyleSheet("font-size: 22pt; margin-bottom: 12px; background: transparent;")
+        lbl.setStyleSheet(f"font-size: {_pts(22)}pt; margin-bottom: {_px(12)}px; background: transparent;")
         self.vBoxLayout.addWidget(lbl)
 
     def add(self, w):          self.vBoxLayout.addWidget(w)
@@ -484,7 +515,7 @@ class DashboardPage(QWidget):
 
         title_lbl = TitleLabel("Dashboard", left_inner)
         title_lbl.setFont(T.title())
-        title_lbl.setStyleSheet("font-size: 22pt; margin-bottom: 12px; background: transparent;")
+        title_lbl.setStyleSheet(f"font-size: {_pts(22)}pt; margin-bottom: {_px(12)}px; background: transparent;")
         left_lay.addWidget(title_lbl)
 
         # ── Device rows ───────────────────────────────────────────────────
@@ -500,8 +531,8 @@ class DashboardPage(QWidget):
         hdr_row.addWidget(h1)
         hdr_row.addStretch()
         self.btn_refresh = PushButton(FIF.SYNC, "Refresh", dev_card)
-        self.btn_refresh.setMinimumHeight(34)
-        self.btn_refresh.setFixedWidth(100)
+        self.btn_refresh.setMinimumHeight(_px(34))
+        self.btn_refresh.setFixedWidth(_px(100))
         self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         hdr_row.addWidget(self.btn_refresh)
         dev_lay.addLayout(hdr_row)
@@ -512,45 +543,44 @@ class DashboardPage(QWidget):
 
             lbl_num = StrongBodyLabel(f"P{i+1}", dev_card)
             lbl_num.setFont(T.body())
-            lbl_num.setFixedWidth(40)
+            lbl_num.setFixedWidth(_px(40))
             lbl_num.setStyleSheet("background: transparent;")
 
             combo_dev = ComboBox(dev_card)
             combo_dev.setFont(T.body())
-            combo_dev.setMinimumHeight(36)
-            combo_dev.setMinimumWidth(160)
+            combo_dev.setMinimumHeight(_px(36))
             combo_dev.setPlaceholderText("Select Device")
             combo_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            combo_dev.setMaximumWidth(300)
 
             combo_acc = ComboBox(dev_card)
             combo_acc.setFont(T.body())
-            combo_acc.setMinimumHeight(36)
-            combo_acc.setMinimumWidth(120)
-            combo_acc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            combo_acc.setMinimumHeight(_px(36))
+            combo_acc.setFixedWidth(_px(160))
             combo_acc.setPlaceholderText("Accounts")
 
             lbl_port = CaptionLabel(f":{4723 + i}", dev_card)
             lbl_port.setFont(T.caption())
-            lbl_port.setMinimumWidth(50)
+            lbl_port.setFixedWidth(_px(60))
             lbl_port.setStyleSheet("background: transparent;")
 
             lbl_status = CaptionLabel("● idle", dev_card)
             lbl_status.setFont(T.caption())
-            lbl_status.setMinimumWidth(60)
+            lbl_status.setFixedWidth(_px(75))
             lbl_status.setStyleSheet("background: transparent;")
 
             btn_view = PushButton("👁 View", dev_card)
             btn_view.setFont(T.button())
-            btn_view.setMinimumHeight(34)
-            btn_view.setMinimumWidth(80)
+            btn_view.setMinimumHeight(_px(34))
+            btn_view.setFixedWidth(_px(90))
             btn_view.setCursor(Qt.CursorShape.PointingHandCursor)
 
-            row.addWidget(lbl_num, 0)
-            row.addWidget(combo_dev, 3)
-            row.addWidget(combo_acc, 2)
-            row.addWidget(lbl_port, 0)
-            row.addWidget(lbl_status, 0)
-            row.addWidget(btn_view, 0)
+            row.addWidget(lbl_num)
+            row.addWidget(combo_dev)
+            row.addWidget(combo_acc)
+            row.addWidget(lbl_port)
+            row.addWidget(lbl_status)
+            row.addWidget(btn_view)
             dev_lay.addLayout(row)
             self.device_rows.append((combo_dev, combo_acc, lbl_port, lbl_status, btn_view))
 
@@ -576,7 +606,7 @@ class DashboardPage(QWidget):
             txt = TextEdit(tgt_card)
             txt.setFont(T.body())
             txt.setPlaceholderText("username1\nusername2")
-            txt.setMinimumHeight(140)
+            txt.setMinimumHeight(_px(140))
             col.addWidget(lbl)
             col.addWidget(txt)
             targets_grid.addLayout(col)
@@ -604,7 +634,7 @@ class DashboardPage(QWidget):
         mode_form.addWidget(lbl_m)
         self.combo_mode = ComboBox(mode_card)
         self.combo_mode.setFont(T.body())
-        self.combo_mode.setMinimumHeight(34)
+        self.combo_mode.setMinimumHeight(_px(34))
         self.combo_mode.addItems(["followers", "following"])
         mode_form.addWidget(self.combo_mode)
         mode_form.addSpacing(15)
@@ -614,7 +644,7 @@ class DashboardPage(QWidget):
         mode_form.addWidget(lbl_mx)
         self.spin_count = SpinBox(mode_card)
         self.spin_count.setFont(T.body())
-        self.spin_count.setMinimumHeight(34)
+        self.spin_count.setMinimumHeight(_px(34))
         self.spin_count.setRange(1, 50000); self.spin_count.setValue(100)
         mode_form.addWidget(self.spin_count)
         mode_lay.addLayout(mode_form)
@@ -642,7 +672,7 @@ class DashboardPage(QWidget):
         self._lbl_sched_start.setStyleSheet("background: transparent;")
         self.time_start = TimeEdit(sched_card)
         self.time_start.setFont(T.body())
-        self.time_start.setFixedHeight(34)
+        self.time_start.setFixedHeight(_px(34))
         self.time_start.setDisplayFormat("hh:mm AP")
         self.time_start.setToolTip("Scraping START time (e.g. 09:00 AM)")
         self._lbl_sched_arrow = CaptionLabel("to", sched_card)
@@ -651,7 +681,7 @@ class DashboardPage(QWidget):
         self._lbl_sched_end.setStyleSheet("background: transparent;")
         self.time_end = TimeEdit(sched_card)
         self.time_end.setFont(T.body())
-        self.time_end.setFixedHeight(34)
+        self.time_end.setFixedHeight(_px(34))
         self.time_end.setDisplayFormat("hh:mm AP")
         self.time_end.setToolTip("Scraping END time (e.g. 06:00 PM)")
         time_row.addWidget(self._lbl_sched_start)
@@ -670,12 +700,12 @@ class DashboardPage(QWidget):
         ctrl_row.setSpacing(20)
         self.btn_start = PrimaryPushButton(FIF.PLAY, "START SCRAPING", left_inner)
         self.btn_start.setFont(T.button())
-        self.btn_start.setMinimumHeight(48)
+        self.btn_start.setMinimumHeight(_px(48))
         self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self.btn_stop = PushButton(FIF.CLOSE, "STOP ALL", left_inner)
         self.btn_stop.setFont(T.button())
-        self.btn_stop.setMinimumHeight(48)
+        self.btn_stop.setMinimumHeight(_px(48))
         self.btn_stop.setEnabled(False)
         self.btn_stop.setObjectName("btn_stop_danger")
         self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -690,7 +720,8 @@ class DashboardPage(QWidget):
         left_lay.addLayout(ctrl_row)
 
         left_lay.addStretch(1)
-        outer.addWidget(left_scroll, stretch=1)
+        outer.addWidget(left_scroll, stretch=65)
+        outer.addStretch(35)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -733,11 +764,11 @@ class FiltersPage(PageWidget):
         row_p = QHBoxLayout()
         self.spin_min_posts = SpinBox(skip_card)
         self.spin_min_posts.setRange(0, 10000)
-        self.spin_min_posts.setFont(T.body()); self.spin_min_posts.setMinimumHeight(34); self.spin_min_posts.setFixedWidth(150)
+        self.spin_min_posts.setFont(T.body()); self.spin_min_posts.setMinimumHeight(_px(34)); self.spin_min_posts.setFixedWidth(_px(150))
         self.spin_recent_days = SpinBox(skip_card)
         self.spin_recent_days.setRange(0, 3650)
         self.spin_recent_days.setValue(365)
-        self.spin_recent_days.setFont(T.body()); self.spin_recent_days.setMinimumHeight(34); self.spin_recent_days.setFixedWidth(150)
+        self.spin_recent_days.setFont(T.body()); self.spin_recent_days.setMinimumHeight(_px(34)); self.spin_recent_days.setFixedWidth(_px(150))
         lbl_mp = CaptionLabel("Min posts:", skip_card); lbl_mp.setFont(T.body()); lbl_mp.setStyleSheet("background: transparent;")
         lbl_rd = CaptionLabel("Post within (days):", skip_card); lbl_rd.setFont(T.body()); lbl_rd.setStyleSheet("background: transparent;")
         row_p.addWidget(lbl_mp); row_p.addWidget(self.spin_min_posts)
@@ -764,7 +795,7 @@ class FiltersPage(PageWidget):
         self.txt_skip_keywords = TextEdit(kw_card)
         self.txt_skip_keywords.setFont(T.body())
         self.txt_skip_keywords.setPlaceholderText("crypto, scam, bot, test")
-        self.txt_skip_keywords.setMinimumHeight(140)
+        self.txt_skip_keywords.setMinimumHeight(_px(140))
         col_skip.addWidget(self.txt_skip_keywords)
 
         col_only = QVBoxLayout()
@@ -774,7 +805,7 @@ class FiltersPage(PageWidget):
         self.txt_only_keywords = TextEdit(kw_card)
         self.txt_only_keywords.setFont(T.body())
         self.txt_only_keywords.setPlaceholderText("fitness, coach, realestate")
-        self.txt_only_keywords.setMinimumHeight(140)
+        self.txt_only_keywords.setMinimumHeight(_px(140))
         col_only.addWidget(self.txt_only_keywords)
 
         kw_form.addLayout(col_skip); kw_form.addLayout(col_only)
@@ -805,7 +836,7 @@ class FiltersPage(PageWidget):
         self.btn_import_bl   = PushButton(FIF.FOLDER,          "Import .txt",   bl_card)
         self.btn_clear_bl    = PushButton(FIF.DELETE,          "Clear All",     bl_card)
         for b in [self.btn_download_bl, self.btn_import_bl, self.btn_clear_bl]:
-            b.setFont(T.button()); b.setMinimumHeight(36); bl_btns.addWidget(b)
+            b.setFont(T.button()); b.setMinimumHeight(_px(36)); bl_btns.addWidget(b)
         bl_btns.addStretch()
         bl_lay.addLayout(bl_btns)
         self.add(bl_card)
@@ -841,7 +872,7 @@ class ResultsPage(QWidget):
 
         title_lbl = TitleLabel("Results & Logs", left_inner)
         title_lbl.setFont(T.title())
-        title_lbl.setStyleSheet("font-size: 22pt; margin-bottom: 12px; background: transparent;")
+        title_lbl.setStyleSheet(f"font-size: {_pts(22)}pt; margin-bottom: {_px(12)}px; background: transparent;")
         left_lay.addWidget(title_lbl)
 
         # Status & Progress Card
@@ -864,7 +895,7 @@ class ResultsPage(QWidget):
         p_lay.addLayout(status_row)
 
         self.progress_bar = ProgressBar(prog_card)
-        self.progress_bar.setValue(0); self.progress_bar.setMinimumHeight(14)
+        self.progress_bar.setValue(0); self.progress_bar.setMinimumHeight(_px(14))
         p_lay.addWidget(self.progress_bar)
         self.lbl_progress = CaptionLabel("Ready", prog_card)
         self.lbl_progress.setFont(T.body()); self.lbl_progress.setStyleSheet("background: transparent;")
@@ -884,12 +915,12 @@ class ResultsPage(QWidget):
             "Profile URL", "Scraped At",
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.setMinimumHeight(400)
+        self.table.setMinimumHeight(_px(400))
         left_lay.addWidget(self.table)
 
         exp_row = QHBoxLayout()
         self.btn_export_csv = PushButton(FIF.DOWNLOAD, "Export CSV", left_inner)
-        self.btn_export_csv.setFont(T.button()); self.btn_export_csv.setMinimumHeight(36)
+        self.btn_export_csv.setFont(T.button()); self.btn_export_csv.setMinimumHeight(_px(36))
         exp_row.addWidget(self.btn_export_csv); exp_row.addStretch()
         left_lay.addLayout(exp_row)
 
@@ -898,11 +929,12 @@ class ResultsPage(QWidget):
         lbl_log.setFont(T.heading()); lbl_log.setStyleSheet("background: transparent;")
         left_lay.addWidget(lbl_log)
         self.log_area = TextEdit(left_inner)
-        self.log_area.setReadOnly(True); self.log_area.setMinimumHeight(250); self.log_area.setFont(T.mono())
+        self.log_area.setReadOnly(True); self.log_area.setMinimumHeight(_px(250)); self.log_area.setFont(T.mono())
         left_lay.addWidget(self.log_area)
 
         left_lay.addStretch(1)
-        outer.addWidget(left_scroll, stretch=1)
+        outer.addWidget(left_scroll, stretch=65)
+        outer.addStretch(35)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -927,22 +959,22 @@ class SettingsPage(PageWidget):
         def _row(label, widget):
             r = QHBoxLayout()
             lbl = CaptionLabel(label, sh_card)
-            lbl.setFixedWidth(140); lbl.setFont(T.body()); lbl.setStyleSheet("background: transparent;")
+            lbl.setFixedWidth(_px(140)); lbl.setFont(T.body()); lbl.setStyleSheet("background: transparent;")
             r.addWidget(lbl); r.addWidget(widget)
             sh_lay.addLayout(r)
 
-        self.inp_sheet_id  = LineEdit(sh_card); self.inp_sheet_id.setFont(T.body()); self.inp_sheet_id.setMinimumHeight(36)
+        self.inp_sheet_id  = LineEdit(sh_card); self.inp_sheet_id.setFont(T.body()); self.inp_sheet_id.setMinimumHeight(_px(36))
         self.inp_sheet_id.setPlaceholderText("Spreadsheet ID from URL")
-        self.inp_sheet_tab = LineEdit(sh_card); self.inp_sheet_tab.setFont(T.body()); self.inp_sheet_tab.setMinimumHeight(36)
-        self.inp_creds     = LineEdit(sh_card); self.inp_creds.setFont(T.body()); self.inp_creds.setMinimumHeight(36)
+        self.inp_sheet_tab = LineEdit(sh_card); self.inp_sheet_tab.setFont(T.body()); self.inp_sheet_tab.setMinimumHeight(_px(36))
+        self.inp_creds     = LineEdit(sh_card); self.inp_creds.setFont(T.body()); self.inp_creds.setMinimumHeight(_px(36))
         _row("Sheet ID:",  self.inp_sheet_id)
         _row("Tab Name:",  self.inp_sheet_tab)
 
         creds_row = QHBoxLayout()
         creds_lbl = CaptionLabel("Credentials:", sh_card)
-        creds_lbl.setFixedWidth(140); creds_lbl.setFont(T.body()); creds_lbl.setStyleSheet("background: transparent;")
+        creds_lbl.setFixedWidth(_px(140)); creds_lbl.setFont(T.body()); creds_lbl.setStyleSheet("background: transparent;")
         self.btn_browse_creds = PushButton(FIF.FOLDER, "Browse", sh_card)
-        self.btn_browse_creds.setFont(T.button()); self.btn_browse_creds.setMinimumHeight(36)
+        self.btn_browse_creds.setFont(T.button()); self.btn_browse_creds.setMinimumHeight(_px(36))
         creds_row.addWidget(creds_lbl); creds_row.addWidget(self.inp_creds); creds_row.addWidget(self.btn_browse_creds)
         sh_lay.addLayout(creds_row)
 
@@ -951,7 +983,7 @@ class SettingsPage(PageWidget):
         self.btn_revoke_token = PushButton(FIF.DELETE,        "Revoke Token",   sh_card)
         self.lbl_sheet_status = CaptionLabel("Not connected", sh_card)
         for b in [self.btn_test_sheets, self.btn_revoke_token]:
-            b.setFont(T.button()); b.setMinimumHeight(36); btns_row.addWidget(b)
+            b.setFont(T.button()); b.setMinimumHeight(_px(36)); btns_row.addWidget(b)
         self.lbl_sheet_status.setFont(T.body()); self.lbl_sheet_status.setStyleSheet("background: transparent;")
         btns_row.addWidget(self.lbl_sheet_status); btns_row.addStretch()
         sh_lay.addLayout(btns_row)
@@ -967,7 +999,7 @@ class SettingsPage(PageWidget):
         wh_lay.addWidget(lbl_wh)
         wh_lay.addWidget(CaptionLabel("POST each account as JSON (blank = disabled).", wh_card))
         self.inp_webhook = LineEdit(wh_card); self.inp_webhook.setFont(T.body())
-        self.inp_webhook.setMinimumHeight(36); self.inp_webhook.setPlaceholderText("https://hooks.zapier.com/…")
+        self.inp_webhook.setMinimumHeight(_px(36)); self.inp_webhook.setPlaceholderText("https://hooks.zapier.com/…")
         wh_lay.addWidget(self.inp_webhook); wa_row.addWidget(wh_card, 1)
 
         ap_card = CardWidget(self); ap_lay = QVBoxLayout(ap_card)
@@ -980,7 +1012,7 @@ class SettingsPage(PageWidget):
             "Change host only for remote Appium.", ap_card
         ))
         self.inp_appium_host = LineEdit(ap_card); self.inp_appium_host.setFont(T.body())
-        self.inp_appium_host.setMinimumHeight(36)
+        self.inp_appium_host.setMinimumHeight(_px(36))
         ap_lay.addWidget(self.inp_appium_host); wa_row.addWidget(ap_card, 1)
         self.add_layout(wa_row)
 
@@ -1005,7 +1037,7 @@ class SettingsPage(PageWidget):
                 wmin.setDecimals(1); wmin.setSingleStep(0.5)
                 wmax.setDecimals(1); wmax.setSingleStep(0.5)
             for w in (wmin, wmax):
-                w.setFont(T.body()); w.setFixedHeight(34); w.setFixedWidth(140)
+                w.setFont(T.body()); w.setFixedHeight(_px(34)); w.setFixedWidth(_px(140))
                 w.setKeyboardTracking(True)
             lbl_min = CaptionLabel("MIN", dl_card); lbl_min.setFont(T.caption())
             lbl_min.setStyleSheet("background: transparent;"); r.addWidget(lbl_min); r.addWidget(wmin)
@@ -1033,16 +1065,16 @@ class SettingsPage(PageWidget):
         self.rb_switch_profiles.setChecked(True)
         self.sp_switch_every = SpinBox(dl_card)
         self.sp_switch_every.setFont(T.body()); self.sp_switch_every.setRange(1, 10000)
-        self.sp_switch_every.setValue(50); self.sp_switch_every.setFixedWidth(130)
-        self.sp_switch_every.setMinimumHeight(34); self.sp_switch_every.setKeyboardTracking(True)
+        self.sp_switch_every.setValue(50); self.sp_switch_every.setFixedWidth(_px(130))
+        self.sp_switch_every.setMinimumHeight(_px(34)); self.sp_switch_every.setKeyboardTracking(True)
 
         self.rb_switch_hours = QRadioButton("Every", dl_card)
         self.rb_switch_hours.setFont(T.body())
         self.rb_switch_hours.setStyleSheet("background: transparent;")
         self.sp_switch_hours = SpinBox(dl_card)
         self.sp_switch_hours.setFont(T.body()); self.sp_switch_hours.setRange(1, 168)
-        self.sp_switch_hours.setValue(1); self.sp_switch_hours.setFixedWidth(130)
-        self.sp_switch_hours.setMinimumHeight(34); self.sp_switch_hours.setKeyboardTracking(True)
+        self.sp_switch_hours.setValue(1); self.sp_switch_hours.setFixedWidth(_px(130))
+        self.sp_switch_hours.setMinimumHeight(_px(34)); self.sp_switch_hours.setKeyboardTracking(True)
 
         sm_row.addWidget(self.rb_switch_profiles); sm_row.addWidget(self.sp_switch_every)
         sm_row.addWidget(CaptionLabel("profiles", dl_card))
@@ -1130,7 +1162,7 @@ class MainWindow(FluentWindow):
         if not _titlebar_pixmap.isNull():
             logo_label = QLabel(self.titleBar)
             logo_label.setPixmap(_titlebar_pixmap)
-            logo_label.setFixedSize(40, 40)
+            logo_label.setFixedSize(_px(40), _px(40))
             logo_label.setContentsMargins(10, 0, 0, 0)
             logo_label.setStyleSheet("background: transparent;")
             self.titleBar.hBoxLayout.insertWidget(
@@ -1203,14 +1235,14 @@ class MainWindow(FluentWindow):
 
         # Width control buttons  ─  and  +
         self._btn_mirror_shrink = PushButton("−", self.mirror_panel)
-        self._btn_mirror_shrink.setFixedSize(30, 30)
+        self._btn_mirror_shrink.setFixedSize(_px(30), _px(30))
         self._btn_mirror_shrink.setFont(T.heading())
         self._btn_mirror_shrink.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_shrink.setToolTip("Shrink mirror panel")
         self._btn_mirror_shrink.clicked.connect(lambda: self._step_mirror_width(-60))
 
         self._btn_mirror_grow = PushButton("+", self.mirror_panel)
-        self._btn_mirror_grow.setFixedSize(30, 30)
+        self._btn_mirror_grow.setFixedSize(_px(30), _px(30))
         self._btn_mirror_grow.setFont(T.heading())
         self._btn_mirror_grow.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_grow.setToolTip("Grow mirror panel")

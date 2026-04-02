@@ -14,6 +14,23 @@ from qfluentwidgets import isDarkTheme
 from .stream_worker import MirrorStreamWorker
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-platform scaling helpers (mirrors main_window.py)
+# ─────────────────────────────────────────────────────────────────────────────
+import sys as _sys
+
+def _dpi_scale() -> float:
+    return 0.85 if _sys.platform == "win32" else 1.0
+
+def _pts(base_pt: int) -> int:
+    return max(6, round(base_pt * _dpi_scale()))
+
+def _px(base_px: int) -> int:
+    return max(1, round(base_px * _dpi_scale()))
+
+
+
+
 # ── accent palette (state colors only) ───────────────────────────────────────
 _C = {
     "bg":          "#0a0f1e",
@@ -78,7 +95,7 @@ class _Overlay(QWidget):
         p.fillRect(self.rect(), QColor(bg))
 
         # icon
-        icon_font = QFont("Segoe UI Emoji", 30)
+        icon_font = QFont("Segoe UI Emoji", _pts(30))
         p.setFont(icon_font)
         p.setPen(QColor(_C.get(self._state, _C["idle"])))
         icon_rect = self.rect().adjusted(0, -40, 0, -40)
@@ -86,7 +103,7 @@ class _Overlay(QWidget):
                    _ICONS.get(self._state, "?"))
 
         # message
-        p.setFont(_font(10))
+        p.setFont(_font(_pts(10)))
         p.setPen(QColor(text_dim))
         msg_rect = self.rect().adjusted(12, 44, -12, 0)
         p.drawText(msg_rect,
@@ -99,7 +116,7 @@ class _Overlay(QWidget):
 class MirrorWidget(QFrame):
     """Embedded mirror panel for one Android device."""
 
-    MIN_W, MIN_H = 240, 426
+    MIN_W, MIN_H = _px(240), _px(426)
 
     detached = pyqtSignal()
 
@@ -209,11 +226,11 @@ class MirrorWidget(QFrame):
         hlay.setContentsMargins(8, 0, 8, 0)
 
         self._lbl_name  = QLabel(f"Phone {self.phone_index + 1}", hdr)
-        self._lbl_name.setFont(_font(9, bold=True))
+        self._lbl_name.setFont(_font(_pts(9), bold=True))
         self._lbl_name.setStyleSheet(f"color:{self._C['text_main']};background:transparent;")
 
         self._lbl_state = QLabel("idle", hdr)
-        self._lbl_state.setFont(_font(9))
+        self._lbl_state.setFont(_font(_pts(9)))
         self._lbl_state.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._lbl_state.setStyleSheet(f"color:{self._C['idle']};background:transparent;")
 
@@ -242,11 +259,11 @@ class MirrorWidget(QFrame):
         flay.setContentsMargins(8, 2, 8, 2)
 
         self._lbl_fps = QLabel("", ftr)
-        self._lbl_fps.setFont(_font(8))
+        self._lbl_fps.setFont(_font(_pts(8)))
         self._lbl_fps.setStyleSheet(f"color:{self._C['text_dim']};background:transparent;")
 
         self._btn_disconnect = QPushButton("✖ Disconnect", ftr)
-        self._btn_disconnect.setFont(_font(8, bold=True))
+        self._btn_disconnect.setFont(_font(_pts(8), bold=True))
         self._btn_disconnect.setFixedHeight(22)
         self._btn_disconnect.setStyleSheet(self._get_button_style())
         self._btn_disconnect.clicked.connect(self.detach)
