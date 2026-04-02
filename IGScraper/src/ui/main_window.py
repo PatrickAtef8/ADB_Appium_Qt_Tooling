@@ -535,7 +535,7 @@ class DashboardPage(QWidget):
         hdr_row.addStretch()
         self.btn_refresh = PushButton(FIF.SYNC, "Refresh", dev_card)
         self.btn_refresh.setMinimumHeight(_px(34))
-        self.btn_refresh.setFixedWidth(_px(100))
+        self.btn_refresh.setMinimumWidth(_px(115))
         self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         hdr_row.addWidget(self.btn_refresh)
         dev_lay.addLayout(hdr_row)
@@ -1237,16 +1237,18 @@ class MainWindow(FluentWindow):
         hdr_row.addStretch()
 
         # Width control buttons  ─  and  +
+        _zoom_font = QFont("Inter, Segoe UI", _pts(10)); _zoom_font.setWeight(QFont.Weight.Medium)
+
         self._btn_mirror_shrink = PushButton("−", self.mirror_panel)
         self._btn_mirror_shrink.setFixedSize(_px(30), _px(30))
-        self._btn_mirror_shrink.setFont(T.heading())
+        self._btn_mirror_shrink.setFont(_zoom_font)
         self._btn_mirror_shrink.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_shrink.setToolTip("Shrink mirror panel")
         self._btn_mirror_shrink.clicked.connect(lambda: self._step_mirror_width(-60))
 
         self._btn_mirror_grow = PushButton("+", self.mirror_panel)
         self._btn_mirror_grow.setFixedSize(_px(30), _px(30))
-        self._btn_mirror_grow.setFont(T.heading())
+        self._btn_mirror_grow.setFont(_zoom_font)
         self._btn_mirror_grow.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_grow.setToolTip("Grow mirror panel")
         self._btn_mirror_grow.clicked.connect(lambda: self._step_mirror_width(+60))
