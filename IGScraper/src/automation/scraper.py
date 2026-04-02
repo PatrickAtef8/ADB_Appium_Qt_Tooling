@@ -206,10 +206,18 @@ class InstagramScraper:
            text also contains a digit (e.g. "523 following") — the action
            button text is plain "Following" with no number.
         3. Fall back to descriptionContains (accessibility label on the stat).
+
+        All 3 strategies are retried for up to 30 seconds so slow page loads
+        due to network lag don't cause an immediate failure.
         """
         driver = self.ctrl.driver
         self._log(f"Opening {mode} list...")
         time.sleep(2)
+
+        MAX_WAIT   = 30   # total seconds to keep retrying before giving up
+        RETRY_WAIT = 3    # seconds to wait between attempts
+        deadline   = time.time() + MAX_WAIT
+        attempt    = 0
 
         mode_lower = mode.lower()
 
@@ -231,67 +239,75 @@ class InstagramScraper:
             "com.instagram.android:id/profile_header_count_container",
             "com.instagram.android:id/profile_stats_container",
         ]
-        for res_id in STAT_ID_MAP.get(mode_lower, STAT_FALLBACK_IDS):
+
+        while time.time() < deadline:
+            attempt += 1
+            if attempt > 1:
+                self._log(f"⏳ Page still loading, retrying {mode} list... (attempt {attempt}, up to {MAX_WAIT}s)")
+                time.sleep(RETRY_WAIT)
+
+            # ── Strategy 1: target the profile-header stats container directly ──
+            for res_id in STAT_ID_MAP.get(mode_lower, STAT_FALLBACK_IDS):
+                try:
+                    el = driver.find_element(AppiumBy.ID, res_id)
+                    self._log(f"✅ Found {mode} stat container by ID: '{el.text}'")
+                    el.click()
+                    time.sleep(2.5)
+                    return True
+                except Exception:
+                    continue
+
+            # ── Strategy 2: pick the TextView whose text contains a digit ────────
+            # The stat label looks like "1,234 following" or "following\n1,234"
+            # depending on the layout.  The action button text is simply "Following".
+            # We collect all matching TextViews and prefer the one with a digit.
             try:
-                el = driver.find_element(AppiumBy.ID, res_id)
-                self._log(f"✅ Found {mode} stat container by ID: '{el.text}'")
+                elements = self._find_all(
+                    AppiumBy.XPATH,
+                    f'//android.widget.TextView[contains('
+                    f'translate(@text,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")'
+                    f',"{mode_lower}")]'
+                )
+                digit_match = None
+                first_match = None
+                for el in elements:
+                    try:
+                        txt = el.text.strip()
+                        if mode_lower not in txt.lower():
+                            continue
+                        if first_match is None:
+                            first_match = el
+                        # Prefer the element whose text also contains a digit
+                        if re.search(r'\d', txt):
+                            digit_match = el
+                            break
+                    except Exception:
+                        continue
+
+                target = digit_match or first_match
+                if target:
+                    self._log(f"✅ Found {mode} via text scan: '{target.text}'")
+                    target.click()
+                    time.sleep(2.5)
+                    return True
+            except Exception:
+                pass
+
+            # ── Strategy 3: accessibility description on the stat button ─────────
+            try:
+                el = driver.find_element(
+                    AppiumBy.ANDROID_UIAUTOMATOR,
+                    f'new UiSelector().descriptionContains("{mode}")'
+                )
+                desc = el.get_attribute("content-desc")
+                self._log(f"✅ Found {mode} via description: '{desc}'")
                 el.click()
                 time.sleep(2.5)
                 return True
             except Exception:
-                continue
+                pass
 
-        # ── Strategy 2: pick the TextView whose text contains a digit ────────
-        # The stat label looks like "1,234 following" or "following\n1,234"
-        # depending on the layout.  The action button text is simply "Following".
-        # We collect all matching TextViews and prefer the one with a digit.
-        try:
-            elements = self._find_all(
-                AppiumBy.XPATH,
-                f'//android.widget.TextView[contains('
-                f'translate(@text,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")'
-                f',"{mode_lower}")]'
-            )
-            digit_match = None
-            first_match = None
-            for el in elements:
-                try:
-                    txt = el.text.strip()
-                    if mode_lower not in txt.lower():
-                        continue
-                    if first_match is None:
-                        first_match = el
-                    # Prefer the element whose text also contains a digit
-                    if re.search(r'\d', txt):
-                        digit_match = el
-                        break
-                except Exception:
-                    continue
-
-            target = digit_match or first_match
-            if target:
-                self._log(f"✅ Found {mode} via text scan: '{target.text}'")
-                target.click()
-                time.sleep(2.5)
-                return True
-        except Exception:
-            pass
-
-        # ── Strategy 3: accessibility description on the stat button ─────────
-        try:
-            el = driver.find_element(
-                AppiumBy.ANDROID_UIAUTOMATOR,
-                f'new UiSelector().descriptionContains("{mode}")'
-            )
-            desc = el.get_attribute("content-desc")
-            self._log(f"✅ Found {mode} via description: '{desc}'")
-            el.click()
-            time.sleep(2.5)
-            return True
-        except Exception:
-            pass
-
-        self._log(f"❌ Could not find {mode} button.")
+        self._log(f"❌ Could not find {mode} button after {MAX_WAIT}s — page may not have loaded.")
         return False
 
     # ── Row extraction ────────────────────────────────────────────────────────

@@ -623,25 +623,42 @@ class DashboardPage(QWidget):
         sched_card = CardWidget(left_inner)
         sched_lay = QVBoxLayout(sched_card)
         sched_lay.setContentsMargins(24, 24, 24, 24)
+        sched_lay.setSpacing(10)
         self.chk_schedule = CheckBox("Working Hours", sched_card)
         self.chk_schedule.setFont(T.heading())
         self.chk_schedule.setStyleSheet("background: transparent;")
         sched_lay.addWidget(self.chk_schedule)
-
+        self.lbl_sched_desc = CaptionLabel(
+            "Scraping only runs between these times. Outside this window the bot pauses and waits.",
+            sched_card,
+        )
+        self.lbl_sched_desc.setStyleSheet("background: transparent; color: grey;")
+        self.lbl_sched_desc.setWordWrap(True)
+        sched_lay.addWidget(self.lbl_sched_desc)
         time_row = QHBoxLayout()
+        time_row.setSpacing(8)
+        self._lbl_sched_start = CaptionLabel("Start:", sched_card)
+        self._lbl_sched_start.setStyleSheet("background: transparent;")
         self.time_start = TimeEdit(sched_card)
         self.time_start.setFont(T.body())
         self.time_start.setFixedHeight(34)
-        self.time_start.setDisplayFormat("HH:mm")
+        self.time_start.setDisplayFormat("hh:mm AP")
+        self.time_start.setToolTip("Scraping START time (e.g. 09:00 AM)")
+        self._lbl_sched_arrow = CaptionLabel("to", sched_card)
+        self._lbl_sched_arrow.setStyleSheet("background: transparent;")
+        self._lbl_sched_end = CaptionLabel("End:", sched_card)
+        self._lbl_sched_end.setStyleSheet("background: transparent;")
         self.time_end = TimeEdit(sched_card)
         self.time_end.setFont(T.body())
         self.time_end.setFixedHeight(34)
-        self.time_end.setDisplayFormat("HH:mm")
+        self.time_end.setDisplayFormat("hh:mm AP")
+        self.time_end.setToolTip("Scraping END time (e.g. 06:00 PM)")
+        time_row.addWidget(self._lbl_sched_start)
         time_row.addWidget(self.time_start)
-        lbl_dash = CaptionLabel("-", sched_card)
-        lbl_dash.setStyleSheet("background: transparent;")
-        time_row.addWidget(lbl_dash)
+        time_row.addWidget(self._lbl_sched_arrow)
+        time_row.addWidget(self._lbl_sched_end)
         time_row.addWidget(self.time_end)
+        time_row.addStretch()
         sched_lay.addLayout(time_row)
         bottom_row.addWidget(sched_card, 1)
 
@@ -773,19 +790,21 @@ class FiltersPage(PageWidget):
         lbl_bl.setFont(T.heading()); lbl_bl.setStyleSheet("background: transparent;")
         bl_lay.addWidget(lbl_bl)
         bl_lay.addWidget(CaptionLabel(
-            "Usernames in this list will NEVER be scraped again. One per line.", bl_card
+            "Usernames in this list will NEVER be scraped again. "
+            "Download the .txt file to edit it, then import it back.", bl_card
         ))
-        self.txt_blacklist = TextEdit(bl_card)
-        self.txt_blacklist.setFont(T.mono())
-        self.txt_blacklist.setPlaceholderText("already_scraped_user1\nalready_scraped_user2")
-        self.txt_blacklist.setMinimumHeight(200)
-        bl_lay.addWidget(self.txt_blacklist)
+
+        # Count label — updated dynamically by MainWindow
+        self.lbl_bl_count = CaptionLabel("0 entries in blacklist", bl_card)
+        self.lbl_bl_count.setStyleSheet("background: transparent; color: grey;")
+        self.lbl_bl_count.setFont(T.mono())
+        bl_lay.addWidget(self.lbl_bl_count)
 
         bl_btns = QHBoxLayout()
-        self.btn_save_bl  = PrimaryPushButton(FIF.SAVE,   "Save Blacklist", bl_card)
-        self.btn_load_bl  = PushButton(FIF.FOLDER,        "Reload",         bl_card)
-        self.btn_clear_bl = PushButton(FIF.DELETE,        "Clear All",      bl_card)
-        for b in [self.btn_save_bl, self.btn_load_bl, self.btn_clear_bl]:
+        self.btn_download_bl = PrimaryPushButton(FIF.DOWNLOAD, "Download .txt", bl_card)
+        self.btn_import_bl   = PushButton(FIF.FOLDER,          "Import .txt",   bl_card)
+        self.btn_clear_bl    = PushButton(FIF.DELETE,          "Clear All",     bl_card)
+        for b in [self.btn_download_bl, self.btn_import_bl, self.btn_clear_bl]:
             b.setFont(T.button()); b.setMinimumHeight(36); bl_btns.addWidget(b)
         bl_btns.addStretch()
         bl_lay.addLayout(bl_btns)
@@ -1148,6 +1167,7 @@ class MainWindow(FluentWindow):
         self._connect_signals()
         self._refresh_devices()
         self._reload_blacklist_ui()
+        self._on_schedule_toggled()   # apply enabled/disabled state on load
 
     # ── Persistent mirror panel ───────────────────────────────────────────
     def _init_persistent_mirror(self):
@@ -1388,6 +1408,7 @@ class MainWindow(FluentWindow):
         dp.btn_refresh.clicked.connect(self._refresh_devices)
         dp.btn_start.clicked.connect(self._start_scraping)
         dp.btn_stop.clicked.connect(self._stop_all)
+        dp.chk_schedule.stateChanged.connect(self._on_schedule_toggled)
 
         for i, (combo_dev, combo_acc, lbl_port, lbl_status, btn_view) in enumerate(dp.device_rows):
             combo_dev.currentIndexChanged.connect(
@@ -1403,12 +1424,32 @@ class MainWindow(FluentWindow):
         sp.btn_browse_creds.clicked.connect(self._browse_credentials)
         sp.btn_test_sheets.clicked.connect(self._test_sheets)
         sp.btn_revoke_token.clicked.connect(self._revoke_token)
-        fp.btn_save_bl.clicked.connect(self._save_blacklist_from_ui)
-        fp.btn_load_bl.clicked.connect(self._reload_blacklist_ui)
+        fp.btn_download_bl.clicked.connect(self._download_blacklist_txt)
+        fp.btn_import_bl.clicked.connect(self._import_blacklist_txt)
         fp.btn_clear_bl.clicked.connect(self._clear_blacklist)
         rp.btn_export_csv.clicked.connect(self._export_csv)
 
     # ── Device helpers ────────────────────────────────────────────────────
+    # ── Working-hours toggle ──────────────────────────────────────────────
+    def _set_schedule_locked(self, locked: bool):
+        """Lock/unlock the Working Hours card while scraping is active."""
+        dp = self.dashboard_page
+        for w in [dp.chk_schedule, dp.time_start, dp.time_end,
+                  dp._lbl_sched_start, dp._lbl_sched_end, dp._lbl_sched_arrow,
+                  dp.lbl_sched_desc]:
+            w.setEnabled(False if locked else (
+                w is dp.chk_schedule or dp.chk_schedule.isChecked()
+            ))
+
+    def _on_schedule_toggled(self, _state=None):
+        """Enable/disable time pickers based on the Working Hours checkbox."""
+        dp = self.dashboard_page
+        enabled = dp.chk_schedule.isChecked()
+        for w in [dp.time_start, dp.time_end,
+                  dp._lbl_sched_start, dp._lbl_sched_end, dp._lbl_sched_arrow,
+                  dp.lbl_sched_desc]:
+            w.setEnabled(enabled)
+
     def _refresh_devices(self):
         devices = get_connected_devices()
         dp = self.dashboard_page
@@ -1793,6 +1834,7 @@ class MainWindow(FluentWindow):
 
         self.dashboard_page.btn_start.setEnabled(False)
         self.dashboard_page.btn_stop.setEnabled(True)
+        self._set_schedule_locked(True)
         self.dashboard_page.lbl_overall_status.setText(f"Running ({len(assigned)} phones)…")
         self.stackedWidget.setCurrentWidget(self.results_page)
 
@@ -1913,6 +1955,7 @@ class MainWindow(FluentWindow):
     def _reset_ui_after_done(self):
         self.dashboard_page.btn_start.setEnabled(True)
         self.dashboard_page.btn_stop.setEnabled(False)
+        self._set_schedule_locked(False)
         self.dashboard_page.lbl_overall_status.setText(f"Done — {self._collected} collected")
         self.results_page.lbl_progress.setText(f"Done: {self._collected} total accounts")
 
@@ -1965,14 +2008,58 @@ class MainWindow(FluentWindow):
 
     # ── Blacklist helpers ─────────────────────────────────────────────────
     def _reload_blacklist_ui(self):
+        """Refresh the count label from the on-disk blacklist."""
         bl = load_blacklist()
-        self.filters_page.txt_blacklist.setPlainText("\n".join(sorted(bl)))
+        count = len(bl)
+        self.filters_page.lbl_bl_count.setText(
+            f"{count} entr{'y' if count == 1 else 'ies'} in blacklist"
+        )
 
-    def _save_blacklist_from_ui(self):
-        raw = self.filters_page.txt_blacklist.toPlainText()
-        bl  = {u.strip().lower() for u in raw.splitlines() if u.strip()}
-        save_blacklist(bl)
-        InfoBar.success("Saved", f"Blacklist saved ({len(bl)} entries).", parent=self)
+    def _download_blacklist_txt(self):
+        """Export the current blacklist as a plain .txt file (one username per line)."""
+        bl = load_blacklist()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Blacklist", "blacklist.txt", "Text files (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(sorted(bl)))
+                if bl:
+                    f.write("\n")
+            InfoBar.success(
+                "Downloaded",
+                f"Blacklist exported ({len(bl)} entries) → {os.path.basename(path)}",
+                parent=self,
+            )
+        except Exception as exc:
+            InfoBar.error("Export Failed", str(exc), parent=self)
+
+    def _import_blacklist_txt(self):
+        """Import usernames from a .txt file (one per line) — merges with existing list."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Blacklist", "", "Text files (*.txt);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                new_entries = {line.strip().lower() for line in f if line.strip()}
+            bl = load_blacklist()
+            before = len(bl)
+            bl.update(new_entries)
+            save_blacklist(bl)
+            added = len(bl) - before
+            self._reload_blacklist_ui()
+            InfoBar.success(
+                "Imported",
+                f"Added {added} new entr{'y' if added == 1 else 'ies'} "
+                f"({len(bl)} total in blacklist).",
+                parent=self,
+            )
+        except Exception as exc:
+            InfoBar.error("Import Failed", str(exc), parent=self)
 
     def _clear_blacklist(self):
         if QMessageBox.question(
@@ -1981,7 +2068,7 @@ class MainWindow(FluentWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) == QMessageBox.StandardButton.Yes:
             clear_blacklist()
-            self.filters_page.txt_blacklist.clear()
+            self._reload_blacklist_ui()
             InfoBar.success("Cleared", "Blacklist cleared.", parent=self)
 
     # ── Export ────────────────────────────────────────────────────────────

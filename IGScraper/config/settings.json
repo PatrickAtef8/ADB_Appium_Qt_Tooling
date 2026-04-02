@@ -2,7 +2,7 @@
   "sheet_id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
   "sheet_tab": "Sheet1",
   "credentials_path": "assets/credentials.json",
-  "webhook_url": "https://webhook.site/293bd19e-1c26-40fe-ba95-64f06b92f05c",
+  "webhook_url": "",
   "filters": {
     "skip_no_bio": false,
     "skip_private": false,
@@ -23,14 +23,14 @@
     "rest_min_minutes": 30,
     "rest_max_minutes": 60,
     "session_break_every": 1,
-    "switch_mode": "profiles",
+    "switch_mode": "hours",
     "switch_hours": 1
   },
   "schedule": {
     "enabled": false,
-    "start_hour": 4,
+    "start_hour": 12,
     "start_minute": 0,
-    "end_hour": 19,
+    "end_hour": 12,
     "end_minute": 0
   },
   "appium": {
@@ -39,7 +39,7 @@
   },
   "devices": [
     {
-      "serial": null
+      "serial": "emulator-5554"
     },
     {
       "serial": null
@@ -55,12 +55,8 @@
   "last_count": 10,
   "last_device": "",
   "targets_per_phone": [
-    [
-      "bmw"
-    ],
-    [
-      "natgeo"
-    ],
+    [],
+    [],
     []
   ],
   "mirror_width": 677
