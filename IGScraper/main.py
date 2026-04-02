@@ -12,14 +12,23 @@ import pathlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ── Global crash log ─────────────────────────────────────────────────────────
-# On Windows: writes to %USERPROFILE%\cansa_crash.log (always writable)
-# On Linux:   writes to ~/cansa_crash.log
-_LOG_FILE = pathlib.Path.home() / "cansa_crash.log"
+_LOG_FILE   = pathlib.Path.home() / "cansa_crash.log"
+_SPLASH_LOG = pathlib.Path.home() / "splash_debug.log"
 
 def _write_crash(msg: str):
     try:
         with open(_LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n=== {datetime.datetime.now()} ===\n{msg}\n")
+    except Exception:
+        pass
+
+# ── Splash debug logger ───────────────────────────────────────────────────────
+def _slog(msg: str):
+    """Write a timestamped line to splash_debug.log (always writable)."""
+    line = f"[{datetime.datetime.now().strftime('%H:%M:%S.%f')}] {msg}\n"
+    try:
+        with open(_SPLASH_LOG, "a", encoding="utf-8", errors="replace") as f:
+            f.write(line)
     except Exception:
         pass
 
@@ -30,7 +39,6 @@ def _excepthook(exc_type, exc_value, exc_tb):
 
 sys.excepthook = _excepthook
 
-# Also catch threading exceptions (QThread run() exceptions end up here)
 import threading
 def _thread_excepthook(args):
     msg = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
@@ -41,23 +49,16 @@ from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
 from PyQt6.QtGui import QIcon, QPixmap, QScreen, QImageReader
 from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal, QRect
 
-# ── Windows DPI: prevent Qt from scaling up beyond 100% on 96-dpi screens ────
-# Must be set BEFORE QApplication is constructed.
 QApplication.setHighDpiScaleFactorRoundingPolicy(
     Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
 )
 
-# ── Cross-platform font scaling ───────────────────────────────────────────────
-# Windows GDI renders the same point-size fonts ~15 % larger than Linux/X11.
-# _pts() corrects for this so the splash and main window look identical on
-# both platforms.
 def _pts(base_pt: int) -> int:
     if sys.platform == "win32":
         return max(6, round(base_pt * 0.85))
     return base_pt
 
 from src.ui.main_window import MainWindow
-
 
 _APP_BG = "#0f172a"
 
@@ -71,62 +72,63 @@ def _resource_path(relative: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reliable cross-platform pixmap loader
+# Pixmap loader — logs every step to splash_debug.log
 # ─────────────────────────────────────────────────────────────────────────────
-def _load_pixmap(png_path: str, ico_path: str, size: int = 300) -> QPixmap:
-    """
-    Load the logo pixmap in a way that works reliably on both platforms,
-    both from source and from a frozen PyInstaller EXE.
-
-    Strategy (in order):
-      1. QImageReader on the PNG  — works on Linux and on Windows once a
-         native window exists (post-show).  Needs the imageformats plugin.
-      2. QIcon on the PNG         — sometimes succeeds when QImageReader misses.
-      3. QIcon on the ICO         — built-in Qt decoder, NO plugin required.
-                                    This is the guaranteed Windows fallback.
-                                    Identical to how the app-bar and title-bar
-                                    icons are loaded (which always work).
-
-    The ICO file already contains a 256×256 RGBA image, so the result is
-    visually identical to the PNG — just decoded through a different path.
-    """
+def _load_pixmap(png_path: str, ico_path: str, size: int = 300,
+                 label: str = "") -> QPixmap:
+    prefix = f"[{label}] " if label else ""
     pixmap = QPixmap()
 
-    # 1. PNG via QImageReader
-    if os.path.exists(png_path):
+    # ── Step 1: PNG via QImageReader ─────────────────────────────────────────
+    png_exists = os.path.exists(png_path)
+    _slog(f"{prefix}PNG path: {png_path}  exists={png_exists}")
+
+    if png_exists:
+        _slog(f"{prefix}  file size: {os.path.getsize(png_path)} bytes")
+        supported = [fmt.data().decode() for fmt in QImageReader.supportedImageFormats()]
+        _slog(f"{prefix}  Qt supported formats: {supported}")
         reader = QImageReader(png_path)
         reader.setAutoTransform(True)
         img = reader.read()
         if not img.isNull():
             pixmap = QPixmap.fromImage(img)
+            _slog(f"{prefix}  QImageReader OK → pixmap {pixmap.width()}x{pixmap.height()}  isNull={pixmap.isNull()}")
         else:
-            print(f"⚠️ QImageReader failed ({png_path}): {reader.errorString()}")
+            _slog(f"{prefix}  QImageReader FAILED: '{reader.errorString()}'")
 
-    # 2. PNG via QIcon (fallback)
-    if pixmap.isNull() and os.path.exists(png_path):
+    # ── Step 2: PNG via QIcon fallback ───────────────────────────────────────
+    if pixmap.isNull() and png_exists:
         icon = QIcon(png_path)
+        _slog(f"{prefix}  QIcon(png) isNull={icon.isNull()}")
         if not icon.isNull():
             pixmap = icon.pixmap(size, size)
+            _slog(f"{prefix}  QIcon(png) → pixmap {pixmap.width()}x{pixmap.height()}  isNull={pixmap.isNull()}")
 
-    # 3. ICO via QIcon — built-in decoder, always works on Windows frozen EXE
-    if pixmap.isNull() and os.path.exists(ico_path):
-        icon = QIcon(ico_path)
-        if not icon.isNull():
-            pixmap = icon.pixmap(size, size)
-            print(f"ℹ️ Splash using ICO fallback: {ico_path}")
+    # ── Step 3: ICO via QIcon (guaranteed built-in decoder) ──────────────────
+    if pixmap.isNull():
+        ico_exists = os.path.exists(ico_path)
+        _slog(f"{prefix}  ICO path: {ico_path}  exists={ico_exists}")
+        if ico_exists:
+            _slog(f"{prefix}  ICO file size: {os.path.getsize(ico_path)} bytes")
+            icon = QIcon(ico_path)
+            _slog(f"{prefix}  QIcon(ico) isNull={icon.isNull()}")
+            if not icon.isNull():
+                pixmap = icon.pixmap(size, size)
+                _slog(f"{prefix}  QIcon(ico) → pixmap {pixmap.width()}x{pixmap.height()}  isNull={pixmap.isNull()}")
 
     if pixmap.isNull():
-        print(f"⚠️ Could not load splash image from either: {png_path} / {ico_path}")
+        _slog(f"{prefix}  *** ALL METHODS FAILED — pixmap is null ***")
         return pixmap
 
-    # Scale down if needed, preserve aspect ratio
+    # ── Scale if needed ───────────────────────────────────────────────────────
+    _slog(f"{prefix}  before scale: {pixmap.width()}x{pixmap.height()}")
     if pixmap.width() > size or pixmap.height() > size:
         pixmap = pixmap.scaled(
             size, size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-
+    _slog(f"{prefix}  FINAL pixmap: {pixmap.width()}x{pixmap.height()}  isNull={pixmap.isNull()}")
     return pixmap
 
 
@@ -136,9 +138,9 @@ def _load_pixmap(png_path: str, ico_path: str, size: int = 300) -> QPixmap:
 class SplashWindow(QWidget):
     finished = pyqtSignal()
 
-    _HOLD_MS    = 2200
+    _HOLD_MS     = 2200
     _FADE_OUT_MS = 600
-    _LOGO_SIZE  = 300
+    _LOGO_SIZE   = 300
 
     def __init__(self, png_path: str, ico_path: str, screen_geo: QRect):
         super().__init__()
@@ -164,11 +166,13 @@ class SplashWindow(QWidget):
         logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo_lbl.setStyleSheet("background: transparent;")
 
-        # Pre-show load attempt — may be null on Windows (no native window yet),
-        # that is fine: _ensure_logo_loaded() will fix it 50 ms after show().
-        pixmap = _load_pixmap(png_path, ico_path, self._LOGO_SIZE)
+        _slog("--- PRE-SHOW load ---")
+        pixmap = _load_pixmap(png_path, ico_path, self._LOGO_SIZE, label="pre-show")
         if not pixmap.isNull():
             logo_lbl.setPixmap(pixmap)
+            _slog(f"pre-show: setPixmap done")
+        else:
+            _slog("pre-show: pixmap null, skipping setPixmap")
 
         title_lbl = QLabel("Cansa", self)
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -210,38 +214,24 @@ class SplashWindow(QWidget):
     def start(self):
         self.setWindowOpacity(1.0)
         self.showMaximized()
-        # On Windows, the native window handle does not exist until after show().
-        # Reload the pixmap now that the platform plugin is fully initialised.
-        # This is the authoritative load on Windows; the pre-show one above is
-        # just a best-effort to avoid a blank frame on Linux.
+        _slog(f"start(): showMaximized called  geometry={self.geometry()}")
         QTimer.singleShot(50, self._ensure_logo_loaded)
         self._hold_timer.start()
 
     def _ensure_logo_loaded(self):
-        """
-        Post-show pixmap reload.
+        _slog("--- POST-SHOW load (50ms after showMaximized) ---")
+        _slog(f"  logo_lbl geometry={self._logo_lbl.geometry()}  size={self._logo_lbl.size()}")
+        _slog(f"  splash geometry={self.geometry()}")
 
-        On Windows, Qt's imageformats plugin (qpng.dll) is not registered until
-        after the first native window is shown.  Even if QImageReader returns a
-        non-null image pre-show, it can be a blank/transparent pixmap because the
-        Windows platform plugin hasn't wired up the screen context yet.
-
-        We always re-run the load here on Windows, and also run it on Linux as a
-        no-op safety net (QImageReader is reliable pre-show on Linux, so the
-        resulting pixmap will be identical and setPixmap is harmless).
-
-        Critically, after setting the pixmap we call both update() AND repaint()
-        so the label is guaranteed to be redrawn before the hold timer fires the
-        fade-out animation.
-        """
-        pixmap = _load_pixmap(self._png_path, self._ico_path, self._LOGO_SIZE)
+        pixmap = _load_pixmap(self._png_path, self._ico_path, self._LOGO_SIZE, label="post-show")
 
         if not pixmap.isNull():
             self._logo_lbl.setPixmap(pixmap)
             self._logo_lbl.update()
-            self._logo_lbl.repaint()   # force immediate paint — do not wait for event loop
+            self._logo_lbl.repaint()
+            _slog(f"post-show: setPixmap+repaint done  label_size={self._logo_lbl.size()}")
         else:
-            print(f"⚠️ Splash logo still null after post-show reload.")
+            _slog("post-show: *** ALL METHODS FAILED — splash will show no image ***")
 
     def _on_done(self):
         self.finished.emit()
@@ -252,36 +242,42 @@ class SplashWindow(QWidget):
 # Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    # Fresh log every run
+    try:
+        _SPLASH_LOG.write_text(
+            f"=== splash_debug.log started {datetime.datetime.now()} ===\n"
+            f"Python: {sys.version}\n"
+            f"Platform: {sys.platform}\n"
+            f"Frozen (PyInstaller): {hasattr(sys, '_MEIPASS')}\n"
+            f"_MEIPASS: {getattr(sys, '_MEIPASS', 'N/A')}\n\n",
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("Cansa")
     app.setApplicationVersion("1.0")
 
-    # ── Paths ─────────────────────────────────────────────────────────────
     ico_path = _resource_path("cansa_icon.ico")
     png_path = _resource_path("cansa_icon.png")
 
-    # ── App icon (Windows / Taskbar) ───────────────────────────────────────
+    _slog(f"ico_path: exists={os.path.exists(ico_path)}  {ico_path}")
+    _slog(f"png_path: exists={os.path.exists(png_path)}  {png_path}")
+
     if os.path.exists(ico_path):
         app.setWindowIcon(QIcon(ico_path))
-        print(f"✅ ICO loaded: {ico_path}")
+        _slog("App icon set from ICO OK")
     else:
-        print(f"⚠️ ICO not found: {ico_path}")
+        _slog("WARNING: ICO not found for app icon")
 
-    # ── Main Window ────────────────────────────────────────────────────────
     window = MainWindow()
     window.resize(1600, 1000)
     window.setWindowOpacity(0.0)
 
     screen: QScreen = QApplication.primaryScreen()
     screen_geo = screen.availableGeometry()
-
-    # ── Splash ─────────────────────────────────────────────────────────────
-    # Pass both paths so _load_pixmap() can fall back to ICO if PNG plugin
-    # is unavailable (guaranteed to work on Windows frozen EXE).
-    if not os.path.exists(png_path) and not os.path.exists(ico_path):
-        print(f"⚠️ Neither splash image found: {png_path} / {ico_path}")
-    else:
-        print(f"✅ Splash paths: png={png_path}  ico={ico_path}")
+    _slog(f"screen: geo={screen_geo}  dpr={screen.devicePixelRatio()}")
 
     splash = SplashWindow(png_path, ico_path, screen_geo)
 
@@ -291,7 +287,6 @@ def main():
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
         anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
         window.showMaximized()
         anim.start()
 
