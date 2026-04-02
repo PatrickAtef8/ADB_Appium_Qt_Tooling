@@ -272,6 +272,7 @@ def main():
         print(f"✅ ICO loaded: {ico_path}")
     else:
         print(f"⚠️ ICO not found: {ico_path}")
+        
 
     # ── Main Window ────────────────────────────────────────────────────────
     window = MainWindow()
