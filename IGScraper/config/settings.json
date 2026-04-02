@@ -23,7 +23,7 @@
     "rest_min_minutes": 30,
     "rest_max_minutes": 60,
     "session_break_every": 1,
-    "switch_mode": "hours",
+    "switch_mode": "profiles",
     "switch_hours": 1
   },
   "schedule": {
@@ -55,9 +55,11 @@
   "last_count": 10,
   "last_device": "",
   "targets_per_phone": [
-    [],
+    [
+      "android"
+    ],
     [],
     []
   ],
-  "mirror_width": 859
+  "mirror_width": 542
 }

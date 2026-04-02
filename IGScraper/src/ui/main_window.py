@@ -1236,27 +1236,21 @@ class MainWindow(FluentWindow):
         hdr_row.addWidget(mirror_title)
         hdr_row.addStretch()
 
-        # Width control buttons  ─  and  +
-        _zoom_ss = (
-            "QPushButton {"
-            "  background: #1e293b; color: #f8fafc;"
-            "  border: 1px solid #475569; border-radius: 4px;"
-            "  font-size: 16px; font-weight: bold;"
-            "}"
-            "QPushButton:hover { background: #334155; }"
-            "QPushButton:pressed { background: #0f172a; }"
-        )
+        # Content scale state
+        self._content_scale      = 1.0
+        self._content_scale_prev = 1.0
+        self._btn_scale_down: Optional[QPushButton] = None
+        self._btn_scale_up:   Optional[QPushButton] = None
 
+        # Width control buttons  ─  and  +
         self._btn_mirror_shrink = QPushButton("−", self.mirror_panel)
         self._btn_mirror_shrink.setFixedSize(_px(30), _px(30))
-        self._btn_mirror_shrink.setStyleSheet(_zoom_ss)
         self._btn_mirror_shrink.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_shrink.setToolTip("Shrink mirror panel")
         self._btn_mirror_shrink.clicked.connect(lambda: self._step_mirror_width(-60))
 
         self._btn_mirror_grow = QPushButton("+", self.mirror_panel)
         self._btn_mirror_grow.setFixedSize(_px(30), _px(30))
-        self._btn_mirror_grow.setStyleSheet(_zoom_ss)
         self._btn_mirror_grow.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_mirror_grow.setToolTip("Grow mirror panel")
         self._btn_mirror_grow.clicked.connect(lambda: self._step_mirror_width(+60))
@@ -1287,6 +1281,11 @@ class MainWindow(FluentWindow):
     def _step_mirror_width(self, delta: int):
         self._mirror_width = max(_px(260), min(_px(900), self._mirror_width + delta))
         self._reposition_mirror()
+
+    def _step_content_scale(self, delta: float):
+        self._content_scale_prev = self._content_scale
+        self._content_scale = round(max(0.7, min(1.5, self._content_scale + delta)), 1)
+        self._apply_content_scale()
 
     def _reposition_mirror(self):
         """Reposition the mirror container to match _mirror_width."""
@@ -1390,6 +1389,23 @@ class MainWindow(FluentWindow):
         if hasattr(self, "mirror"):
             self.mirror.update_theme()
 
+        # Content scale ± buttons in title bar
+        self._btn_scale_down = QPushButton("−", self)
+        self._btn_scale_down.setFixedSize(26, 26)
+        self._btn_scale_down.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_scale_down.setToolTip("Zoom out content")
+        self._btn_scale_down.clicked.connect(lambda: self._step_content_scale(-0.1))
+
+        self._btn_scale_up = QPushButton("+", self)
+        self._btn_scale_up.setFixedSize(26, 26)
+        self._btn_scale_up.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_scale_up.setToolTip("Zoom in content")
+        self._btn_scale_up.clicked.connect(lambda: self._step_content_scale(+0.1))
+
+        self.titleBar.hBoxLayout.insertWidget(1, self._btn_scale_up,   0, Qt.AlignmentFlag.AlignLeft)
+        self.titleBar.hBoxLayout.insertWidget(1, self._btn_scale_down, 0, Qt.AlignmentFlag.AlignLeft)
+        self._refresh_zoom_btn_styles()
+
     def _apply_stylesheet(self):
         dark = isDarkTheme()
         bg = "#0f172a" if dark else "#f8fafc"
@@ -1441,6 +1457,68 @@ class MainWindow(FluentWindow):
         self._apply_stylesheet()
         if hasattr(self, "mirror"):
             self.mirror.update_theme()
+        self._refresh_zoom_btn_styles()
+
+    # ── Zoom button stylesheet (theme-aware) ──────────────────────────────
+    def _zoom_btn_ss(self) -> str:
+        dark = isDarkTheme()
+        bg     = "#1e293b" if dark else "#e2e8f0"
+        bg_hov = "#334155" if dark else "#cbd5e1"
+        bg_pre = "#0f172a" if dark else "#94a3b8"
+        col    = "#f8fafc"  if dark else "#0f172a"
+        brd    = "#475569"  if dark else "#94a3b8"
+        return (
+            f"QPushButton {{background:{bg};color:{col};"
+            f"border:1px solid {brd};border-radius:4px;"
+            f"font-size:16px;font-weight:bold;}}"
+            f"QPushButton:hover {{background:{bg_hov};}}"
+            f"QPushButton:pressed {{background:{bg_pre};}}"
+        )
+
+    def _refresh_zoom_btn_styles(self):
+        ss = self._zoom_btn_ss()
+        for btn in (self._btn_mirror_shrink, self._btn_mirror_grow,
+                    self._btn_scale_down, self._btn_scale_up):
+            if btn:
+                btn.setStyleSheet(ss)
+
+    # ── Content scale (live font/size walk) ───────────────────────────────
+    def _apply_content_scale(self):
+        """Walk every child widget of the 4 pages and rescale fonts + heights."""
+        s = self._content_scale
+        pages = [self.dashboard_page, self.filters_page,
+                 self.results_page,   self.settings_page]
+
+        # Base pt sizes at scale 1.0 (after platform correction)
+        base = {
+            "title":   _pts(22),
+            "heading": _pts(13),
+            "body":    _pts(10),
+            "caption": _pts(9),
+            "button":  _pts(10),
+            "mono":    _pts(9),
+        }
+
+        def scaled(pt):
+            return max(6, round(pt * s))
+
+        for page in pages:
+            for w in page.findChildren(QWidget):
+                f = w.font()
+                pt = f.pointSize()
+                if pt <= 0:
+                    continue
+                # Snap pt to the nearest base size and rescale
+                closest_key = min(base, key=lambda k: abs(base[k] - round(pt / (self._content_scale_prev or 1.0))))
+                new_pt = scaled(base[closest_key])
+                if f.pointSize() != new_pt:
+                    f.setPointSize(new_pt)
+                    w.setFont(f)
+                # Rescale fixed/minimum heights for input widgets
+                from PyQt6.QtWidgets import QAbstractSpinBox as _ASB
+                if isinstance(w, (QAbstractSpinBox, _ASB)):
+                    w.setMinimumHeight(max(20, round(_px(34) * s)))
+        self._content_scale_prev = s
 
     # ── Signal connections ────────────────────────────────────────────────
     def _connect_signals(self):
