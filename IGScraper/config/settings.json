@@ -16,7 +16,7 @@
   "delays": {
     "between_profiles_min": 2.0,
     "between_profiles_max": 4.0,
-    "between_scrolls_min": 1.0,
+    "between_scrolls_min": 0.5,
     "between_scrolls_max": 3.0,
     "run_min_profiles": 3,
     "run_max_profiles": 10,
@@ -28,7 +28,7 @@
   },
   "schedule": {
     "enabled": false,
-    "start_hour": 9,
+    "start_hour": 4,
     "start_minute": 0,
     "end_hour": 19,
     "end_minute": 0
@@ -63,5 +63,5 @@
     ],
     []
   ],
-  "mirror_width": 695
+  "mirror_width": 572
 }

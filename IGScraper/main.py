@@ -90,13 +90,17 @@ class SplashWindow(QWidget):
         logo_lbl = QLabel(self)
         logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        pixmap = QPixmap(image_path)
+        # Load via QIcon first — it selects the largest available frame from
+        # an ICO file (e.g. 256×256) rather than the smallest one that a raw
+        # QPixmap() call picks.  Then ask for a 256×256 pixmap from it.
+        # For PNG the pixmap() call simply returns the full image at that size.
+        icon = QIcon(image_path)
+        if not icon.isNull():
+            pixmap = icon.pixmap(256, 256)
+        else:
+            pixmap = QPixmap()
 
         if not pixmap.isNull():
-            # Only scale DOWN to 300×300 — never upscale.
-            # Upscaling a small ICO frame (e.g. 32×32) to 300×300 produces
-            # a blurry, pixelated logo. If the source is already ≤300px on
-            # both axes, display it at native size so it stays crisp.
             src_w, src_h = pixmap.width(), pixmap.height()
             if src_w > 300 or src_h > 300:
                 pixmap = pixmap.scaled(

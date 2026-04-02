@@ -501,6 +501,7 @@ class DashboardPage(QWidget):
         hdr_row.addStretch()
         self.btn_refresh = PushButton(FIF.SYNC, "Refresh", dev_card)
         self.btn_refresh.setMinimumHeight(34)
+        self.btn_refresh.setFixedWidth(100)
         self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         hdr_row.addWidget(self.btn_refresh)
         dev_lay.addLayout(hdr_row)
@@ -519,6 +520,7 @@ class DashboardPage(QWidget):
             combo_dev.setMinimumHeight(36)
             combo_dev.setPlaceholderText("Select Device")
             combo_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            combo_dev.setMaximumWidth(300)
 
             combo_acc = ComboBox(dev_card)
             combo_acc.setFont(T.body())
@@ -533,7 +535,7 @@ class DashboardPage(QWidget):
 
             lbl_status = CaptionLabel("● idle", dev_card)
             lbl_status.setFont(T.caption())
-            lbl_status.setFixedWidth(100)
+            lbl_status.setFixedWidth(75)
             lbl_status.setStyleSheet("background: transparent;")
 
             btn_view = PushButton("👁 View", dev_card)
@@ -986,7 +988,6 @@ class SettingsPage(PageWidget):
                 wmax.setDecimals(1); wmax.setSingleStep(0.5)
             for w in (wmin, wmax):
                 w.setFont(T.body()); w.setFixedHeight(34); w.setFixedWidth(140)
-                w.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
                 w.setKeyboardTracking(True)
             lbl_min = CaptionLabel("MIN", dl_card); lbl_min.setFont(T.caption())
             lbl_min.setStyleSheet("background: transparent;"); r.addWidget(lbl_min); r.addWidget(wmin)
@@ -1059,7 +1060,25 @@ class MainWindow(FluentWindow):
         super().__init__()
 
         # ====================== ADD LOGO TO TITLE BAR ======================
-        icon = QApplication.instance().windowIcon()
+        # Load the icon directly from the resource path rather than relying on
+        # app.windowIcon() which can be null in a frozen Windows EXE at the
+        # point MainWindow.__init__ runs (the icon assignment in main() happens
+        # before MainWindow is constructed, but QFluentWindow may reset it).
+        import sys as _sys
+        _base = getattr(_sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        # Walk up one level if we're inside src/ui/
+        for _candidate in [
+            os.path.join(_base, "cansa_icon.ico"),
+            os.path.join(_base, "..", "..", "cansa_icon.ico"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "cansa_icon.ico"),
+        ]:
+            _candidate = os.path.normpath(_candidate)
+            if os.path.exists(_candidate):
+                icon = QIcon(_candidate)
+                break
+        else:
+            icon = QApplication.instance().windowIcon()
+
         if not icon.isNull():
             logo_label = QLabel(self.titleBar)
             pixmap = icon.pixmap(32, 32)
