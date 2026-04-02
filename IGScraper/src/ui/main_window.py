@@ -518,38 +518,39 @@ class DashboardPage(QWidget):
             combo_dev = ComboBox(dev_card)
             combo_dev.setFont(T.body())
             combo_dev.setMinimumHeight(36)
+            combo_dev.setMinimumWidth(160)
             combo_dev.setPlaceholderText("Select Device")
             combo_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            combo_dev.setMaximumWidth(300)
 
             combo_acc = ComboBox(dev_card)
             combo_acc.setFont(T.body())
             combo_acc.setMinimumHeight(36)
-            combo_acc.setFixedWidth(160)
+            combo_acc.setMinimumWidth(120)
+            combo_acc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             combo_acc.setPlaceholderText("Accounts")
 
             lbl_port = CaptionLabel(f":{4723 + i}", dev_card)
             lbl_port.setFont(T.caption())
-            lbl_port.setFixedWidth(60)
+            lbl_port.setMinimumWidth(50)
             lbl_port.setStyleSheet("background: transparent;")
 
             lbl_status = CaptionLabel("● idle", dev_card)
             lbl_status.setFont(T.caption())
-            lbl_status.setFixedWidth(75)
+            lbl_status.setMinimumWidth(60)
             lbl_status.setStyleSheet("background: transparent;")
 
             btn_view = PushButton("👁 View", dev_card)
             btn_view.setFont(T.button())
             btn_view.setMinimumHeight(34)
-            btn_view.setFixedWidth(90)
+            btn_view.setMinimumWidth(80)
             btn_view.setCursor(Qt.CursorShape.PointingHandCursor)
 
-            row.addWidget(lbl_num)
-            row.addWidget(combo_dev)
-            row.addWidget(combo_acc)
-            row.addWidget(lbl_port)
-            row.addWidget(lbl_status)
-            row.addWidget(btn_view)
+            row.addWidget(lbl_num, 0)
+            row.addWidget(combo_dev, 3)
+            row.addWidget(combo_acc, 2)
+            row.addWidget(lbl_port, 0)
+            row.addWidget(lbl_status, 0)
+            row.addWidget(btn_view, 0)
             dev_lay.addLayout(row)
             self.device_rows.append((combo_dev, combo_acc, lbl_port, lbl_status, btn_view))
 
@@ -689,8 +690,7 @@ class DashboardPage(QWidget):
         left_lay.addLayout(ctrl_row)
 
         left_lay.addStretch(1)
-        outer.addWidget(left_scroll, stretch=65)
-        outer.addStretch(35)
+        outer.addWidget(left_scroll, stretch=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -902,8 +902,7 @@ class ResultsPage(QWidget):
         left_lay.addWidget(self.log_area)
 
         left_lay.addStretch(1)
-        outer.addWidget(left_scroll, stretch=65)
-        outer.addStretch(35)
+        outer.addWidget(left_scroll, stretch=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

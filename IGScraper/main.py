@@ -131,6 +131,11 @@ class SplashWindow(QWidget):
         else:
             print(f"⚠️ Splash image could not be loaded: {image_path}")
 
+        # Store for possible deferred reload on Windows
+        self._logo_lbl   = logo_lbl
+        self._image_path = image_path
+        self._pixmap     = pixmap
+
         logo_lbl.setPixmap(pixmap)
         logo_lbl.setStyleSheet("background: transparent;")
 
@@ -172,7 +177,44 @@ class SplashWindow(QWidget):
     def start(self):
         self.setWindowOpacity(1.0)
         self.showMaximized()
+        # On Windows the native window handle does not exist until after show().
+        # Defer a second load attempt so QImageReader / QIcon have a valid
+        # platform context — this fixes the blank logo on Windows.
+        QTimer.singleShot(50, self._ensure_logo_loaded)
         self._hold_timer.start()
+
+    def _ensure_logo_loaded(self):
+        """Re-attempt image load now that the window is fully shown."""
+        if not self._pixmap.isNull():
+            return   # already loaded fine first time
+
+        path = self._image_path
+        pixmap = QPixmap()
+
+        # Try QImageReader first (PNG)
+        if path.lower().endswith(".png"):
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            img = reader.read()
+            if not img.isNull():
+                pixmap = QPixmap.fromImage(img)
+
+        # Try QIcon (works for ICO and sometimes PNG after window is shown)
+        if pixmap.isNull():
+            icon = QIcon(path)
+            if not icon.isNull():
+                pixmap = icon.pixmap(256, 256)
+
+        if not pixmap.isNull():
+            if pixmap.width() > 300 or pixmap.height() > 300:
+                pixmap = pixmap.scaled(
+                    300, 300,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            self._pixmap = pixmap
+            self._logo_lbl.setPixmap(pixmap)
+            self._logo_lbl.update()
 
     def _on_done(self):
         self.finished.emit()
