@@ -116,6 +116,8 @@ class _Overlay(QWidget):
 class MirrorWidget(QFrame):
     """Embedded mirror panel for one Android device."""
 
+    # _px() applies the win32 scaling factor (0.85) so the mirror dimensions
+    # are proportionally smaller on Windows — matching the rest of the UI.
     MIN_W, MIN_H = _px(240), _px(426)
 
     detached = pyqtSignal()

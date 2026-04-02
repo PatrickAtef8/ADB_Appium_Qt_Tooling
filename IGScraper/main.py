@@ -141,18 +141,22 @@ class SplashWindow(QWidget):
             print(f"⚠️ Splash image could not be loaded: {image_path}")
 
         # Store for possible deferred reload on Windows.
-        # _logo_loaded_ok is True only when we KNOW the pixmap rendered correctly
-        # (loaded via QImageReader and non-null with real dimensions).
-        # On Windows, the pre-show QIcon fallback can produce a non-null but
-        # visually blank pixmap, so we must NOT rely solely on isNull() to decide
-        # whether to retry after the window is shown.
+        # _logo_loaded_ok is True only when we KNOW the pixmap rendered correctly.
+        # On Windows, even a successful QImageReader pre-show load can return a
+        # non-null but visually blank/transparent pixmap because the platform
+        # plugin (windows backend) is not yet fully initialised before the first
+        # native window is shown.  We therefore NEVER mark pre-show loads as ok
+        # on Windows — the deferred _ensure_logo_loaded() call (50 ms post-show)
+        # will always run on Windows and perform the reliable reload.
         self._logo_lbl       = logo_lbl
         self._image_path     = image_path
         self._pixmap         = pixmap
-        # PNG loaded via QImageReader before show() is reliable — mark as ok.
-        # QIcon fallback (ICO / edge-case PNG) is NOT reliable on Windows pre-show.
+        # On Windows: force post-show reload regardless of pre-show result.
+        # On Linux: pre-show QImageReader is reliable — skip the extra reload.
+        import sys as _sys_inner
         self._logo_loaded_ok = (
-            not pixmap.isNull()
+            _sys_inner.platform != "win32"   # on Linux, trust the pre-show load
+            and not pixmap.isNull()
             and image_path.lower().endswith(".png")
             and pixmap.width() > 1
         )

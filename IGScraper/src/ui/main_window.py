@@ -133,7 +133,7 @@ class MirrorResizeGrip(QWidget):
     def mouseMoveEvent(self, e):
         if self._dragging:
             delta    = int(self._drag_start_x - e.globalPosition().x())
-            new_w    = max(260, min(900, self._panel_w_at_drag + delta))
+            new_w    = max(_px(260), min(_px(900), self._panel_w_at_drag + delta))
             self.width_changed.emit(new_w)
             e.accept()
 
@@ -1206,7 +1206,7 @@ class MainWindow(FluentWindow):
     # ── Persistent mirror panel ───────────────────────────────────────────
     def _init_persistent_mirror(self):
         # Restore saved width (default 500, clamp to valid range)
-        self._mirror_width: int = max(260, min(900, int(self.cfg.get("mirror_width", 500))))
+        self._mirror_width: int = max(_px(260), min(_px(900), int(self.cfg.get("mirror_width", _px(500)))))
 
         # ── Outer container: grip + panel side by side ────────────────────
         self._mirror_container = QWidget(self)
@@ -1275,7 +1275,7 @@ class MainWindow(FluentWindow):
         self._reposition_mirror()
 
     def _step_mirror_width(self, delta: int):
-        self._mirror_width = max(260, min(900, self._mirror_width + delta))
+        self._mirror_width = max(_px(260), min(_px(900), self._mirror_width + delta))
         self._reposition_mirror()
 
     def _reposition_mirror(self):

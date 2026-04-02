@@ -1,11 +1,31 @@
 """
 Config manager — load/save settings.json with deep merge.
+
+Path resolution (priority order):
+  1. Frozen EXE on Windows → %APPDATA%\Cansa\settings.json
+     (_MEIPASS is a temp dir that is deleted between runs, so we must NOT write there)
+  2. Frozen EXE on Linux   → ~/.config/Cansa/settings.json
+  3. Normal Python run     → <project_root>/config/settings.json  (original behaviour)
 """
 import json
 import os
+import sys
 import copy
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../../config/settings.json")
+
+def _get_config_path() -> str:
+    if getattr(sys, "_MEIPASS", None):
+        # Running as a frozen PyInstaller EXE — use a persistent user directory.
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA", os.path.expanduser("~"))
+        else:
+            base = os.path.join(os.path.expanduser("~"), ".config")
+        return os.path.join(base, "Cansa", "settings.json")
+    # Normal source run — original relative path.
+    return os.path.join(os.path.dirname(__file__), "../../config/settings.json")
+
+
+CONFIG_PATH = _get_config_path()
 
 DEFAULT_CONFIG = {
     "sheet_id": "",
