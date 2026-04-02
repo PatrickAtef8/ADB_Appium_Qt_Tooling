@@ -7,8 +7,18 @@
 # • cansa_icon.png bundled in root (for splash + title-bar icon)
 # • All original hiddenimports + new ones (PyQt6 + qfluentwidgets)
 # • Icon set on the final EXE
-# • Qt imageformats plugins explicitly bundled so QPixmap can load PNG/JPG
-#   inside the frozen EXE on Windows (without these DLLs PNG returns null)
+#
+# FIX (Windows splash PNG blank):
+#   The previous version tried to manually copy the Qt imageformats plugin
+#   DLLs (qpng.dll, qjpeg.dll …) into _MEIPASS\PyQt6\Qt6\plugins\imageformats\.
+#   PyInstaller's own PyQt6 hook already does this correctly, so the manual
+#   copy was redundant and occasionally placed the DLLs in the wrong slot,
+#   causing Qt's plugin resolver to silently skip them.
+#
+#   The correct fix is a runtime hook (rthook_qt_plugins.py) that sets
+#   QT_PLUGIN_PATH to _MEIPASS\PyQt6\Qt6\plugins\ before Qt is initialised.
+#   Qt then finds every plugin — imageformats, platforms, styles — regardless
+#   of the process working directory or qt.conf resolution order.
 #
 # HOW TO BUILD:
 # cd IGScraper
@@ -16,43 +26,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
-import PyQt6
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_all, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
-
-# ── Qt imageformats plugins ───────────────────────────────────────────────────
-# PyInstaller does NOT automatically bundle Qt's image-format plugin DLLs
-# (qjpeg.dll, qpng.dll, etc.).  Without them, QImageReader / QPixmap silently
-# returns a null image for PNG/JPG files inside the frozen EXE on Windows —
-# the file is bundled but cannot be decoded.  ICO works without a plugin
-# because Qt has a built-in ICO reader, which is why the app-icon showed but
-# the splash PNG did not.
-#
-# We probe multiple candidate paths because PyQt6's internal layout differs
-# between pip versions (Qt6/ vs Qt/ vs directly under the package root).
-_qt_pkg_dir = os.path.dirname(PyQt6.__file__)
-_imageformats_src = None
-for _candidate in [
-    os.path.join(_qt_pkg_dir, "Qt6", "plugins", "imageformats"),
-    os.path.join(_qt_pkg_dir, "Qt",  "plugins", "imageformats"),
-    os.path.join(_qt_pkg_dir, "plugins", "imageformats"),
-]:
-    if os.path.isdir(_candidate):
-        _imageformats_src = _candidate
-        break
-
-if _imageformats_src is None:
-    import warnings
-    warnings.warn(
-        "⚠️  Could not locate PyQt6 imageformats plugin folder — "
-        "PNG/JPG splash image may not display in the frozen EXE on Windows. "
-        f"Searched under: {_qt_pkg_dir}"
-    )
-
-# Destination inside _MEIPASS must match Qt's expected plugin search path.
-_imageformats_dst = os.path.join("PyQt6", "Qt6", "plugins", "imageformats")
 
 # Collect ALL PyAV files: Python modules + FFmpeg DLLs + data files
 # Without this, av imports successfully on the build machine but crashes
@@ -64,22 +41,18 @@ np_datas, np_binaries, np_hiddenimports = collect_all("numpy")
 
 a = Analysis(
     ['main.py'],
-    pathex=[str(Path('.').resolve())],          # <- original robust path
+    pathex=[str(Path('.').resolve())],
     binaries=[*av_binaries, *np_binaries],
     datas=[
         # PNG (splash logo) -> lands in root of _MEIPASS
-        # Decoded by the imageformats plugin bundle below.
+        # Qt decodes it via the imageformats plugin (qpng.dll on Windows,
+        # libqpng.so on Linux) whose path is registered by rthook_qt_plugins.py
+        # before Qt is initialised — so QImageReader always finds it.
         ('cansa_icon.png', '.'),
 
         # ICO (app icon + emergency splash fallback) -> root of _MEIPASS
         # ICO is decoded by Qt's built-in reader — no plugin required.
         ('cansa_icon.ico', '.'),
-
-        # Qt image-format plugins: lets QImageReader load PNG/JPG in frozen EXE.
-        # _imageformats_src is None when the folder wasn't found (warning
-        # already emitted above); skip the entry in that case to avoid a
-        # PyInstaller error on the tuple.
-        *([(_imageformats_src, _imageformats_dst)] if _imageformats_src else []),
 
         # Original config & assets
         ('config/settings.json', 'config'),
@@ -88,6 +61,7 @@ a = Analysis(
 
         # scrcpy server JAR for Live Mirror feature
         ('src/mirror/assets/scrcpy-server.jar', 'src/mirror/assets'),
+
         *av_datas,
         *np_datas,
     ],
@@ -125,7 +99,9 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    # rthook_qt_plugins.py runs before main.py and sets QT_PLUGIN_PATH so Qt
+    # finds imageformats/platforms plugins inside _MEIPASS on Windows.
+    runtime_hooks=['rthook_qt_plugins.py'],
     excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -155,5 +131,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='cansa_icon.ico',               # <- sets the .exe icon
+    icon='cansa_icon.ico',            # <- sets the .exe icon
 )

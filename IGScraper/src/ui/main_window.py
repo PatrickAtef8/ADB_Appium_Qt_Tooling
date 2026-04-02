@@ -509,8 +509,11 @@ class DashboardPage(QWidget):
 
         left_inner = QWidget()
         left_lay   = QVBoxLayout(left_inner)
-        left_lay.setContentsMargins(40, 40, 30, 40)
-        left_lay.setSpacing(24)
+        _m = 24 if _sys.platform == "win32" else 40   # outer horizontal margin
+        _cs = 16 if _sys.platform == "win32" else 24  # card internal margin
+        _sp = 14 if _sys.platform == "win32" else 24  # spacing between cards
+        left_lay.setContentsMargins(_m, 40, _m, 40)
+        left_lay.setSpacing(_sp)
         left_scroll.setWidget(left_inner)
 
         title_lbl = TitleLabel("Dashboard", left_inner)
@@ -521,8 +524,8 @@ class DashboardPage(QWidget):
         # ── Device rows ───────────────────────────────────────────────────
         dev_card = CardWidget(left_inner)
         dev_lay  = QVBoxLayout(dev_card)
-        dev_lay.setContentsMargins(24, 24, 24, 24)
-        dev_lay.setSpacing(20)
+        dev_lay.setContentsMargins(_cs, _cs, _cs, _cs)
+        dev_lay.setSpacing(16 if _sys.platform == "win32" else 20)
 
         hdr_row = QHBoxLayout()
         h1 = StrongBodyLabel("📱 Connected Phones", dev_card)
@@ -539,11 +542,11 @@ class DashboardPage(QWidget):
 
         for i in range(3):
             row = QHBoxLayout()
-            row.setSpacing(16)
+            row.setSpacing(10 if _sys.platform == "win32" else 16)
 
             lbl_num = StrongBodyLabel(f"P{i+1}", dev_card)
             lbl_num.setFont(T.body())
-            lbl_num.setFixedWidth(_px(40))
+            lbl_num.setFixedWidth(28 if _sys.platform == "win32" else _px(40))
             lbl_num.setStyleSheet("background: transparent;")
 
             combo_dev = ComboBox(dev_card)
@@ -551,28 +554,28 @@ class DashboardPage(QWidget):
             combo_dev.setMinimumHeight(_px(36))
             combo_dev.setPlaceholderText("Select Device")
             combo_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            combo_dev.setMaximumWidth(300)
+            combo_dev.setMaximumWidth(220 if _sys.platform == "win32" else 300)
 
             combo_acc = ComboBox(dev_card)
             combo_acc.setFont(T.body())
             combo_acc.setMinimumHeight(_px(36))
-            combo_acc.setFixedWidth(_px(160))
+            combo_acc.setFixedWidth(120 if _sys.platform == "win32" else _px(160))
             combo_acc.setPlaceholderText("Accounts")
 
             lbl_port = CaptionLabel(f":{4723 + i}", dev_card)
             lbl_port.setFont(T.caption())
-            lbl_port.setFixedWidth(_px(60))
+            lbl_port.setFixedWidth(48 if _sys.platform == "win32" else _px(60))
             lbl_port.setStyleSheet("background: transparent;")
 
             lbl_status = CaptionLabel("● idle", dev_card)
             lbl_status.setFont(T.caption())
-            lbl_status.setFixedWidth(_px(75))
+            lbl_status.setFixedWidth(58 if _sys.platform == "win32" else _px(75))
             lbl_status.setStyleSheet("background: transparent;")
 
             btn_view = PushButton("👁 View", dev_card)
             btn_view.setFont(T.button())
             btn_view.setMinimumHeight(_px(34))
-            btn_view.setFixedWidth(_px(90))
+            btn_view.setFixedWidth(75 if _sys.platform == "win32" else _px(90))
             btn_view.setCursor(Qt.CursorShape.PointingHandCursor)
 
             row.addWidget(lbl_num)
@@ -589,15 +592,15 @@ class DashboardPage(QWidget):
         # ── Targets ───────────────────────────────────────────────────────
         tgt_card = CardWidget(left_inner)
         tgt_lay  = QVBoxLayout(tgt_card)
-        tgt_lay.setContentsMargins(24, 24, 24, 24)
-        tgt_lay.setSpacing(16)
+        tgt_lay.setContentsMargins(_cs, _cs, _cs, _cs)
+        tgt_lay.setSpacing(12 if _sys.platform == "win32" else 16)
         lbl_tgt = StrongBodyLabel("🎯 Targets per Phone", tgt_card)
         lbl_tgt.setFont(T.heading())
         lbl_tgt.setStyleSheet("background: transparent;")
         tgt_lay.addWidget(lbl_tgt)
 
         targets_grid = QHBoxLayout()
-        targets_grid.setSpacing(20)
+        targets_grid.setSpacing(12 if _sys.platform == "win32" else 20)
         for i in range(3):
             col = QVBoxLayout()
             lbl = CaptionLabel(f"Phone {i+1}", tgt_card)
@@ -616,12 +619,12 @@ class DashboardPage(QWidget):
 
         # ── Configuration & Controls ──────────────────────────────────────
         bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(24)
+        bottom_row.setSpacing(14 if _sys.platform == "win32" else 24)
 
         # Mode & Count Card
         mode_card = CardWidget(left_inner)
         mode_lay = QVBoxLayout(mode_card)
-        mode_lay.setContentsMargins(24, 24, 24, 24)
+        mode_lay.setContentsMargins(_cs, _cs, _cs, _cs)
         lbl_mode = StrongBodyLabel("⚙️ Run Settings", mode_card)
         lbl_mode.setFont(T.heading())
         lbl_mode.setStyleSheet("background: transparent;")
@@ -653,7 +656,7 @@ class DashboardPage(QWidget):
         # Schedule Card
         sched_card = CardWidget(left_inner)
         sched_lay = QVBoxLayout(sched_card)
-        sched_lay.setContentsMargins(24, 24, 24, 24)
+        sched_lay.setContentsMargins(_cs, _cs, _cs, _cs)
         sched_lay.setSpacing(10)
         self.chk_schedule = CheckBox("Working Hours", sched_card)
         self.chk_schedule.setFont(T.heading())

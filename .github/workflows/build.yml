@@ -33,10 +33,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path assets
           '{"installed":{}}' | Out-File -FilePath assets/credentials.json -Encoding utf8
 
-      - name: Install PyAV and numpy (required for H.264 frame decoding)
+      - name: Verify imageformats plugin DLLs are present before build (DEBUG)
         working-directory: IGScraper
-        run: pip install av numpy
-
+        shell: powershell
+        run: |
+          Write-Host "==== PyQt6 imageformats plugins ===="
+          $qt6 = python -c "import PyQt6, os; print(os.path.dirname(PyQt6.__file__))"
+          $pluginPath = Join-Path $qt6 "Qt6\plugins\imageformats"
+          if (Test-Path $pluginPath) {
+            Get-ChildItem $pluginPath
+          } else {
+            Write-Host "WARNING: imageformats folder not found at $pluginPath"
+          }
 
       - name: Build EXE with PyInstaller
         working-directory: IGScraper
