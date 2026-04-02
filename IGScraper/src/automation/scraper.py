@@ -17,7 +17,7 @@ from selenium.common.exceptions import (
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from .appium_controller import AppiumController
+from .appium_controller import AppiumController, _run_hidden
 from src.utils.filters import extract_email, extract_phone, infer_country_code, should_skip
 from src.utils.blacklist import add_to_blacklist
 
@@ -96,7 +96,6 @@ class InstagramScraper:
 
     def navigate_to_profile(self, username: str) -> bool:
         """Navigate directly to a profile using Instagram deep link."""
-        import subprocess
         driver = self.ctrl.driver
         self._log(f"Navigating to profile: @{username}")
 
@@ -109,7 +108,7 @@ class InstagramScraper:
                 "-d", f"https://www.instagram.com/{username}/",
                 "com.instagram.android"
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = _run_hidden(cmd, capture_output=True, text=True, timeout=10)
             if "Error" not in result.stderr and "error" not in result.stdout.lower():
                 self._log(f"✅ Opened profile via deep link: @{username}")
                 time.sleep(4)
@@ -642,8 +641,6 @@ class InstagramScraper:
         50th switch, so Phase B always finds the chevron on the very first
         Profile-tab tap.
         """
-        import subprocess
-
         driver = self.ctrl.driver
         serial = self.ctrl._device_serial or ""
 
@@ -675,7 +672,7 @@ class InstagramScraper:
             # Appium session is still connected because am-start does not
             # conflict with UiAutomator2 — it only modifies the activity
             # manager task stack.
-            subprocess.run(
+            _run_hidden(
                 [
                     "adb", "-s", serial, "shell", "am", "start",
                     "--activity-clear-top",
@@ -731,8 +728,10 @@ class InstagramScraper:
         scroll_delay_max  = delays.get("between_scrolls_max",   3.0)
         profile_delay_min = delays.get("between_profiles_min",  2.0)
         profile_delay_max = delays.get("between_profiles_max",  4.0)
-        break_every       = int(delays.get("session_break_every",    100))
-        break_duration    = int(delays.get("session_break_duration",  30))
+        # Session break is intentionally disabled: the account-switch pause
+        # already provides sufficient rest between bursts, and the old
+        # break_every / break_duration values reused the switch_every counter
+        # which caused a 30 s sleep after every single collected profile.
 
         if not self.navigate_to_profile(target_username):
             self._log(f"❌ Failed to navigate to @{target_username}")
@@ -825,18 +824,6 @@ class InstagramScraper:
                 if self.on_switch_check:
                     self.on_switch_check(collected)
                 # ─────────────────────────────────────────────────────────
-
-                # Session break (pause only — no switch logic here).
-                # Skip if a switch was just triggered on this same tick:
-                # the switch already pauses for several seconds internally,
-                # and _need_reopen_list being True means we are about to
-                # re-navigate — adding another break here is redundant and
-                # would delay the re-navigation unnecessarily.
-                if (break_every > 0
-                        and collected % break_every == 0
-                        and not self._need_reopen_list):
-                    self._log(f"⏸️ Session break for {break_duration}s...")
-                    time.sleep(break_duration)
 
             # Scroll to reveal more rows (outer loop continues)
             if not self._need_reopen_list:

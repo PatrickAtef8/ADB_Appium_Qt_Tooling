@@ -29,6 +29,25 @@ def _run_hidden(*args, **kwargs):
     if kwargs.get("text") or kwargs.get("capture_output"):
         kwargs.setdefault("encoding", "utf-8")
         kwargs.setdefault("errors", "replace")
+    # ── FIX: on Windows, subprocess children spawned with CREATE_NO_WINDOW
+    # may not inherit user-level environment variables (including ANDROID_HOME
+    # and ANDROID_SDK_ROOT).  Explicitly forward them so Appium/ADB never
+    # complain that the SDK root is missing, even when the user has set the
+    # variables correctly in System Properties.
+    if os.name == "nt" and "env" not in kwargs:
+        env = os.environ.copy()
+        android_sdk = (
+            env.get("ANDROID_HOME")
+            or env.get("ANDROID_SDK_ROOT")
+            or r"C:\Users\Jucian\AppData\Local\Android\Sdk"  # last-resort fallback
+        )
+        env["ANDROID_HOME"] = android_sdk
+        env["ANDROID_SDK_ROOT"] = android_sdk
+        # Ensure platform-tools (adb) is reachable from child processes
+        platform_tools = os.path.join(android_sdk, "platform-tools")
+        if platform_tools.lower() not in env.get("PATH", "").lower():
+            env["PATH"] = platform_tools + os.pathsep + env.get("PATH", "")
+        kwargs["env"] = env
     return subprocess.run(*args, **kwargs)
 
 

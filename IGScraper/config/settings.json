@@ -23,7 +23,6 @@
     "rest_min_minutes": 30,
     "rest_max_minutes": 60,
     "session_break_every": 1,
-    "session_break_duration": 30,
     "switch_mode": "profiles",
     "switch_hours": 1
   },
@@ -64,5 +63,5 @@
     ],
     []
   ],
-  "mirror_width": 672
+  "mirror_width": 681
 }

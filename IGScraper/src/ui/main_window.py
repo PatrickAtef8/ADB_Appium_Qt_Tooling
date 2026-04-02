@@ -1613,7 +1613,6 @@ class MainWindow(FluentWindow):
             "rest_min_minutes":       sp.sp_rest_min.value(),
             "rest_max_minutes":       sp.sp_rest_max.value(),
             "session_break_every":    sp.sp_switch_every.value(),
-            "session_break_duration": 30,
             "switch_mode":            "hours" if sp.rb_switch_hours.isChecked() else "profiles",
             "switch_hours":           sp.sp_switch_hours.value(),
         }
