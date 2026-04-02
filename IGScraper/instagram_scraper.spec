@@ -24,14 +24,33 @@ block_cipher = None
 
 # ── Qt imageformats plugins ───────────────────────────────────────────────────
 # PyInstaller does NOT automatically bundle Qt's image-format plugin DLLs
-# (qjpeg.dll, qpng.dll, etc.).  Without them, QPixmap silently returns a
-# null pixmap for PNG/JPG files inside the frozen EXE on Windows — the image
-# is bundled but simply cannot be decoded.  ICO works without a plugin because
-# Qt has built-in ICO support, which is why the app icon showed but the splash
-# PNG did not.  We resolve this by explicitly copying the entire imageformats
-# folder from the PyQt6 installation into the bundle.
-_qt_root = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6")
-_imageformats_src = os.path.join(_qt_root, "plugins", "imageformats")
+# (qjpeg.dll, qpng.dll, etc.).  Without them, QImageReader / QPixmap silently
+# returns a null image for PNG/JPG files inside the frozen EXE on Windows —
+# the file is bundled but cannot be decoded.  ICO works without a plugin
+# because Qt has a built-in ICO reader, which is why the app-icon showed but
+# the splash PNG did not.
+#
+# We probe multiple candidate paths because PyQt6's internal layout differs
+# between pip versions (Qt6/ vs Qt/ vs directly under the package root).
+_qt_pkg_dir = os.path.dirname(PyQt6.__file__)
+_imageformats_src = None
+for _candidate in [
+    os.path.join(_qt_pkg_dir, "Qt6", "plugins", "imageformats"),
+    os.path.join(_qt_pkg_dir, "Qt",  "plugins", "imageformats"),
+    os.path.join(_qt_pkg_dir, "plugins", "imageformats"),
+]:
+    if os.path.isdir(_candidate):
+        _imageformats_src = _candidate
+        break
+
+if _imageformats_src is None:
+    import warnings
+    warnings.warn(
+        "⚠️  Could not locate PyQt6 imageformats plugin folder — "
+        "PNG/JPG splash image may not display in the frozen EXE on Windows. "
+        f"Searched under: {_qt_pkg_dir}"
+    )
+
 # Destination inside _MEIPASS must match Qt's expected plugin search path.
 _imageformats_dst = os.path.join("PyQt6", "Qt6", "plugins", "imageformats")
 
@@ -49,11 +68,18 @@ a = Analysis(
     binaries=[*av_binaries, *np_binaries],
     datas=[
         # PNG (splash logo) -> lands in root of _MEIPASS
-        # Requires imageformats plugins below to actually decode on Windows.
+        # Decoded by the imageformats plugin bundle below.
         ('cansa_icon.png', '.'),
 
-        # Qt image-format plugins: lets QPixmap load PNG/JPG in frozen EXE
-        (_imageformats_src, _imageformats_dst),
+        # ICO (app icon + emergency splash fallback) -> root of _MEIPASS
+        # ICO is decoded by Qt's built-in reader — no plugin required.
+        ('cansa_icon.ico', '.'),
+
+        # Qt image-format plugins: lets QImageReader load PNG/JPG in frozen EXE.
+        # _imageformats_src is None when the folder wasn't found (warning
+        # already emitted above); skip the entry in that case to avoid a
+        # PyInstaller error on the tuple.
+        *([(_imageformats_src, _imageformats_dst)] if _imageformats_src else []),
 
         # Original config & assets
         ('config/settings.json', 'config'),

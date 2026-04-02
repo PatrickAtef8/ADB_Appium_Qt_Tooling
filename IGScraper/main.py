@@ -38,7 +38,7 @@ def _thread_excepthook(args):
 threading.excepthook = _thread_excepthook
 
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
-from PyQt6.QtGui import QIcon, QPixmap, QScreen
+from PyQt6.QtGui import QIcon, QPixmap, QScreen, QImageReader
 from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal, QRect
 
 # ── Windows DPI: prevent Qt from scaling up beyond 100% on 96-dpi screens ────
@@ -90,15 +90,35 @@ class SplashWindow(QWidget):
         logo_lbl = QLabel(self)
         logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Load via QIcon first — it selects the largest available frame from
-        # an ICO file (e.g. 256×256) rather than the smallest one that a raw
-        # QPixmap() call picks.  Then ask for a 256×256 pixmap from it.
-        # For PNG the pixmap() call simply returns the full image at that size.
-        icon = QIcon(image_path)
-        if not icon.isNull():
-            pixmap = icon.pixmap(256, 256)
-        else:
-            pixmap = QPixmap()
+        # ── Cross-platform image loading ──────────────────────────────────
+        # On Windows, QIcon(path).pixmap() can silently return a null pixmap
+        # before a native window is shown (the Windows platform plugin is not
+        # yet fully initialised at widget-construction time).
+        #
+        # QImageReader is the correct fix: it talks directly to the format
+        # plugin (qpng.dll / libqpng.so) and does NOT need a screen or window
+        # handle.  ICO files are decoded by Qt's built-in reader (no plugin
+        # required), so the QIcon fallback handles them fine.
+        #
+        # Load order:
+        #   1. QImageReader  — reliable on both platforms for PNG.
+        #   2. QIcon fallback — catches ICO and any edge-case PNG miss.
+        pixmap = QPixmap()
+
+        if image_path.lower().endswith(".png"):
+            reader = QImageReader(image_path)
+            reader.setAutoTransform(True)
+            img = reader.read()
+            if not img.isNull():
+                pixmap = QPixmap.fromImage(img)
+            else:
+                print(f"⚠️ QImageReader error ({image_path}): {reader.errorString()} — trying QIcon fallback")
+
+        if pixmap.isNull():
+            # Fallback: works for ICO (built-in) and sometimes PNG on Linux
+            icon = QIcon(image_path)
+            if not icon.isNull():
+                pixmap = icon.pixmap(256, 256)
 
         if not pixmap.isNull():
             src_w, src_h = pixmap.width(), pixmap.height()
@@ -108,6 +128,8 @@ class SplashWindow(QWidget):
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
+        else:
+            print(f"⚠️ Splash image could not be loaded: {image_path}")
 
         logo_lbl.setPixmap(pixmap)
         logo_lbl.setStyleSheet("background: transparent;")

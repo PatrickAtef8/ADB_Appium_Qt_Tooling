@@ -9,7 +9,7 @@ from datetime import datetime, time as dtime
 from typing import Dict, List, Optional, Tuple
 
 from PyQt6.QtCore    import Qt, QThread, QTime, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui     import QFont, QColor, QIcon
+from PyQt6.QtGui     import QFont, QColor, QIcon, QPixmap, QImageReader
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
     QLabel, QMessageBox, QSizePolicy, QTableWidgetItem,
@@ -1064,25 +1064,54 @@ class MainWindow(FluentWindow):
         # app.windowIcon() which can be null in a frozen Windows EXE at the
         # point MainWindow.__init__ runs (the icon assignment in main() happens
         # before MainWindow is constructed, but QFluentWindow may reset it).
+        #
+        # We use QImageReader for PNG (same cross-platform fix as the splash
+        # screen — QIcon.pixmap() can silently return null on Windows before a
+        # native window handle exists). ICO is handled by QIcon's built-in
+        # decoder which does not need a window handle.
         import sys as _sys
         _base = getattr(_sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        # Walk up one level if we're inside src/ui/
-        for _candidate in [
-            os.path.join(_base, "cansa_icon.ico"),
-            os.path.join(_base, "..", "..", "cansa_icon.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "cansa_icon.ico"),
-        ]:
-            _candidate = os.path.normpath(_candidate)
-            if os.path.exists(_candidate):
-                icon = QIcon(_candidate)
-                break
-        else:
-            icon = QApplication.instance().windowIcon()
 
-        if not icon.isNull():
+        # Probe PNG first (preferred, crisp), then ICO as fallback.
+        # Candidates walk from _MEIPASS root -> two levels up (dev layout).
+        _titlebar_pixmap = QPixmap()
+        for _ext, _fname in [(".png", "cansa_icon.png"), (".ico", "cansa_icon.ico")]:
+            for _rel in [
+                os.path.join(_base, _fname),
+                os.path.join(_base, "..", "..", _fname),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", _fname),
+            ]:
+                _path = os.path.normpath(_rel)
+                if not os.path.exists(_path):
+                    continue
+                if _ext == ".png":
+                    _reader = QImageReader(_path)
+                    _reader.setAutoTransform(True)
+                    _img = _reader.read()
+                    if not _img.isNull():
+                        _titlebar_pixmap = QPixmap.fromImage(_img).scaled(
+                            32, 32,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                        break
+                else:  # ICO — built-in decoder, QIcon is fine
+                    _icon_tmp = QIcon(_path)
+                    if not _icon_tmp.isNull():
+                        _titlebar_pixmap = _icon_tmp.pixmap(32, 32)
+                        break
+            if not _titlebar_pixmap.isNull():
+                break
+
+        if _titlebar_pixmap.isNull():
+            # Last resort: use whatever the app-level window icon is
+            _app_icon = QApplication.instance().windowIcon()
+            if not _app_icon.isNull():
+                _titlebar_pixmap = _app_icon.pixmap(32, 32)
+
+        if not _titlebar_pixmap.isNull():
             logo_label = QLabel(self.titleBar)
-            pixmap = icon.pixmap(32, 32)
-            logo_label.setPixmap(pixmap)
+            logo_label.setPixmap(_titlebar_pixmap)
             logo_label.setFixedSize(40, 40)
             logo_label.setContentsMargins(10, 0, 0, 0)
             logo_label.setStyleSheet("background: transparent;")
@@ -2001,7 +2030,10 @@ class MainWindow(FluentWindow):
 if __name__ == "__main__":
     import sys
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("assets/Cansa.png"))
+    # Use the correct ICO path relative to the project root (two levels up from src/ui/)
+    _ico = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "cansa_icon.ico"))
+    if os.path.exists(_ico):
+        app.setWindowIcon(QIcon(_ico))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
