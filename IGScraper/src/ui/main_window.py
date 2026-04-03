@@ -206,6 +206,70 @@ class AccountSwitchWorker(QThread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SheetsAuthWorker  – runs OAuth + connect_sheet off the main thread
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SheetsAuthWorker(QThread):
+    """Runs Google Sheets OAuth (may open a browser) on a background thread."""
+    success  = pyqtSignal(object)   # emits the authenticated SheetsClient
+    failure  = pyqtSignal(str)      # emits error message
+
+    def __init__(self, credentials_path: str, sheet_id: str, tab_name: str,
+                 existing_client=None, reuse: bool = False):
+        super().__init__()
+        self._credentials_path = credentials_path
+        self._sheet_id         = sheet_id
+        self._tab_name         = tab_name
+        self._existing_client  = existing_client
+        self._reuse            = reuse
+
+    def run(self):
+        try:
+            from src.sheets.google_sheets import SheetsClient
+            if self._reuse and self._existing_client:
+                self._existing_client.connect_sheet()
+                self.success.emit(self._existing_client)
+            else:
+                client = SheetsClient(
+                    credentials_path=self._credentials_path,
+                    sheet_id=self._sheet_id,
+                    tab_name=self._tab_name,
+                )
+                client.authenticate()
+                client.connect_sheet()
+                self.success.emit(client)
+        except Exception as e:
+            self.failure.emit(str(e)[:300] if str(e) else "Authentication denied or connection refused.")
+
+
+class SheetsTestWorker(QThread):
+    """Runs Google Sheets test-connection off the main thread (Settings page)."""
+    success  = pyqtSignal(object, int)  # (SheetsClient, row_count)
+    failure  = pyqtSignal(str)
+
+    def __init__(self, credentials_path: str, sheet_id: str, tab_name: str):
+        super().__init__()
+        self._credentials_path = credentials_path
+        self._sheet_id         = sheet_id
+        self._tab_name         = tab_name
+
+    def run(self):
+        try:
+            from src.sheets.google_sheets import SheetsClient
+            client = SheetsClient(
+                credentials_path=self._credentials_path,
+                sheet_id=self._sheet_id,
+                tab_name=self._tab_name,
+            )
+            client.authenticate()
+            client.connect_sheet()
+            rows = client.get_row_count()
+            self.success.emit(client, rows)
+        except Exception as e:
+            self.failure.emit(str(e)[:300] if str(e) else "Authentication denied or connection refused.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PhoneWorker
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -318,6 +382,17 @@ class PhoneWorker(QThread):
                   5. Appium session is reattached for continued scraping.
                 """
                 nonlocal since_last_switch, last_switch_time, acc_idx, current_account
+
+                # ── Working-hours end-time enforcement ───────────────────────
+                # This check runs after every collected profile so scraping
+                # stops as soon as the end time is reached, not just between targets.
+                if schedule.get("enabled") and self._is_past_schedule_end(schedule):
+                    end = dtime(schedule["end_hour"], schedule["end_minute"])
+                    self._log(f"⏰ Working hours ended ({end:%H:%M}). Stopping scraping…")
+                    self._stop_flag = True
+                    if self._scraper:
+                        self._scraper.stop()
+                    return
 
                 if len(device_accounts) <= 1 or self._stop_flag:
                     since_last_switch += 1
@@ -451,6 +526,11 @@ class PhoneWorker(QThread):
                 return
             self._log(f"⏰ Outside hours ({start:%H:%M}–{end:%H:%M}). Waiting…")
             self._sleep(60)
+
+    def _is_past_schedule_end(self, schedule: dict) -> bool:
+        """Return True if the current time is past the schedule end time."""
+        end = dtime(schedule["end_hour"], schedule["end_minute"])
+        return datetime.now().time() > end
 
     def _sleep(self, seconds: int):
         for _ in range(seconds):
@@ -625,32 +705,39 @@ class DashboardPage(QWidget):
         mode_card = CardWidget(left_inner)
         mode_lay = QVBoxLayout(mode_card)
         mode_lay.setContentsMargins(_cs, _cs, _cs, _cs)
+        mode_lay.setSpacing(0)
         lbl_mode = StrongBodyLabel("⚙️ Run Settings", mode_card)
         lbl_mode.setFont(T.heading())
         lbl_mode.setStyleSheet("background: transparent;")
         mode_lay.addWidget(lbl_mode)
+        mode_lay.addSpacing(16)
 
         mode_form = QHBoxLayout()
+        mode_form.setSpacing(0)
         lbl_m = CaptionLabel("Mode:", mode_card)
         lbl_m.setFont(T.body())
         lbl_m.setStyleSheet("background: transparent;")
         mode_form.addWidget(lbl_m)
+        mode_form.addSpacing(6)
         self.combo_mode = ComboBox(mode_card)
         self.combo_mode.setFont(T.body())
         self.combo_mode.setMinimumHeight(_px(34))
         self.combo_mode.addItems(["followers", "following"])
         mode_form.addWidget(self.combo_mode)
-        mode_form.addSpacing(15)
+        mode_form.addSpacing(40)
         lbl_mx = CaptionLabel("Max:", mode_card)
         lbl_mx.setFont(T.body())
         lbl_mx.setStyleSheet("background: transparent;")
         mode_form.addWidget(lbl_mx)
+        mode_form.addSpacing(6)
         self.spin_count = SpinBox(mode_card)
         self.spin_count.setFont(T.body())
         self.spin_count.setMinimumHeight(_px(34))
         self.spin_count.setRange(1, 50000); self.spin_count.setValue(100)
         mode_form.addWidget(self.spin_count)
+        mode_form.addStretch(1)
         mode_lay.addLayout(mode_form)
+        mode_lay.addStretch(1)
         bottom_row.addWidget(mode_card, 1)
 
         # Schedule Card
@@ -675,7 +762,7 @@ class DashboardPage(QWidget):
         self._lbl_sched_start.setStyleSheet("background: transparent;")
         self.time_start = TimeEdit(sched_card)
         self.time_start.setFont(T.body())
-        self.time_start.setFixedHeight(_px(34))
+        self.time_start.setMinimumHeight(_px(34))
         self.time_start.setDisplayFormat("hh:mm AP")
         self.time_start.setToolTip("Scraping START time (e.g. 09:00 AM)")
         self._lbl_sched_arrow = CaptionLabel("to", sched_card)
@@ -684,7 +771,7 @@ class DashboardPage(QWidget):
         self._lbl_sched_end.setStyleSheet("background: transparent;")
         self.time_end = TimeEdit(sched_card)
         self.time_end.setFont(T.body())
-        self.time_end.setFixedHeight(_px(34))
+        self.time_end.setMinimumHeight(_px(34))
         self.time_end.setDisplayFormat("hh:mm AP")
         self.time_end.setToolTip("Scraping END time (e.g. 06:00 PM)")
         time_row.addWidget(self._lbl_sched_start)
@@ -705,6 +792,7 @@ class DashboardPage(QWidget):
         self.btn_start.setFont(T.button())
         self.btn_start.setMinimumHeight(_px(48))
         self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_start.setEnabled(False)   # locked until device assigned + accounts detected
 
         self.btn_stop = PushButton(FIF.CLOSE, "STOP ALL", left_inner)
         self.btn_stop.setFont(T.button())
@@ -768,15 +856,27 @@ class FiltersPage(PageWidget):
         self.spin_min_posts = SpinBox(skip_card)
         self.spin_min_posts.setRange(0, 10000)
         self.spin_min_posts.setFont(T.body()); self.spin_min_posts.setMinimumHeight(_px(34)); self.spin_min_posts.setFixedWidth(_px(150))
-        self.spin_recent_days = SpinBox(skip_card)
-        self.spin_recent_days.setRange(0, 3650)
-        self.spin_recent_days.setValue(365)
-        self.spin_recent_days.setFont(T.body()); self.spin_recent_days.setMinimumHeight(_px(34)); self.spin_recent_days.setFixedWidth(_px(150))
         lbl_mp = CaptionLabel("Min posts:", skip_card); lbl_mp.setFont(T.body()); lbl_mp.setStyleSheet("background: transparent;")
-        lbl_rd = CaptionLabel("Post within (days):", skip_card); lbl_rd.setFont(T.body()); lbl_rd.setStyleSheet("background: transparent;")
         row_p.addWidget(lbl_mp); row_p.addWidget(self.spin_min_posts)
-        row_p.addSpacing(30)
-        row_p.addWidget(lbl_rd); row_p.addWidget(self.spin_recent_days)
+        row_p.addSpacing(40)
+
+        self.chk_enable_post_spin = CheckBox("Enable post-spin (check latest post date)", skip_card)
+        self.chk_enable_post_spin.setFont(T.body()); self.chk_enable_post_spin.setStyleSheet("background: transparent;")
+        
+        self.spin_skip_months = SpinBox(skip_card)
+        self.spin_skip_months.setRange(1, 120)
+        self.spin_skip_months.setFont(T.body()); self.spin_skip_months.setMinimumHeight(_px(34)); self.spin_skip_months.setFixedWidth(_px(150))
+        self.spin_skip_months.setEnabled(False)
+        
+        lbl_sm = CaptionLabel("Months threshold:", skip_card); lbl_sm.setFont(T.body()); lbl_sm.setStyleSheet("background: transparent;")
+        
+        self.chk_enable_post_spin.stateChanged.connect(lambda s: self.spin_skip_months.setEnabled(s == 2))
+        
+        row_p.addWidget(self.chk_enable_post_spin)
+        row_p.addSpacing(20)
+        row_p.addWidget(lbl_sm)
+        row_p.addWidget(self.spin_skip_months)
+
         row_p.addStretch()
         skip_lay.addLayout(row_p)
         self.add(skip_card)
@@ -1040,7 +1140,7 @@ class SettingsPage(PageWidget):
                 wmin.setDecimals(1); wmin.setSingleStep(0.5)
                 wmax.setDecimals(1); wmax.setSingleStep(0.5)
             for w in (wmin, wmax):
-                w.setFont(T.body()); w.setFixedHeight(_px(34)); w.setFixedWidth(_px(140))
+                w.setFont(T.body()); w.setMinimumHeight(_px(34)); w.setFixedWidth(_px(140))
                 w.setKeyboardTracking(True)
             lbl_min = CaptionLabel("MIN", dl_card); lbl_min.setFont(T.caption())
             lbl_min.setStyleSheet("background: transparent;"); r.addWidget(lbl_min); r.addWidget(wmin)
@@ -1053,7 +1153,6 @@ class SettingsPage(PageWidget):
 
         add_delay("Between profiles (s):", "sp_prof_min", "sp_prof_max", 1.0, 30.0)
         add_delay("Between scrolls (s):",  "sp_scrl_min", "sp_scrl_max", 0.5, 15.0)
-        add_delay("Profiles per run:",      "sp_run_min",  "sp_run_max",  1, 500, True)
         add_delay("Rest between runs (m):", "sp_rest_min", "sp_rest_max", 1, 1440, True)
 
         # ── Account switch mode ───────────────────────────────────────────
@@ -1484,7 +1583,7 @@ class MainWindow(FluentWindow):
 
     # ── Content scale (live font/size walk) ───────────────────────────────
     def _apply_content_scale(self):
-        """Walk every child widget of the 4 pages and rescale fonts + heights."""
+        """Walk every child widget of the 4 pages and rescale fonts + heights symmetrically."""
         s = self._content_scale
         pages = [self.dashboard_page, self.filters_page,
                  self.results_page,   self.settings_page]
@@ -1499,25 +1598,137 @@ class MainWindow(FluentWindow):
             "mono":    _pts(9),
         }
 
-        def scaled(pt):
+        def scaled_pt(pt):
             return max(6, round(pt * s))
 
+        # ── Type helpers ──────────────────────────────────────────────────
+        # qfluentwidgets.ComboBox  → inherits QPushButton, NOT QComboBox
+        # qfluentwidgets.ScrollArea → inherits QScrollArea (must be excluded
+        #   from the "text area" branch — only QTextEdit / QAbstractItemView
+        #   should be treated as scalable scroll areas)
+        # qfluentwidgets.TimeEdit  → sets maximumHeight=33 internally in its
+        #   constructor, so we must unlock it with a large value before scaling
+        from PyQt6.QtWidgets import (
+            QAbstractSpinBox    as _ASB,
+            QAbstractButton     as _ABT,
+            QAbstractItemView   as _AIV,   # TableWidget base
+            QTextEdit           as _QTE,   # TextEdit base
+            QScrollArea         as _QSA,   # container ScrollAreas — EXCLUDED
+            QLineEdit           as _LE,
+            QProgressBar        as _PB,
+            QCheckBox           as _ChB,
+            QRadioButton        as _RB,
+        )
+        from qfluentwidgets import ComboBox as _FCombo, CaptionLabel as _CaptLbl, CheckBox as _FChB
+
+        def _is_combo(w):
+            return isinstance(w, _FCombo)
+
+        def _is_spinbox(w):
+            # SpinBox / DoubleSpinBox / TimeEdit all inherit QAbstractSpinBox
+            return isinstance(w, _ASB)
+
+        def _is_text_area(w):
+            # Only real content areas: TextEdit and TableWidget.
+            # Excludes QScrollArea (layout containers like left_scroll on Dashboard).
+            return isinstance(w, (_QTE, _AIV)) and not isinstance(w, _QSA)
+
+        def _is_real_button(w):
+            return (isinstance(w, _ABT)
+                    and not isinstance(w, (_ChB, _RB))
+                    and not _is_combo(w))
+
+        def _is_lineedit(w):
+            return isinstance(w, _LE)
+
+        def _is_progressbar(w):
+            return isinstance(w, _PB)
+
+        def _is_caption_label(w):
+            return isinstance(w, _CaptLbl)
+
+        def _is_fluent_checkbox(w):
+            return isinstance(w, _FChB)
+
+        # ── First pass: tag every widget with its true base height ────────
+        # Stored once — never recalculated — so heights never drift.
         for page in pages:
             for w in page.findChildren(QWidget):
+                if getattr(w, "_scale_base_h", None) is not None:
+                    continue   # already tagged
+
+                if _is_combo(w) or _is_lineedit(w):
+                    w._scale_base_h = _px(34)
+
+                elif _is_spinbox(w):
+                    w._scale_base_h = _px(34)
+
+                elif _is_real_button(w):
+                    w._scale_base_h = _px(48) if w.minimumHeight() >= _px(44) else _px(36)
+
+                elif _is_progressbar(w):
+                    w._scale_base_h = _px(14)
+
+                elif _is_text_area(w):
+                    mh = w.minimumHeight()
+                    if mh > 0:
+                        w._scale_base_h = mh   # TextEdit 140/250 px, TableWidget 400 px
+
+                elif _is_fluent_checkbox(w):
+                    w._scale_base_h = _px(22)
+
+                elif _is_caption_label(w):
+                    w._scale_base_h = _px(16)
+
+        # ── Second pass: apply fonts + heights ────────────────────────────
+        for page in pages:
+            for w in page.findChildren(QWidget):
+                # Font rescaling
                 f = w.font()
                 pt = f.pointSize()
-                if pt <= 0:
+                if pt > 0:
+                    closest_key = min(
+                        base,
+                        key=lambda k: abs(base[k] - round(pt / (self._content_scale_prev or 1.0)))
+                    )
+                    new_pt = scaled_pt(base[closest_key])
+                    if f.pointSize() != new_pt:
+                        f.setPointSize(new_pt)
+                        w.setFont(f)
+
+                # Height rescaling — skip untagged widgets
+                base_h = getattr(w, "_scale_base_h", None)
+                if base_h is None:
                     continue
-                # Snap pt to the nearest base size and rescale
-                closest_key = min(base, key=lambda k: abs(base[k] - round(pt / (self._content_scale_prev or 1.0))))
-                new_pt = scaled(base[closest_key])
-                if f.pointSize() != new_pt:
-                    f.setPointSize(new_pt)
-                    w.setFont(f)
-                # Rescale fixed/minimum heights for input widgets
-                from PyQt6.QtWidgets import QAbstractSpinBox as _ASB
-                if isinstance(w, (QAbstractSpinBox, _ASB)):
-                    w.setMinimumHeight(max(20, round(_px(34) * s)))
+
+                if _is_text_area(w):
+                    w.setMinimumHeight(max(40, round(base_h * s)))
+
+                elif _is_spinbox(w):
+                    new_h = max(20, round(base_h * s))
+                    # qfluentwidgets.TimeEdit (and some SpinBoxes) set an internal
+                    # maximumHeight cap in their constructor. Unlock it first with
+                    # a large value, THEN set the real target — otherwise Qt clamps
+                    # setMinimumHeight to the old maximumHeight silently.
+                    w.setMaximumHeight(16777215)   # Qt QWIDGETSIZE_MAX — full unlock
+                    w.setMaximumHeight(new_h)
+                    w.setMinimumHeight(new_h)
+
+                elif _is_combo(w) or _is_lineedit(w):
+                    w.setMinimumHeight(max(20, round(base_h * s)))
+
+                elif _is_real_button(w):
+                    w.setMinimumHeight(max(20, round(base_h * s)))
+
+                elif _is_progressbar(w):
+                    w.setMinimumHeight(max(6, round(base_h * s)))
+
+                elif _is_fluent_checkbox(w):
+                    w.setMinimumHeight(max(14, round(base_h * s)))
+
+                elif _is_caption_label(w):
+                    w.setMinimumHeight(max(10, round(base_h * s)))
+
         self._content_scale_prev = s
 
     # ── Signal connections ────────────────────────────────────────────────
@@ -1627,6 +1838,7 @@ class MainWindow(FluentWindow):
         worker.error.connect(self._on_accounts_error)
         self._detection_workers[idx] = worker
         worker.start()
+        self._update_start_button_state()
 
     def _on_accounts_detected(self, row_idx: int, accounts: list):
         dp = self.dashboard_page
@@ -1642,6 +1854,7 @@ class MainWindow(FluentWindow):
         combo_acc.blockSignals(False)
         lbl_status.setText("● idle")
         self._detection_workers.pop(row_idx, None)
+        self._update_start_button_state()
 
     def _on_accounts_error(self, row_idx: int):
         dp = self.dashboard_page
@@ -1656,6 +1869,21 @@ class MainWindow(FluentWindow):
         combo_acc.blockSignals(False)
         lbl_status.setText("● idle")
         self._detection_workers.pop(row_idx, None)
+        self._update_start_button_state()
+
+    def _update_start_button_state(self):
+        """Enable START SCRAPING only when a device is assigned and no detection is running."""
+        dp = self.dashboard_page
+        any_device = False
+        detecting = False
+        for i, (combo_dev, combo_acc, lbl_port, lbl_status, btn_view) in enumerate(dp.device_rows):
+            if combo_dev.currentData():
+                any_device = True
+                if i in self._detection_workers and self._detection_workers[i].isRunning():
+                    detecting = True
+                    break
+        if not dp.btn_stop.isEnabled():  # not currently scraping
+            dp.btn_start.setEnabled(any_device and not detecting)
 
     def _on_account_selected(self, row_idx: int):
         dp = self.dashboard_page
@@ -1812,7 +2040,8 @@ class MainWindow(FluentWindow):
             "skip_no_profile_pic":      fp.chk_skip_no_pic.isChecked(),
             "skip_no_contact":          fp.chk_skip_no_contact.isChecked(),
             "min_posts":                fp.spin_min_posts.value(),
-            "require_recent_post_days": fp.spin_recent_days.value(),
+            "enable_post_spin":         fp.chk_enable_post_spin.isChecked(),
+            "skip_no_posts_last_n_months": fp.spin_skip_months.value(),
             "keywords":                 parse_keywords(fp.txt_skip_keywords.toPlainText()),
             "only_keywords":            parse_keywords(fp.txt_only_keywords.toPlainText()),
         }
@@ -1826,8 +2055,6 @@ class MainWindow(FluentWindow):
             "between_profiles_max":   sp.sp_prof_max.value(),
             "between_scrolls_min":    sp.sp_scrl_min.value(),
             "between_scrolls_max":    sp.sp_scrl_max.value(),
-            "run_min_profiles":       sp.sp_run_min.value(),
-            "run_max_profiles":       sp.sp_run_max.value(),
             "rest_min_minutes":       sp.sp_rest_min.value(),
             "rest_max_minutes":       sp.sp_rest_max.value(),
             "session_break_every":    sp.sp_switch_every.value(),
@@ -1867,7 +2094,9 @@ class MainWindow(FluentWindow):
         fp.chk_skip_no_pic.setChecked(f.get("skip_no_profile_pic", False))
         fp.chk_skip_no_contact.setChecked(f.get("skip_no_contact", True))
         fp.spin_min_posts.setValue(int(f.get("min_posts", 0)))
-        fp.spin_recent_days.setValue(int(f.get("require_recent_post_days", 365)))
+        fp.chk_enable_post_spin.setChecked(f.get("enable_post_spin", False))
+        fp.spin_skip_months.setValue(int(f.get("skip_no_posts_last_n_months", 1)))
+        fp.spin_skip_months.setEnabled(fp.chk_enable_post_spin.isChecked())
         fp.txt_skip_keywords.setPlainText(", ".join(f.get("keywords", [])))
         fp.txt_only_keywords.setPlainText(", ".join(f.get("only_keywords", [])))
 
@@ -1882,8 +2111,6 @@ class MainWindow(FluentWindow):
         sp.sp_prof_max.setValue(d.get("between_profiles_max", 5.0))
         sp.sp_scrl_min.setValue(d.get("between_scrolls_min",  1.0))
         sp.sp_scrl_max.setValue(d.get("between_scrolls_max",  3.0))
-        sp.sp_run_min.setValue(int(d.get("run_min_profiles",  5)))
-        sp.sp_run_max.setValue(int(d.get("run_max_profiles",  15)))
         sp.sp_rest_min.setValue(int(d.get("rest_min_minutes", 30)))
         sp.sp_rest_max.setValue(int(d.get("rest_max_minutes", 60)))
         sp.sp_switch_every.setValue(int(d.get("session_break_every", 50)))
@@ -1917,20 +2144,60 @@ class MainWindow(FluentWindow):
         save_config(cfg)
 
         self._log("🔗 Connecting to Google Sheets…")
-        try:
-            self._sheets_client = SheetsClient(
-                credentials_path=cfg["credentials_path"],
-                sheet_id=cfg["sheet_id"],
-                tab_name=cfg["sheet_tab"],
-            )
-            self._sheets_client.authenticate()
-            self._sheets_client.connect_sheet()
-            self._log("✅ Google Sheets connected.")
-        except Exception as e:
-            InfoBar.error("Sheets Failed", str(e)[:200], parent=self)
-            self._log(f"❌ Sheets error: {e}")
-            return
+        # Disable Start button while OAuth may open a browser — re-enabled on failure
+        self.dashboard_page.btn_start.setEnabled(False)
 
+        _reuse = (
+            self._sheets_client is not None
+            and getattr(self._sheets_client, "_worksheet", None) is not None
+            and getattr(self._sheets_client, "sheet_id", None) == cfg["sheet_id"]
+        )
+
+        # Capture everything _launch_scraping needs (closure over local vars)
+        _cfg           = cfg
+        _assigned      = assigned
+        _phone_targets = phone_targets
+        _total_targets = total_targets
+
+        def _on_sheets_success(client):
+            self._sheets_client = client
+            self._log("✅ Google Sheets connected.")
+            try:
+                rows = client.get_row_count()
+                self.settings_page.lbl_sheet_status.setText(f"✅ Connected · {rows} rows")
+            except Exception:
+                self.settings_page.lbl_sheet_status.setText("✅ Connected")
+            self._launch_scraping(_cfg, _assigned, _phone_targets, _total_targets)
+
+        def _on_sheets_failure(err_msg):
+            self._sheets_client = None
+            self.settings_page.lbl_sheet_status.setText("❌ Not connected")
+            self._log(f"❌ Sheets auth failed: {err_msg}")
+            InfoBar.error(
+                "Google Sheets – Authentication Failed",
+                err_msg,
+                orient=Qt.Orientation.Horizontal,
+                isClosable=True,
+                duration=6000,
+                parent=self,
+            )
+            # Re-enable Start so the user can try again
+            self._update_start_button_state()
+
+        self._sheets_auth_worker = SheetsAuthWorker(
+            credentials_path=_cfg["credentials_path"],
+            sheet_id=_cfg["sheet_id"],
+            tab_name=_cfg["sheet_tab"],
+            existing_client=self._sheets_client,
+            reuse=_reuse,
+        )
+        self._sheets_auth_worker.success.connect(_on_sheets_success)
+        self._sheets_auth_worker.failure.connect(_on_sheets_failure)
+        self._sheets_auth_worker.start()
+        # _launch_scraping is called from _on_sheets_success when auth completes
+
+    def _launch_scraping(self, cfg: dict, assigned: list, phone_targets: list, total_targets: int):
+        """Called after Sheets auth succeeds. Starts Appium and PhoneWorkers."""
         serials = [s for _, s in assigned]
         self._log(f"🚀 Auto-starting Appium for {len(serials)} phone(s)…")
         try:
@@ -1940,6 +2207,7 @@ class MainWindow(FluentWindow):
         except RuntimeError as e:
             InfoBar.error("Appium Failed", str(e)[:300], parent=self)
             self._log(f"❌ Appium startup failed: {e}")
+            self._update_start_button_state()
             return
 
         self._collected     = 0
@@ -2101,22 +2369,40 @@ class MainWindow(FluentWindow):
             InfoBar.warning("Missing Sheet ID", "Enter your Google Sheet ID first.", parent=self)
             return
         self._log("🔗 Authenticating with Google Sheets (browser may open)…")
+        # Disable the test button while auth runs so the user can't double-click
         try:
-            client = SheetsClient(
-                credentials_path=cfg["credentials_path"],
-                sheet_id=cfg["sheet_id"],
-                tab_name=cfg["sheet_tab"],
-            )
-            client.authenticate()
-            client.connect_sheet()
-            rows = client.get_row_count()
+            self.settings_page.btn_test_sheets.setEnabled(False)
+        except Exception:
+            pass
+
+        def _on_test_success(client, rows):
+            self._sheets_client = client
             self.settings_page.lbl_sheet_status.setText(f"✅ Connected · {rows} rows")
             self._log(f"✅ Google Sheet connected — {rows} existing rows.")
             InfoBar.success("Connected!", f"Google Sheets ready. {rows} existing rows.", parent=self)
-        except Exception as e:
-            self.settings_page.lbl_sheet_status.setText("❌ Failed")
-            self._log(f"❌ Sheets error: {e}")
-            InfoBar.error("Connection Failed", str(e)[:200], parent=self)
+            try:
+                self.settings_page.btn_test_sheets.setEnabled(True)
+            except Exception:
+                pass
+
+        def _on_test_failure(err_msg):
+            self._sheets_client = None
+            self.settings_page.lbl_sheet_status.setText("❌ Not connected")
+            self._log(f"❌ Sheets error: {err_msg}")
+            InfoBar.error("Connection Failed", err_msg, parent=self)
+            try:
+                self.settings_page.btn_test_sheets.setEnabled(True)
+            except Exception:
+                pass
+
+        self._sheets_test_worker = SheetsTestWorker(
+            credentials_path=cfg["credentials_path"],
+            sheet_id=cfg["sheet_id"],
+            tab_name=cfg["sheet_tab"],
+        )
+        self._sheets_test_worker.success.connect(_on_test_success)
+        self._sheets_test_worker.failure.connect(_on_test_failure)
+        self._sheets_test_worker.start()
 
     def _revoke_token(self):
         from src.sheets.google_sheets import TOKEN_PATH

@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
         "skip_no_contact": False,
         "min_posts": 0,
         "require_recent_post_days": 365,
+        "skip_no_posts_last_n_months": 0,
     },
     "delays": {
         "between_profiles_min": 2.0,

@@ -9,28 +9,27 @@
     "skip_no_profile_pic": false,
     "skip_no_contact": false,
     "min_posts": 0,
-    "require_recent_post_days": 365,
+    "enable_post_spin": true,
+    "skip_no_posts_last_n_months": 1,
     "keywords": [],
     "only_keywords": []
   },
   "delays": {
-    "between_profiles_min": 2.0,
-    "between_profiles_max": 4.0,
+    "between_profiles_min": 1.0,
+    "between_profiles_max": 2.0,
     "between_scrolls_min": 0.5,
     "between_scrolls_max": 3.0,
-    "run_min_profiles": 3,
-    "run_max_profiles": 10,
-    "rest_min_minutes": 30,
-    "rest_max_minutes": 60,
-    "session_break_every": 1,
-    "switch_mode": "profiles",
+    "rest_min_minutes": 1,
+    "rest_max_minutes": 2,
+    "session_break_every": 5,
+    "switch_mode": "hours",
     "switch_hours": 1
   },
   "schedule": {
     "enabled": false,
-    "start_hour": 12,
+    "start_hour": 9,
     "start_minute": 0,
-    "end_hour": 12,
+    "end_hour": 19,
     "end_minute": 0
   },
   "appium": {
@@ -39,7 +38,7 @@
   },
   "devices": [
     {
-      "serial": null
+      "serial": "emulator-5554"
     },
     {
       "serial": null
@@ -52,14 +51,14 @@
   "blacklist": [],
   "last_target": "",
   "last_mode": "following",
-  "last_count": 10,
+  "last_count": 5,
   "last_device": "",
   "targets_per_phone": [
     [
-      "android"
+      "hollywoodreporter"
     ],
     [],
     []
   ],
-  "mirror_width": 542
+  "mirror_width": 500
 }

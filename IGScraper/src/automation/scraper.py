@@ -60,6 +60,48 @@ def _rand(a: float, b: float) -> float:
     return random.uniform(min(a, b), max(a, b))
 
 
+def _parse_ig_date(text: str) -> Optional[datetime]:
+    """
+    Parse Instagram date strings like:
+    - '2 hours ago', '5 days ago', '1 week ago'
+    - 'July 5, 2024', 'July 5', '5 July'
+    - '23 October 2023'
+    Returns a datetime object or None.
+    """
+    if not text: return None
+    # Clean up the text: remove "See translation", dots, and extra whitespace
+    text = text.split("•")[0].split("·")[0].strip().lower()
+    now = datetime.now()
+    
+    try:
+        # Relative dates
+        m = re.search(r"(\d+)\s+(minute|hour|day|week)s?\s+ago", text)
+        if m:
+            val = int(m.group(1))
+            unit = m.group(2)
+            if "minute" in unit: return now - timedelta(minutes=val)
+            if "hour" in unit: return now - timedelta(hours=val)
+            if "day" in unit: return now - timedelta(days=val)
+            if "week" in unit: return now - timedelta(weeks=val)
+            
+        # Absolute dates
+        # Try common formats
+        # Instagram often uses "Month Day, Year" or "Day Month Year"
+        # We need to handle "July 5, 2024" -> "July 5 2024" for easier parsing
+        clean_abs = re.sub(r"[,]", "", text).title()
+        for fmt in ["%B %d %Y", "%B %d", "%d %B %Y", "%d %B"]:
+            try:
+                dt = datetime.strptime(clean_abs, fmt)
+                if dt.year == 1900: # No year in string
+                    dt = dt.replace(year=now.year)
+                    if dt > now: dt = dt.replace(year=now.year - 1)
+                return dt
+            except: continue
+            
+    except: pass
+    return None
+
+
 class InstagramScraper:
     def __init__(
         self,
@@ -191,25 +233,7 @@ class InstagramScraper:
         return False
 
     def open_list(self, mode: str) -> bool:
-        """Open followers or following list.
-
-        Corner-case handled: when the scraping account already *follows* the
-        target, Instagram shows both a "Following" action-button (to unfollow)
-        AND the "Following" stat counter in the header.  A naïve
-        textContains() search always picks the first match — which is the
-        action-button — and never opens the list.
-
-        Fix strategy (tried in order):
-        1. Look inside the known profile-header stats container IDs so we only
-           ever touch the counter row, not the action button.
-        2. Among ALL TextViews that contain the mode word, pick the one whose
-           text also contains a digit (e.g. "523 following") — the action
-           button text is plain "Following" with no number.
-        3. Fall back to descriptionContains (accessibility label on the stat).
-
-        All 3 strategies are retried for up to 30 seconds so slow page loads
-        due to network lag don't cause an immediate failure.
-        """
+        """Open followers or following list."""
         driver = self.ctrl.driver
         self._log(f"Opening {mode} list...")
         time.sleep(2)
@@ -221,10 +245,6 @@ class InstagramScraper:
 
         mode_lower = mode.lower()
 
-        # ── Strategy 1: target the profile-header stats container directly ──
-        # Instagram wraps the three stat counters (posts / followers / following)
-        # inside one of these resource-ids.  Searching *inside* that container
-        # guarantees we never hit the action button which lives elsewhere.
         STAT_ID_MAP = {
             "following": [
                 "com.instagram.android:id/profile_header_following_container",
@@ -246,7 +266,6 @@ class InstagramScraper:
                 self._log(f"⏳ Page still loading, retrying {mode} list... (attempt {attempt}, up to {MAX_WAIT}s)")
                 time.sleep(RETRY_WAIT)
 
-            # ── Strategy 1: target the profile-header stats container directly ──
             for res_id in STAT_ID_MAP.get(mode_lower, STAT_FALLBACK_IDS):
                 try:
                     el = driver.find_element(AppiumBy.ID, res_id)
@@ -257,248 +276,129 @@ class InstagramScraper:
                 except Exception:
                     continue
 
-            # ── Strategy 2: pick the TextView whose text contains a digit ────────
-            # The stat label looks like "1,234 following" or "following\n1,234"
-            # depending on the layout.  The action button text is simply "Following".
-            # We collect all matching TextViews and prefer the one with a digit.
             try:
-                elements = self._find_all(
-                    AppiumBy.XPATH,
-                    f'//android.widget.TextView[contains('
-                    f'translate(@text,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")'
-                    f',"{mode_lower}")]'
-                )
-                digit_match = None
-                first_match = None
-                for el in elements:
-                    try:
-                        txt = el.text.strip()
-                        if mode_lower not in txt.lower():
-                            continue
-                        if first_match is None:
-                            first_match = el
-                        # Prefer the element whose text also contains a digit
-                        if re.search(r'\d', txt):
-                            digit_match = el
-                            break
-                    except Exception:
-                        continue
-
-                target = digit_match or first_match
-                if target:
-                    self._log(f"✅ Found {mode} via text scan: '{target.text}'")
-                    target.click()
-                    time.sleep(2.5)
-                    return True
+                all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+                for tv in all_tvs:
+                    txt = tv.text.lower()
+                    if mode_lower in txt and any(c.isdigit() for c in txt):
+                        self._log(f"✅ Found {mode} stat by text matching: '{tv.text}'")
+                        tv.click()
+                        time.sleep(2.5)
+                        return True
             except Exception:
                 pass
 
-            # ── Strategy 3: accessibility description on the stat button ─────────
             try:
                 el = driver.find_element(
                     AppiumBy.ANDROID_UIAUTOMATOR,
                     f'new UiSelector().descriptionContains("{mode}")'
                 )
-                desc = el.get_attribute("content-desc")
-                self._log(f"✅ Found {mode} via description: '{desc}'")
+                self._log(f"✅ Found {mode} stat by description: '{el.get_attribute('content-desc')}'")
                 el.click()
                 time.sleep(2.5)
                 return True
             except Exception:
                 pass
 
-        self._log(f"❌ Could not find {mode} button after {MAX_WAIT}s — page may not have loaded.")
+        self._log(f"❌ Failed to open {mode} list after {MAX_WAIT}s")
         return False
 
-    # ── Row extraction ────────────────────────────────────────────────────────
-
     def _extract_visible_accounts(self) -> List[Dict]:
-        """Extract all visible account rows on screen including story detection."""
+        """Extract usernames from the current screen."""
         driver = self.ctrl.driver
         accounts = []
-
-        row_ids = [
-            "com.instagram.android:id/follow_list_container",
-            "com.instagram.android:id/row_user_container_base",
-            "com.instagram.android:id/unified_follow_list_user_container",
-        ]
-
-        rows = []
-        for rid in row_ids:
-            rows = self._find_all(AppiumBy.ID, rid)
-            if rows:
-                break
-
-        if not rows:
-            rows = self._find_all(
-                AppiumBy.XPATH,
-                '//androidx.recyclerview.widget.RecyclerView/android.widget.LinearLayout'
-            )
-
-        for row in rows:
-            try:
-                acc = self._parse_row(row)
-                if acc and acc.get("username"):
-                    accounts.append(acc)
-            except (StaleElementReferenceException, Exception):
-                continue
-
+        try:
+            rows = driver.find_elements(AppiumBy.ID, IG_USER_ROW)
+            for row in rows:
+                try:
+                    uname_el = row.find_element(AppiumBy.ID, "com.instagram.android:id/follow_list_username")
+                    uname = uname_el.text.strip()
+                    if uname:
+                        fname = ""
+                        try:
+                            fname_el = row.find_element(AppiumBy.ID, "com.instagram.android:id/follow_list_subtitle")
+                            fname = fname_el.text.strip()
+                        except: pass
+                        
+                        accounts.append({
+                            "username": uname,
+                            "full_name": fname,
+                        })
+                except Exception:
+                    continue
+            
+            if not accounts:
+                all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+                for tv in all_tvs:
+                    txt = tv.text.strip()
+                    if txt and " " not in txt and len(txt) > 2 and len(txt) < 31:
+                        if txt.lower() not in ("followers", "following", "posts", "search", "suggested"):
+                            accounts.append({"username": txt, "full_name": ""})
+        except Exception as e:
+            self._log(f"Extraction error: {e}")
         return accounts
 
-    def _parse_row(self, row_element) -> Optional[Dict]:
-        """Parse username, full name, profile pic presence, and story ring from a row."""
-        username = ""
-        full_name = ""
-        has_profile_pic = True
-        has_story = False
-
-        try:
-            u_el = row_element.find_element(
-                AppiumBy.ID, "com.instagram.android:id/follow_list_username"
-            )
-            username = u_el.text.strip()
-        except Exception:
-            try:
-                texts = row_element.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
-                if texts:
-                    username = texts[0].text.strip()
-                if len(texts) > 1:
-                    full_name = texts[1].text.strip()
-            except Exception:
-                pass
-
-        for fn_id in [
-            "com.instagram.android:id/follow_list_subtitle",
-            "com.instagram.android:id/follow_list_full_name",
-        ]:
-            try:
-                fn_el = row_element.find_element(AppiumBy.ID, fn_id)
-                val = fn_el.text.strip()
-                if val:
-                    full_name = val
-                    break
-            except Exception:
-                continue
-
-        # Detect story ring (colored ring around avatar = active story)
-        try:
-            story_indicators = row_element.find_elements(
-                AppiumBy.ANDROID_UIAUTOMATOR,
-                'new UiSelector().descriptionContains("story")'
-            )
-            if story_indicators:
-                has_story = True
-            avatar_containers = row_element.find_elements(
-                AppiumBy.CLASS_NAME, "android.widget.FrameLayout"
-            )
-            for container in avatar_containers:
-                try:
-                    desc = container.get_attribute("content-desc") or ""
-                    if "story" in desc.lower():
-                        has_story = True
-                        break
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Detect if profile picture is present
-        try:
-            img_views = row_element.find_elements(
-                AppiumBy.CLASS_NAME, "android.widget.ImageView"
-            )
-            if not img_views:
-                has_profile_pic = False
-        except Exception:
-            pass
-
-        if not username:
-            return None
-
-        return {
+    def open_profile_details(self, username: str, filters: dict = None) -> dict:
+        """Click on a username to open its profile and scrape full details."""
+        driver = self.ctrl.driver
+        details = {
             "username": username,
-            "full_name": full_name,
+            "full_name": "",
             "bio": "",
+            "is_private": False,
+            "has_profile_pic": True,
+            "post_count": 0,
+            "followers": 0,
+            "following": 0,
+            "has_recent_post": False,
+            "has_story": False,
             "email": "",
             "phone": "",
             "location": "",
-            "country_code": "",
-            "followers": 0,
-            "following": 0,
-            "post_count": 0,
-            "has_profile_pic": has_profile_pic,
-            "has_story": has_story,
-            "has_recent_post": True,
-            "is_private": False,
-            "profile_url": f"https://www.instagram.com/{username}/",
-            "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-    # ── Profile detail extraction ─────────────────────────────────────────────
-
-    def open_profile_details(self, username: str) -> Dict:
-        """
-        Tap a user in the list to open their profile and get full details.
-        Returns dict with bio, followers, following, post_count, email, phone,
-        location, country_code, has_recent_post, is_private, has_profile_pic.
-        """
-        driver = self.ctrl.driver
-        details = {
-            "bio": "", "email": "", "phone": "",
-            "location": "", "country_code": "",
-            "followers": 0, "following": 0, "post_count": 0,
-            "is_private": False, "has_profile_pic": True,
-            "has_recent_post": True,
+            "latest_post_date_text": "",
         }
 
         try:
-            el = driver.find_element(
-                AppiumBy.XPATH,
-                f'//android.widget.TextView[@text="{username}"]'
-            )
-            el.click()
+            try:
+                el = driver.find_element(AppiumBy.ANDROID_UIAUTOMATOR, f'new UiSelector().text("{username}")')
+                el.click()
+            except:
+                all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+                found = False
+                for tv in all_tvs:
+                    if tv.text.strip().lower() == username.lower():
+                        tv.click()
+                        found = True
+                        break
+                if not found: return details
+
             time.sleep(3)
 
-            # Full name
             try:
-                fn_el = driver.find_element(
-                    AppiumBy.ID,
-                    "com.instagram.android:id/profile_header_full_name_above_vanity"
-                )
-                details["full_name"] = fn_el.text.strip()
-            except Exception:
-                pass
-
-            # Bio
-            bio_text = ""
-            for bio_id in [
-                "com.instagram.android:id/profile_user_info_compose_view",
-                "com.instagram.android:id/profile_header_bio_text",
-                "com.instagram.android:id/text_view",
-            ]:
+                driver.find_element(AppiumBy.ID, "com.instagram.android:id/reel_ring")
+                details["has_story"] = True
+            except:
                 try:
-                    bio_el = driver.find_element(AppiumBy.ID, bio_id)
-                    txt = bio_el.text.strip()
-                    if txt and not txt.replace(",", "").replace(".", "").isdigit() \
-                            and txt.lower() not in ("posts", "followers", "following", "follow", "message"):
-                        bio_text = txt
-                        break
-                except Exception:
-                    continue
-            details["bio"] = bio_text
+                    pic = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_avatar_container")
+                    desc = pic.get_attribute("content-desc") or ""
+                    if "Story" in desc or "story" in desc:
+                        details["has_story"] = True
+                except: pass
 
-            # Extract email and phone from bio
-            if bio_text:
-                details["email"] = extract_email(bio_text)
-                details["phone"] = extract_phone(bio_text)
+            try:
+                details["full_name"] = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_full_name").text.strip()
+            except: pass
+            try:
+                details["bio"] = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_bio_text").text.strip()
+            except: pass
 
-            # Location field
-            for loc_id in [
-                "com.instagram.android:id/profile_header_location_container",
-                "com.instagram.android:id/profile_header_location",
-            ]:
+            loc_ids = [
+                "com.instagram.android:id/profile_header_location_text",
+                "com.instagram.android:id/profile_header_business_category",
+            ]
+            for lid in loc_ids:
                 try:
-                    loc_el = driver.find_element(AppiumBy.ID, loc_id)
+                    loc_el = driver.find_element(AppiumBy.ID, lid)
                     loc_txt = loc_el.text.strip()
                     if loc_txt:
                         details["location"] = loc_txt
@@ -506,7 +406,6 @@ class InstagramScraper:
                 except Exception:
                     continue
 
-            # Try to get contact info from the "Contact" button
             try:
                 contact_btn = driver.find_element(
                     AppiumBy.ANDROID_UIAUTOMATOR,
@@ -536,7 +435,6 @@ class InstagramScraper:
             except Exception:
                 pass
 
-            # Also try "Email" link button directly
             if not details["email"]:
                 try:
                     email_btn = driver.find_element(
@@ -550,7 +448,6 @@ class InstagramScraper:
                 except Exception:
                     pass
 
-            # Followers & Following counts
             try:
                 all_texts = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
                 texts = [(el.text.strip(), el) for el in all_texts if el.text.strip()]
@@ -568,55 +465,213 @@ class InstagramScraper:
             except Exception:
                 pass
 
-            # Try combined "54.3K followers" style text
-            if not details["followers"]:
-                try:
-                    el = driver.find_element(
-                        AppiumBy.ANDROID_UIAUTOMATOR,
-                        'new UiSelector().textContains("followers")'
-                    )
-                    num = el.text.lower().replace("followers", "").strip()
-                    details["followers"] = _parse_count(num)
-                except Exception:
-                    pass
-
-            # Post count from posts header
-            if not details["post_count"]:
-                try:
-                    el = driver.find_element(
-                        AppiumBy.ANDROID_UIAUTOMATOR,
-                        'new UiSelector().textContains("posts")'
-                    )
-                    num = el.text.lower().replace("posts", "").strip()
-                    details["post_count"] = _parse_count(num)
-                except Exception:
-                    pass
-
-            # Private account?
             try:
                 driver.find_element(
                     AppiumBy.XPATH,
-                    '//*[contains(@text,"This account is private") or contains(@content-desc,"private")]'
+                    '//*[contains(@text,"This account is private") or '
+                    'contains(@text,"Account is private") or '
+                    'contains(@content-desc,"This account is private")]'
                 )
                 details["is_private"] = True
             except Exception:
-                details["is_private"] = False
+                try:
+                    driver.find_element(
+                        AppiumBy.ANDROID_UIAUTOMATOR,
+                        'new UiSelector().textContains("This account is private")'
+                    )
+                    details["is_private"] = True
+                except Exception:
+                    details["is_private"] = False
 
-            # Has profile picture?
             try:
                 profile_pic = driver.find_element(
                     AppiumBy.ID,
                     "com.instagram.android:id/profile_header_avatar_container_frame"
                 )
-                desc = profile_pic.get_attribute("content-desc") or ""
-                details["has_profile_pic"] = len(desc) > 5
+                desc = (profile_pic.get_attribute("content-desc") or "").lower()
+                uname_lower = username.lower()
+                if uname_lower and uname_lower in desc:
+                    details["has_profile_pic"] = True
+                elif desc and desc not in ("profile photo", "profile picture", "photo"):
+                    details["has_profile_pic"] = True
+                else:
+                    details["has_profile_pic"] = False
             except Exception:
                 details["has_profile_pic"] = True
 
             if not details["is_private"] and details["post_count"] > 0:
                 details["has_recent_post"] = True
+                
+                enable_spin = filters.get("enable_post_spin", False) if filters else False
+                months_threshold = int(filters.get("skip_no_posts_last_n_months", 0)) if filters else 0
+                
+                if enable_spin and months_threshold > 0:
+                    try:
+                        self._log(f"🔍 Attempting to click latest post for @{username}...")
+                        
+                        post_el = None
+                        grid_post_selectors = [
+                            (AppiumBy.XPATH, "//android.widget.Button[contains(@content-desc, 'row 1, column 1')]"),
+                            (AppiumBy.XPATH, "//android.widget.ImageView[contains(@content-desc, 'row 1, column 1')]"),
+                            (AppiumBy.XPATH, "//android.widget.Button[contains(@content-desc, 'Post by')]"),
+                            (AppiumBy.XPATH, "//android.widget.ImageView[contains(@content-desc, 'Post by')]"),
+                            (AppiumBy.ID, "com.instagram.android:id/image_button"),
+                            (AppiumBy.ID, "com.instagram.android:id/media_set_row_content_1"),
+                        ]
+                        
+                        for attempt_find in range(3):
+                            for by, val in grid_post_selectors:
+                                try:
+                                    els = driver.find_elements(by, val)
+                                    if els:
+                                        # Validate: reject highlight/story elements
+                                        for candidate in els:
+                                            desc = (candidate.get_attribute("content-desc") or "").lower()
+                                            # Must NOT be a highlight or story bubble
+                                            if "highlight" in desc or "story" in desc:
+                                                continue
+                                            post_el = candidate
+                                            self._log(f"✅ Found latest post using {by}: {val}")
+                                            break
+                                        if post_el:
+                                            break
+                                except: continue
+                            if post_el: break
+                            
+                            # Fallback: Try to find a grid post button/image with strict validation
+                            try:
+                                all_clickable = driver.find_elements(AppiumBy.XPATH, "//android.widget.Button | //android.widget.ImageView")
+                                for el in all_clickable:
+                                    desc = (el.get_attribute("content-desc") or "").lower()
+                                    # Must reference a grid row/column position
+                                    has_grid_position = ("row 1" in desc and "column 1" in desc)
+                                    # Must be an actual post — not a highlight or story bubble
+                                    is_story_or_highlight = "highlight" in desc or "story" in desc
+                                    # Must explicitly be a post reference
+                                    is_post = "post by" in desc or has_grid_position
+                                    if is_post and not is_story_or_highlight:
+                                        post_el = el
+                                        self._log(f"✅ Found latest post via fallback content-desc: {desc}")
+                                        break
+                            except: pass
+                            if post_el: break
 
-            # Country code inference
+                            if attempt_find < 2:
+                                self._log(f"🔍 Post not found (attempt {attempt_find+1}), scrolling slightly...")
+                                self.scroll_list(swipe_distance=0.2)
+                                time.sleep(2.0)
+                        
+                        if post_el:
+                            try:
+                                post_el.click()
+                            except:
+                                # Final fallback: Coordinate-based click if element click fails
+                                self._log("⚠️ Element click failed, trying coordinate-based click...")
+                                loc = post_el.location
+                                size = post_el.size
+                                cx, cy = loc['x'] + size['width'] // 2, loc['y'] + size['height'] // 2
+                                _run_hidden(["adb", "-s", self.ctrl._device_serial or "", "shell", "input", "tap", str(cx), str(cy)])
+                            
+                            time.sleep(3.0)
+
+                            # ── Guard: detect accidental highlight / story viewer ──────────
+                            # If we tapped a highlight bubble instead of a grid post, the UI
+                            # will show a story-style viewer (no date element, progress bars
+                            # at the top, or a "Highlight" label). Detect and escape cleanly.
+                            landed_in_story = False
+                            try:
+                                # Story/highlight viewers have a progress-bar strip at top
+                                story_indicators = driver.find_elements(
+                                    AppiumBy.XPATH,
+                                    '//*[contains(@resource-id,"reel_viewer_progress") '
+                                    'or contains(@resource-id,"story_progress") '
+                                    'or contains(@resource-id,"highlight_title") '
+                                    'or contains(@content-desc,"Highlight") '
+                                    'or contains(@content-desc,"highlight")]'
+                                )
+                                if story_indicators:
+                                    landed_in_story = True
+                                    self._log(f"⚠️ Accidentally opened a story/highlight for @{username} — pressing back and skipping post-date check")
+                            except Exception:
+                                pass
+
+                            if landed_in_story:
+                                driver.back()
+                                time.sleep(1.5)
+                                self._log(f"⚠️ Could not find date text on post for @{username} (landed in story/highlight)")
+                                details["latest_post_date_text"] = ""
+                                # Treat as "date unknown" — do NOT mark has_recent_post False
+                                # just skip the date-based filter for this account
+                                details["has_recent_post"] = True
+                                return details
+                            # ──────────────────────────────────────────────────────────────
+
+                            date_text = ""
+                            date_ids = [
+                                "com.instagram.android:id/post_date",
+                                "com.instagram.android:id/feed_post_header_timestamp",
+                            ]
+                            
+                            date_regex = r"(\d+\s+(day|hour|minute|week)s?\s+ago)|(^[A-Z][a-z]+\s+\d+)|(^\d+\s+[A-Z][a-z]+)"
+                            
+                            for attempt in range(4):
+                                for d_id in date_ids:
+                                    try:
+                                        date_el = driver.find_element(AppiumBy.ID, d_id)
+                                        txt = date_el.text.strip()
+                                        if txt and re.search(date_regex, txt, re.I):
+                                            date_text = txt
+                                            break
+                                    except: continue
+                                if date_text: break
+                                
+                                all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+                                for tv in reversed(all_tvs):
+                                    txt = tv.text.strip()
+                                    if re.search(date_regex, txt, re.I):
+                                        date_text = txt
+                                        break
+                                if date_text: break
+                                
+                                self._log(f"📜 Post date not visible (attempt {attempt+1}), scrolling and waiting...")
+                                self.scroll_list(swipe_distance=0.4) # Uses ADB shell swipe now
+                                time.sleep(2)
+                            
+                            if date_text:
+                                self._log(f"✅ Latest post date for @{username}: {date_text}")
+                                details["latest_post_date_text"] = date_text
+                                
+                                # Perform skipping logic
+                                post_dt = _parse_ig_date(date_text)
+                                if post_dt:
+                                    now = datetime.now()
+                                    # Use exact day-accurate age in months (30.44 days/month)
+                                    age_days = (now - post_dt).days
+                                    age_months_exact = age_days / 30.44
+                                    # Only skip if the post is STRICTLY OLDER than the threshold
+                                    # e.g. threshold=1 → skip only if age > 1 full month (>30 days)
+                                    if age_months_exact > months_threshold:
+                                        self._log(f"⏭️ Skipping @{username}: Latest post is {age_months_exact:.1f} months old (threshold: >{months_threshold})")
+                                        details["has_recent_post"] = False
+                                    else:
+                                        self._log(f"✅ @{username}: Post is {age_months_exact:.1f} months old — within threshold")
+                                else:
+                                    self._log(f"⚠️ Could not parse date '{date_text}', proceeding anyway...")
+                            else:
+                                self._log(f"⚠️ Could not find date text on post for @{username} after 4 attempts")
+                            
+                            self._log(f"⬅️ Pressing back to return to profile...")
+                            driver.back()
+                            time.sleep(1.5)
+                            
+                            if details.get("has_recent_post") == False:
+                                self._log(f"⬅️ Returning early due to skip...")
+                                return details
+                        else:
+                            self._log(f"❌ No posts found to click for @{username}")
+                    except Exception as e:
+                        self._log(f"⚠️ Could not check latest post for @{username}: {e}")
+
             details["country_code"] = infer_country_code(
                 details["phone"], details["location"]
             )
@@ -627,42 +682,10 @@ class InstagramScraper:
         return details
 
     def _appium_navigate_to_home(self) -> bool:
-        """
-        Use the live Appium session to dismiss the following list, then use
-        ADB 'am start --activity-clear-top' to collapse the Instagram back
-        stack to a single root activity BEFORE releasing the session for
-        ADB-based account switching.
-
-        Why --activity-clear-top is critical
-        -------------------------------------
-        navigate_to_profile() uses 'am start -a android.intent.action.VIEW'
-        (a deep link) which PUSHES a new Activity onto Instagram's back stack.
-        After the first switch the re-navigation does this deep link again, so
-        by the time the second switch fires the stack looks like:
-
-            HomeActivity → DeepLinkProfileActivity → FollowingListSheet
-
-        Without clearing the stack, the Back presses inside
-        switch_instagram_account() Phase B must traverse ALL those layers.
-        If the loop runs out of attempts while still inside the deep-link
-        Profile activity, the next Back press exits Instagram to the launcher
-        (Instagram leaves the foreground).
-
-        --activity-clear-top pops every Activity above the main one in a
-        single command, leaving exactly:
-
-            InstagramMainActivity   (depth = 1, always safe to Back from)
-
-        This makes the stack depth identical whether it is the 1st or the
-        50th switch, so Phase B always finds the chevron on the very first
-        Profile-tab tap.
-        """
+        """Clear the back stack and return to main activity."""
         driver = self.ctrl.driver
         serial = self.ctrl._device_serial or ""
-
         try:
-            # Step 1: Dismiss the following list via Appium back() (max 6 presses)
-            # We check for all known list container IDs so we catch every variant.
             LIST_IDS = [
                 "com.instagram.android:id/follow_list_container",
                 "com.instagram.android:id/row_user_container_base",
@@ -683,40 +706,53 @@ class InstagramScraper:
                     driver.back()
                     time.sleep(1.2)
 
-            # Step 2: Use ADB to collapse the entire Instagram back stack to
-            # the main activity in one shot.  This works even while the
-            # Appium session is still connected because am-start does not
-            # conflict with UiAutomator2 — it only modifies the activity
-            # manager task stack.
             _run_hidden(
                 [
                     "adb", "-s", serial, "shell", "am", "start",
                     "--activity-clear-top",
-                    "-n", "com.instagram.android/"
-                         "com.instagram.mainactivity.InstagramMainActivity",
+                    "-n", "com.instagram.android/com.instagram.mainactivity.InstagramMainActivity",
                 ],
                 capture_output=True, text=True, timeout=10,
             )
-            time.sleep(2.0)   # let the animation finish
-
+            time.sleep(2.0)
             self._log("🏠 Pressed Back to clear screen before account switch")
             return True
-
         except Exception as e:
-            self._log(f"⚠️ _appium_navigate_to_home error (non-fatal): {e}")
-            # Even on error the ADB switch can still attempt — not fatal.
+            self._log(f"⚠️ _appium_navigate_to_home error: {e}")
             return False
 
     def scroll_list(self, swipe_distance: float = 0.6):
-        """Scroll the followers/following list down."""
-        driver = self.ctrl.driver
-        size = driver.get_window_size()
-        w, h = size["width"], size["height"]
-        start_y = int(h * 0.75)
-        end_y = int(h * (0.75 - swipe_distance))
-        driver.swipe(w // 2, start_y, w // 2, end_y, 600)
+        """Scroll the list down using ADB shell swipe for better stability."""
+        serial = self.ctrl._device_serial or ""
+        try:
+            # Get screen size via ADB to ensure correct coordinates
+            size_out = _run_hidden(["adb", "-s", serial, "shell", "wm", "size"], capture_output=True, text=True).stdout
+            m = re.search(r"(\d+)x(\d+)", size_out)
+            if m:
+                w, h = int(m.group(1)), int(m.group(2))
+            else:
+                # Fallback to standard 1080p if size detection fails
+                w, h = 1080, 1920
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+            start_x, start_y = w // 2, int(h * 0.75)
+            end_x, end_y = w // 2, int(h * (0.75 - swipe_distance))
+            duration = 600
+            
+            _run_hidden([
+                "adb", "-s", serial, "shell", "input", "swipe",
+                str(start_x), str(start_y), str(end_x), str(end_y), str(duration)
+            ])
+        except Exception as e:
+            self._log(f"⚠️ ADB scroll failed: {e}, trying Appium fallback...")
+            try:
+                driver = self.ctrl.driver
+                size = driver.get_window_size()
+                w, h = size["width"], size["height"]
+                start_y = int(h * 0.75)
+                end_y = int(h * (0.75 - swipe_distance))
+                driver.swipe(w // 2, start_y, w // 2, end_y, 600)
+            except Exception as e2:
+                self._log(f"❌ All scroll methods failed: {e2}")
 
     def run(
         self,
@@ -728,10 +764,7 @@ class InstagramScraper:
         fetch_details: bool = True,
         blacklist: set = None,
     ) -> int:
-        """
-        Main scraping loop.
-        Returns number of accounts collected.
-        """
+        """Main scraping loop."""
         if blacklist is None:
             blacklist = set()
 
@@ -744,10 +777,6 @@ class InstagramScraper:
         scroll_delay_max  = delays.get("between_scrolls_max",   3.0)
         profile_delay_min = delays.get("between_profiles_min",  2.0)
         profile_delay_max = delays.get("between_profiles_max",  4.0)
-        # Session break is intentionally disabled: the account-switch pause
-        # already provides sufficient rest between bursts, and the old
-        # break_every / break_duration values reused the switch_every counter
-        # which caused a 30 s sleep after every single collected profile.
 
         if not self.navigate_to_profile(target_username):
             self._log(f"❌ Failed to navigate to @{target_username}")
@@ -761,8 +790,6 @@ class InstagramScraper:
         consecutive_empty = 0
 
         while collected < max_count and not self._stop_flag:
-
-            # ── Re-navigate after account switch ──────────────────────────
             if self._need_reopen_list:
                 self._need_reopen_list = False
                 self._log(f"🔄 Re-opening {mode} list after account switch…")
@@ -773,8 +800,7 @@ class InstagramScraper:
                     self._log("❌ Could not reopen list after switch, stopping.")
                     break
                 consecutive_empty = 0
-                continue   # restart while-loop on fresh list screen
-            # ─────────────────────────────────────────────────────────────
+                continue
 
             accounts = self._extract_visible_accounts()
 
@@ -790,36 +816,36 @@ class InstagramScraper:
             consecutive_empty = 0
 
             for acc in accounts:
-                # Break inner loop immediately if stop or switch was requested
                 if self._stop_flag or self._need_reopen_list:
                     break
                 if collected >= max_count:
                     break
 
                 uname = acc["username"].lower()
+                # Check BOTH the current session's seen list AND the global blacklist
                 if uname in seen_usernames or uname in blacklist:
+                    # We don't log "Duplicate skipped" here to avoid cluttering the log
+                    # unless it was a new discovery in the same session.
                     continue
                 seen_usernames.add(uname)
 
-                # Fetch full profile details
                 if fetch_details:
-                    details = self.open_profile_details(acc["username"])
+                    details = self.open_profile_details(acc["username"], filters=filters)
                     acc.update(details)
                     self.ctrl.press_back()
                     time.sleep(_rand(profile_delay_min, profile_delay_max))
 
-                # Apply all filters
                 if should_skip(acc, filters, blacklist):
                     self._log(f"⏭️ Skipped (filtered): @{acc['username']}")
                     continue
 
-                # Emit account
                 if self.on_account_found:
                     self.on_account_found(acc)
 
-                # Add to blacklist so it's never scraped again
                 add_to_blacklist(acc["username"])
-
+                # Also add to local blacklist set to prevent re-processing in same loop
+                blacklist.add(uname)
+                
                 collected += 1
 
                 if self.on_progress:
@@ -833,15 +859,9 @@ class InstagramScraper:
                     f"posts={acc.get('post_count', '-')}"
                 )
 
-                # ── Account switch check ───────────────────────────────────
-                # Called after every collected profile. If the threshold is
-                # reached, on_switch_check sets _need_reopen_list = True so
-                # the outer while-loop re-navigates before the next profile.
                 if self.on_switch_check:
                     self.on_switch_check(collected)
-                # ─────────────────────────────────────────────────────────
 
-            # Scroll to reveal more rows (outer loop continues)
             if not self._need_reopen_list:
                 self.scroll_list()
                 time.sleep(_rand(scroll_delay_min, scroll_delay_max))

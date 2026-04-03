@@ -3,6 +3,7 @@ Filter accounts based on configurable rules.
 Supports: keywords, no-bio, private, no-contact, min posts, no profile pic, story detection.
 """
 import re
+from datetime import datetime, timedelta
 from typing import List
 
 
@@ -159,6 +160,67 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
         has_story = account.get("has_story", False)
         if not has_recent and not has_story:
             return True
+
+    # Check for "skip_no_posts_last_n_months"
+    months_threshold = int(filters.get("skip_no_posts_last_n_months", 0))
+    if months_threshold > 0:
+        latest_date_text = account.get("latest_post_date_text", "")
+        if latest_date_text:
+            try:
+                post_date = None
+                now = datetime.now()
+                
+                # Case: Relative dates (e.g., "1 day ago", "2 days ago", "5d", "3h")
+                # 1. "X days/hours/minutes/weeks ago"
+                m_ago = re.search(r"(\d+)\s+(day|hour|minute|week)s?\s+ago", latest_date_text, re.I)
+                if m_ago:
+                    val = int(m_ago.group(1))
+                    unit = m_ago.group(2).lower()
+                    if unit == "day": post_date = now - timedelta(days=val)
+                    elif unit == "hour": post_date = now - timedelta(hours=val)
+                    elif unit == "minute": post_date = now - timedelta(minutes=val)
+                    elif unit == "week": post_date = now - timedelta(weeks=val)
+                
+                # 2. Short forms like "5d", "3h", "1w"
+                if not post_date:
+                    m_short = re.search(r"^(\d+)([dhwm])$", latest_date_text.strip(), re.I)
+                    if m_short:
+                        val = int(m_short.group(1))
+                        unit = m_short.group(2).lower()
+                        if unit == "d": post_date = now - timedelta(days=val)
+                        elif unit == "h": post_date = now - timedelta(hours=val)
+                        elif unit == "m": post_date = now - timedelta(minutes=val)
+                        elif unit == "w": post_date = now - timedelta(weeks=val)
+
+                # 3. Absolute dates: "January 12, 2023" or "12 January 2023" or "January 12"
+                if not post_date:
+                    # Clean the date text: remove dots, extra spaces, and common noise
+                    clean_text = latest_date_text.replace(".", "").strip()
+                    for fmt in ["%B %d, %Y", "%d %B %Y", "%B %d", "%d %B", "%b %d, %Y", "%d %b %Y", "%b %d", "%d %b"]:
+                        try:
+                            post_date = datetime.strptime(clean_text, fmt)
+                            if "%Y" not in fmt:
+                                post_date = post_date.replace(year=now.year)
+                                # If it's a future date, it was likely from last year
+                                if post_date > now:
+                                    post_date = post_date.replace(year=now.year - 1)
+                            break
+                        except ValueError:
+                            continue
+                
+                if post_date:
+                    # Check if post_date is older than months_threshold
+                    threshold_days = int(months_threshold * 30.44)
+                    threshold_date = now - timedelta(days=threshold_days)
+                    
+                    # If post_date is BEFORE threshold_date, it's OLD (skip)
+                    if post_date < threshold_date:
+                        return True
+            except Exception:
+                pass # If parsing fails, don't skip by default
+        elif account.get("post_count", 0) > 0:
+            # If they have posts but we couldn't read the date, we don't skip
+            pass
 
     # Keyword blacklist
     keywords = filters.get("keywords", [])
