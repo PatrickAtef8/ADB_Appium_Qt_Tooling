@@ -613,22 +613,36 @@ class InstagramScraper:
                             ]
                             
                             date_regex = r"(\d+\s+(day|hour|minute|week)s?\s+ago)|(^[A-Z][a-z]+\s+\d+)|(^\d+\s+[A-Z][a-z]+)"
-                            
+                            # Reject anything that looks like an engagement count, not a date
+                            non_date_regex = r"^\s*[\d,\.]+\s*(like|view|comment|share|save)s?\s*$"
+
+                            def _is_valid_date_text(txt: str) -> bool:
+                                """Return True only if txt looks like a date, not a likes/views count."""
+                                if not txt:
+                                    return False
+                                # Reject engagement counts (e.g. "140 likes", "1,234 views")
+                                if re.search(non_date_regex, txt, re.I):
+                                    return False
+                                # Must match the date pattern
+                                return bool(re.search(date_regex, txt, re.I))
+
                             for attempt in range(4):
                                 for d_id in date_ids:
                                     try:
                                         date_el = driver.find_element(AppiumBy.ID, d_id)
                                         txt = date_el.text.strip()
-                                        if txt and re.search(date_regex, txt, re.I):
+                                        if _is_valid_date_text(txt):
                                             date_text = txt
                                             break
+                                        elif txt:
+                                            self._log(f"⚠️ Skipping non-date text from ID '{d_id}': '{txt}'")
                                     except: continue
                                 if date_text: break
                                 
                                 all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
                                 for tv in reversed(all_tvs):
                                     txt = tv.text.strip()
-                                    if re.search(date_regex, txt, re.I):
+                                    if _is_valid_date_text(txt):
                                         date_text = txt
                                         break
                                 if date_text: break

@@ -1,5 +1,4 @@
 {
-  "sheet_id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
   "sheet_tab": "Sheet1",
   "credentials_path": "assets/credentials.json",
   "webhook_url": "",
@@ -38,7 +37,7 @@
   },
   "devices": [
     {
-      "serial": "emulator-5554"
+      "serial": null
     },
     {
       "serial": null
@@ -50,15 +49,12 @@
   "target_list": [],
   "blacklist": [],
   "last_target": "",
-  "last_mode": "following",
-  "last_count": 5,
+  "last_mode": "followers",
+  "last_count": 100,
   "last_device": "",
   "targets_per_phone": [
-    [
-      "hollywoodreporter"
-    ],
+    [],
     [],
     []
-  ],
-  "mirror_width": 500
+  ]
 }

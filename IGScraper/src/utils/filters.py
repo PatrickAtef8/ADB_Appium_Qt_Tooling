@@ -18,24 +18,274 @@ PHONE_RE = re.compile(
     r"(?:\+?[\d\s\-\(\)]{7,20})",
 )
 
-# Country-code prefixes (international dialing codes → ISO 2-letter)
+# ── NANP (+1) area code disambiguation ───────────────────────────────────────
+# The NANP (North American Numbering Plan) shares +1 between the US, Canada,
+# and many Caribbean nations.  We must inspect the 3-digit area code to
+# tell them apart.  Any +1 NXX not listed below defaults to US.
+
+# Canadian area codes (all confirmed active or reserved as of 2025)
+_CA_AREA_CODES = {
+    "204", "226", "236", "249", "250", "289", "306", "343", "365", "367",
+    "368", "382", "387", "403", "416", "418", "428", "431", "437", "438",
+    "450", "468", "474", "506", "514", "519", "548", "579", "581", "584",
+    "587", "600", "604", "613", "621", "639", "647", "672", "683", "705",
+    "709", "742", "753", "778", "780", "782", "807", "819", "825", "867",
+    "873", "879", "902", "905",
+}
+
+# Caribbean / NANP island area codes -> ISO country code
+_CARIBBEAN_AREA_CODES = {
+    "242": "BS",  # Bahamas
+    "246": "BB",  # Barbados
+    "264": "AI",  # Anguilla
+    "268": "AG",  # Antigua & Barbuda
+    "284": "VG",  # British Virgin Islands
+    "340": "VI",  # US Virgin Islands
+    "345": "KY",  # Cayman Islands
+    "441": "BM",  # Bermuda
+    "473": "GD",  # Grenada
+    "649": "TC",  # Turks & Caicos
+    "664": "MS",  # Montserrat
+    "671": "GU",  # Guam
+    "684": "AS",  # American Samoa
+    "721": "SX",  # Sint Maarten
+    "758": "LC",  # St. Lucia
+    "767": "DM",  # Dominica
+    "784": "VC",  # St. Vincent & the Grenadines
+    "787": "PR",  # Puerto Rico
+    "809": "DO",  # Dominican Republic
+    "829": "DO",  # Dominican Republic
+    "849": "DO",  # Dominican Republic
+    "868": "TT",  # Trinidad & Tobago
+    "869": "KN",  # St. Kitts & Nevis
+    "876": "JM",  # Jamaica
+    "939": "PR",  # Puerto Rico
+}
+
+
+def _resolve_nanp(digits: str) -> str:
+    """
+    Given digits starting with '1' (NANP country code), return the correct
+    ISO 2-letter country code by inspecting the 3-digit area code.
+    digits must already be stripped of leading '+' or '00'.
+    """
+    if len(digits) < 4:
+        return "US"
+    area = digits[1:4]
+    if area in _CA_AREA_CODES:
+        return "CA"
+    if area in _CARIBBEAN_AREA_CODES:
+        return _CARIBBEAN_AREA_CODES[area]
+    return "US"
+
+
+# ── Country-code prefix table ─────────────────────────────────────────────────
+# Checked longest-match first (3 digits -> 2 digits -> 1 digit).
+# "1" (NANP) is intentionally absent — handled by _resolve_nanp() above.
 COUNTRY_PHONE_PREFIXES = {
-    "1": "US", "44": "GB", "49": "DE", "33": "FR", "39": "IT",
-    "34": "ES", "7": "RU", "81": "JP", "86": "CN", "91": "IN",
-    "55": "BR", "52": "MX", "61": "AU", "64": "NZ", "27": "ZA",
-    "20": "EG", "966": "SA", "971": "AE", "962": "JO", "965": "KW",
-    "974": "QA", "973": "BH", "968": "OM", "212": "MA", "213": "DZ",
-    "216": "TN", "218": "LY", "249": "SD", "251": "ET", "234": "NG",
-    "254": "KE", "255": "TZ", "256": "UG", "263": "ZW", "260": "ZM",
-    "82": "KR", "66": "TH", "62": "ID", "60": "MY", "63": "PH",
-    "84": "VN", "65": "SG", "92": "PK", "880": "BD", "94": "LK",
-    "98": "IR", "90": "TR", "972": "IL", "30": "GR", "48": "PL",
-    "31": "NL", "32": "BE", "41": "CH", "43": "AT", "46": "SE",
-    "47": "NO", "45": "DK", "358": "FI", "351": "PT", "353": "IE",
-    "420": "CZ", "36": "HU", "40": "RO", "380": "UA", "375": "BY",
-    "371": "LV", "370": "LT", "372": "EE", "54": "AR", "56": "CL",
-    "57": "CO", "51": "PE", "58": "VE", "593": "EC", "595": "PY",
-    "598": "UY", "591": "BO",
+    # ── 3-digit prefixes ────────────────────────────────────────────────────
+    # Middle East
+    "961": "LB",  # Lebanon
+    "962": "JO",  # Jordan
+    "963": "SY",  # Syria
+    "964": "IQ",  # Iraq
+    "965": "KW",  # Kuwait
+    "966": "SA",  # Saudi Arabia
+    "967": "YE",  # Yemen
+    "968": "OM",  # Oman
+    "970": "PS",  # Palestine
+    "971": "AE",  # UAE
+    "972": "IL",  # Israel
+    "973": "BH",  # Bahrain
+    "974": "QA",  # Qatar
+    "975": "BT",  # Bhutan
+    "976": "MN",  # Mongolia
+    "977": "NP",  # Nepal
+    "960": "MV",  # Maldives
+    # Africa
+    "212": "MA",  # Morocco
+    "213": "DZ",  # Algeria
+    "216": "TN",  # Tunisia
+    "218": "LY",  # Libya
+    "220": "GM",  # Gambia
+    "221": "SN",  # Senegal
+    "222": "MR",  # Mauritania
+    "223": "ML",  # Mali
+    "224": "GN",  # Guinea
+    "225": "CI",  # Côte d'Ivoire
+    "226": "BF",  # Burkina Faso
+    "227": "NE",  # Niger
+    "228": "TG",  # Togo
+    "229": "BJ",  # Benin
+    "230": "MU",  # Mauritius
+    "231": "LR",  # Liberia
+    "232": "SL",  # Sierra Leone
+    "233": "GH",  # Ghana
+    "234": "NG",  # Nigeria
+    "235": "TD",  # Chad
+    "236": "CF",  # Central African Republic
+    "237": "CM",  # Cameroon
+    "238": "CV",  # Cape Verde
+    "239": "ST",  # São Tomé & Príncipe
+    "240": "GQ",  # Equatorial Guinea
+    "241": "GA",  # Gabon
+    "242": "CG",  # Republic of Congo
+    "243": "CD",  # DR Congo
+    "244": "AO",  # Angola
+    "245": "GW",  # Guinea-Bissau
+    "248": "SC",  # Seychelles
+    "249": "SD",  # Sudan
+    "250": "RW",  # Rwanda
+    "251": "ET",  # Ethiopia
+    "252": "SO",  # Somalia
+    "253": "DJ",  # Djibouti
+    "254": "KE",  # Kenya
+    "255": "TZ",  # Tanzania
+    "256": "UG",  # Uganda
+    "257": "BI",  # Burundi
+    "258": "MZ",  # Mozambique
+    "260": "ZM",  # Zambia
+    "261": "MG",  # Madagascar
+    "262": "RE",  # Réunion
+    "263": "ZW",  # Zimbabwe
+    "264": "NA",  # Namibia
+    "265": "MW",  # Malawi
+    "266": "LS",  # Lesotho
+    "267": "BW",  # Botswana
+    "268": "SZ",  # Eswatini
+    "269": "KM",  # Comoros
+    "291": "ER",  # Eritrea
+    # South/Southeast Asia
+    "850": "KP",  # North Korea
+    "853": "MO",  # Macau
+    "855": "KH",  # Cambodia
+    "856": "LA",  # Laos
+    "880": "BD",  # Bangladesh
+    "886": "TW",  # Taiwan
+    # Central Asia / Caucasus
+    "992": "TJ",  # Tajikistan
+    "993": "TM",  # Turkmenistan
+    "994": "AZ",  # Azerbaijan
+    "995": "GE",  # Georgia
+    "996": "KG",  # Kyrgyzstan
+    "998": "UZ",  # Uzbekistan
+    # Europe (3-digit)
+    "350": "GI",  # Gibraltar
+    "351": "PT",  # Portugal
+    "352": "LU",  # Luxembourg
+    "353": "IE",  # Ireland
+    "354": "IS",  # Iceland
+    "355": "AL",  # Albania
+    "356": "MT",  # Malta
+    "357": "CY",  # Cyprus
+    "358": "FI",  # Finland
+    "359": "BG",  # Bulgaria
+    "370": "LT",  # Lithuania
+    "371": "LV",  # Latvia
+    "372": "EE",  # Estonia
+    "373": "MD",  # Moldova
+    "374": "AM",  # Armenia
+    "375": "BY",  # Belarus
+    "376": "AD",  # Andorra
+    "377": "MC",  # Monaco
+    "378": "SM",  # San Marino
+    "380": "UA",  # Ukraine
+    "381": "RS",  # Serbia
+    "382": "ME",  # Montenegro
+    "383": "XK",  # Kosovo
+    "385": "HR",  # Croatia
+    "386": "SI",  # Slovenia
+    "387": "BA",  # Bosnia & Herzegovina
+    "389": "MK",  # North Macedonia
+    "420": "CZ",  # Czech Republic
+    "421": "SK",  # Slovakia
+    "423": "LI",  # Liechtenstein
+    # Latin America (3-digit)
+    "502": "GT",  # Guatemala
+    "503": "SV",  # El Salvador
+    "504": "HN",  # Honduras
+    "505": "NI",  # Nicaragua
+    "506": "CR",  # Costa Rica
+    "507": "PA",  # Panama
+    "509": "HT",  # Haiti
+    "590": "GP",  # Guadeloupe
+    "591": "BO",  # Bolivia
+    "592": "GY",  # Guyana
+    "593": "EC",  # Ecuador
+    "594": "GF",  # French Guiana
+    "595": "PY",  # Paraguay
+    "596": "MQ",  # Martinique
+    "597": "SR",  # Suriname
+    "598": "UY",  # Uruguay
+    "599": "CW",  # Curaçao
+    # Pacific
+    "670": "TL",  # Timor-Leste
+    "673": "BN",  # Brunei
+    "674": "NR",  # Nauru
+    "675": "PG",  # Papua New Guinea
+    "676": "TO",  # Tonga
+    "677": "SB",  # Solomon Islands
+    "678": "VU",  # Vanuatu
+    "679": "FJ",  # Fiji
+    "680": "PW",  # Palau
+    "681": "WF",  # Wallis & Futuna
+    "682": "CK",  # Cook Islands
+    "683": "NU",  # Niue
+    "685": "WS",  # Samoa
+    "686": "KI",  # Kiribati
+    "687": "NC",  # New Caledonia
+    "688": "TV",  # Tuvalu
+    "689": "PF",  # French Polynesia
+    "691": "FM",  # Micronesia
+    "692": "MH",  # Marshall Islands
+    # ── 2-digit prefixes ────────────────────────────────────────────────────
+    "20": "EG",   # Egypt
+    "27": "ZA",   # South Africa
+    "30": "GR",   # Greece
+    "31": "NL",   # Netherlands
+    "32": "BE",   # Belgium
+    "33": "FR",   # France
+    "34": "ES",   # Spain
+    "36": "HU",   # Hungary
+    "39": "IT",   # Italy
+    "40": "RO",   # Romania
+    "41": "CH",   # Switzerland
+    "43": "AT",   # Austria
+    "44": "GB",   # United Kingdom
+    "45": "DK",   # Denmark
+    "46": "SE",   # Sweden
+    "47": "NO",   # Norway
+    "48": "PL",   # Poland
+    "49": "DE",   # Germany
+    "51": "PE",   # Peru
+    "52": "MX",   # Mexico
+    "53": "CU",   # Cuba
+    "54": "AR",   # Argentina
+    "55": "BR",   # Brazil
+    "56": "CL",   # Chile
+    "57": "CO",   # Colombia
+    "58": "VE",   # Venezuela
+    "60": "MY",   # Malaysia
+    "61": "AU",   # Australia
+    "62": "ID",   # Indonesia
+    "63": "PH",   # Philippines
+    "64": "NZ",   # New Zealand
+    "65": "SG",   # Singapore
+    "66": "TH",   # Thailand
+    "81": "JP",   # Japan
+    "82": "KR",   # South Korea
+    "84": "VN",   # Vietnam
+    "86": "CN",   # China
+    "90": "TR",   # Turkey
+    "91": "IN",   # India
+    "92": "PK",   # Pakistan
+    "93": "AF",   # Afghanistan
+    "94": "LK",   # Sri Lanka
+    "95": "MM",   # Myanmar
+    "98": "IR",   # Iran
+    # ── 1-digit prefix ──────────────────────────────────────────────────────
+    # NOTE: "1" (NANP) is NOT here — handled by _resolve_nanp() above
+    "7": "RU",    # Russia (also covers Kazakhstan 76x/77x; defaults to RU)
 }
 
 
@@ -51,7 +301,6 @@ def extract_phone(text: str) -> str:
     """Extract first phone-like number from text."""
     if not text:
         return ""
-    # Look for numbers with country code prefix or local format
     matches = PHONE_RE.findall(text)
     for m in matches:
         cleaned = re.sub(r"[\s\-\(\)]", "", m)
@@ -64,42 +313,159 @@ def infer_country_code(phone: str, location_text: str = "") -> str:
     """
     Try to infer 2-letter country code from phone prefix or location text.
     Returns empty string if cannot infer.
+
+    Key fix: +1 numbers (NANP) are disambiguated by area code so that
+    Canadian numbers (e.g. +1-647-...) are correctly identified as CA,
+    Caribbean island numbers map to their specific country, and everything
+    else defaults to US.
     """
     if phone:
         cleaned = re.sub(r"[^\d]", "", phone)
         if cleaned.startswith("00"):
             cleaned = cleaned[2:]
-        elif cleaned.startswith("+"):
-            cleaned = cleaned[1:]
-        # Try longest prefix first (3 digits, then 2, then 1)
+
+        # ── NANP special case ────────────────────────────────────────────────
+        if cleaned.startswith("1") and len(cleaned) >= 4:
+            return _resolve_nanp(cleaned)
+
+        # ── General longest-prefix match (3 -> 2 -> 1 digits) ───────────────
         for length in (3, 2, 1):
             prefix = cleaned[:length]
             if prefix in COUNTRY_PHONE_PREFIXES:
                 return COUNTRY_PHONE_PREFIXES[prefix]
 
-    # Simple keyword match on location text
+    # ── Location text keyword fallback ───────────────────────────────────────
     COUNTRY_KEYWORDS = {
-        "united states": "US", "usa": "US", "u.s.a": "US",
+        # North America
+        "united states": "US", "usa": "US", "u.s.a": "US", "u.s.": "US",
+        "canada": "CA",
+        "mexico": "MX", "méxico": "MX",
+        # Europe
         "united kingdom": "GB", "uk": "GB", "england": "GB",
+        "scotland": "GB", "wales": "GB", "northern ireland": "GB",
         "germany": "DE", "deutschland": "DE",
-        "france": "FR", "spain": "ES", "italy": "IT",
-        "russia": "RU", "japan": "JP", "china": "CN", "india": "IN",
-        "brazil": "BR", "mexico": "MX", "australia": "AU",
-        "canada": "CA", "egypt": "EG", "saudi": "SA",
-        "uae": "AE", "emirates": "AE", "dubai": "AE",
-        "jordan": "JO", "kuwait": "KW", "qatar": "QA",
-        "morocco": "MA", "algeria": "DZ", "tunisia": "TN",
-        "nigeria": "NG", "south africa": "ZA", "kenya": "KE",
-        "korea": "KR", "thailand": "TH", "indonesia": "ID",
-        "malaysia": "MY", "philippines": "PH", "vietnam": "VN",
-        "singapore": "SG", "pakistan": "PK", "bangladesh": "BD",
-        "iran": "IR", "turkey": "TR", "israel": "IL",
-        "greece": "GR", "poland": "PL", "netherlands": "NL",
-        "belgium": "BE", "switzerland": "CH", "austria": "AT",
-        "sweden": "SE", "norway": "NO", "denmark": "DK",
-        "finland": "FI", "portugal": "PT", "ireland": "IE",
-        "argentina": "AR", "chile": "CL", "colombia": "CO",
-        "peru": "PE", "venezuela": "VE",
+        "france": "FR",
+        "spain": "ES", "españa": "ES",
+        "italy": "IT", "italia": "IT",
+        "portugal": "PT",
+        "netherlands": "NL", "holland": "NL",
+        "belgium": "BE", "belgique": "BE",
+        "switzerland": "CH", "suisse": "CH",
+        "austria": "AT", "österreich": "AT",
+        "sweden": "SE", "sverige": "SE",
+        "norway": "NO", "norge": "NO",
+        "denmark": "DK", "danmark": "DK",
+        "finland": "FI", "suomi": "FI",
+        "poland": "PL", "polska": "PL",
+        "czech": "CZ", "czechia": "CZ",
+        "slovakia": "SK",
+        "hungary": "HU",
+        "romania": "RO",
+        "bulgaria": "BG",
+        "greece": "GR",
+        "croatia": "HR",
+        "serbia": "RS",
+        "ukraine": "UA",
+        "russia": "RU",
+        "luxembourg": "LU",
+        "malta": "MT",
+        "cyprus": "CY",
+        "iceland": "IS",
+        "albania": "AL",
+        "moldova": "MD",
+        "belarus": "BY",
+        "latvia": "LV",
+        "lithuania": "LT",
+        "estonia": "EE",
+        "ireland": "IE",
+        # Middle East
+        "saudi": "SA", "saudi arabia": "SA", "ksa": "SA",
+        "uae": "AE", "emirates": "AE", "dubai": "AE", "abu dhabi": "AE",
+        "jordan": "JO",
+        "kuwait": "KW",
+        "qatar": "QA",
+        "bahrain": "BH",
+        "oman": "OM",
+        "yemen": "YE",
+        "iraq": "IQ",
+        "iran": "IR",
+        "syria": "SY",
+        "lebanon": "LB",
+        "israel": "IL",
+        "palestine": "PS",
+        # Africa
+        "egypt": "EG",
+        "morocco": "MA",
+        "algeria": "DZ",
+        "tunisia": "TN",
+        "libya": "LY",
+        "sudan": "SD",
+        "nigeria": "NG",
+        "kenya": "KE",
+        "ghana": "GH",
+        "south africa": "ZA",
+        "ethiopia": "ET",
+        "tanzania": "TZ",
+        "uganda": "UG",
+        "senegal": "SN",
+        "cameroon": "CM",
+        "angola": "AO",
+        "mozambique": "MZ",
+        "zimbabwe": "ZW",
+        # Asia
+        "india": "IN",
+        "china": "CN",
+        "japan": "JP",
+        "south korea": "KR", "korea": "KR",
+        "indonesia": "ID",
+        "malaysia": "MY",
+        "philippines": "PH",
+        "vietnam": "VN",
+        "thailand": "TH",
+        "singapore": "SG",
+        "pakistan": "PK",
+        "bangladesh": "BD",
+        "sri lanka": "LK",
+        "nepal": "NP",
+        "myanmar": "MM", "burma": "MM",
+        "cambodia": "KH",
+        "taiwan": "TW",
+        "hong kong": "HK",
+        "turkey": "TR", "türkiye": "TR",
+        "afghanistan": "AF",
+        "uzbekistan": "UZ",
+        "kazakhstan": "KZ",
+        "azerbaijan": "AZ",
+        "georgia": "GE",
+        "armenia": "AM",
+        # Oceania
+        "australia": "AU",
+        "new zealand": "NZ",
+        "fiji": "FJ",
+        "papua new guinea": "PG",
+        # Latin America
+        "brazil": "BR", "brasil": "BR",
+        "argentina": "AR",
+        "chile": "CL",
+        "colombia": "CO",
+        "peru": "PE",
+        "venezuela": "VE",
+        "ecuador": "EC",
+        "bolivia": "BO",
+        "paraguay": "PY",
+        "uruguay": "UY",
+        "cuba": "CU",
+        "haiti": "HT",
+        "dominican republic": "DO",
+        "puerto rico": "PR",
+        "jamaica": "JM",
+        "trinidad": "TT",
+        "costa rica": "CR",
+        "panama": "PA",
+        "guatemala": "GT",
+        "honduras": "HN",
+        "el salvador": "SV",
+        "nicaragua": "NI",
     }
     loc_lower = location_text.lower()
     for keyword, code in COUNTRY_KEYWORDS.items():
@@ -169,9 +535,7 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
             try:
                 post_date = None
                 now = datetime.now()
-                
-                # Case: Relative dates (e.g., "1 day ago", "2 days ago", "5d", "3h")
-                # 1. "X days/hours/minutes/weeks ago"
+
                 m_ago = re.search(r"(\d+)\s+(day|hour|minute|week)s?\s+ago", latest_date_text, re.I)
                 if m_ago:
                     val = int(m_ago.group(1))
@@ -180,8 +544,7 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
                     elif unit == "hour": post_date = now - timedelta(hours=val)
                     elif unit == "minute": post_date = now - timedelta(minutes=val)
                     elif unit == "week": post_date = now - timedelta(weeks=val)
-                
-                # 2. Short forms like "5d", "3h", "1w"
+
                 if not post_date:
                     m_short = re.search(r"^(\d+)([dhwm])$", latest_date_text.strip(), re.I)
                     if m_short:
@@ -192,34 +555,28 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
                         elif unit == "m": post_date = now - timedelta(minutes=val)
                         elif unit == "w": post_date = now - timedelta(weeks=val)
 
-                # 3. Absolute dates: "January 12, 2023" or "12 January 2023" or "January 12"
                 if not post_date:
-                    # Clean the date text: remove dots, extra spaces, and common noise
                     clean_text = latest_date_text.replace(".", "").strip()
-                    for fmt in ["%B %d, %Y", "%d %B %Y", "%B %d", "%d %B", "%b %d, %Y", "%d %b %Y", "%b %d", "%d %b"]:
+                    for fmt in ["%B %d, %Y", "%d %B %Y", "%B %d", "%d %B",
+                                "%b %d, %Y", "%d %b %Y", "%b %d", "%d %b"]:
                         try:
                             post_date = datetime.strptime(clean_text, fmt)
                             if "%Y" not in fmt:
                                 post_date = post_date.replace(year=now.year)
-                                # If it's a future date, it was likely from last year
                                 if post_date > now:
                                     post_date = post_date.replace(year=now.year - 1)
                             break
                         except ValueError:
                             continue
-                
+
                 if post_date:
-                    # Check if post_date is older than months_threshold
                     threshold_days = int(months_threshold * 30.44)
                     threshold_date = now - timedelta(days=threshold_days)
-                    
-                    # If post_date is BEFORE threshold_date, it's OLD (skip)
                     if post_date < threshold_date:
                         return True
             except Exception:
-                pass # If parsing fails, don't skip by default
+                pass
         elif account.get("post_count", 0) > 0:
-            # If they have posts but we couldn't read the date, we don't skip
             pass
 
     # Keyword blacklist
