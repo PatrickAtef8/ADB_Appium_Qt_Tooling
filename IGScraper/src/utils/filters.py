@@ -458,7 +458,9 @@ def infer_country_code(phone: str, location_text: str = "") -> str:
     if location_text:
         loc_lower = location_text.lower()
         for keyword, code in COUNTRY_KEYWORDS.items():
-            if keyword in loc_lower:
+            # Use word-boundary match to avoid false hits like
+            # "iran" inside "Almirante" or "ir" inside "Madrid"
+            if re.search(r"\b" + re.escape(keyword) + r"\b", loc_lower):
                 return code
 
     # ── 2. Phone prefix fallback (only when location gave nothing) ────────────

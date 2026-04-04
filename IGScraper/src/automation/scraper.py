@@ -612,7 +612,7 @@ class InstagramScraper:
                         if candidate and not _URL_RE.search(candidate) and not _EMAIL_RE.search(candidate):
                             pin_lines.append(candidate)
                 if pin_lines:
-                    details["location"] = ", ".join(pin_lines)
+                    details["location"] = "\n".join(pin_lines)
 
             try:
                 contact_btn = driver.find_element(
