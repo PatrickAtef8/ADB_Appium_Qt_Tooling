@@ -444,6 +444,11 @@ class PhoneWorker(QThread):
                 self._log("🔗 Reconnecting Appium session after switch…")
                 self._controller.reattach_after_adb()
 
+                # ── Human warm-up scroll (2-5 min on home feed) ──────────────
+                # Makes the new session look organic before jumping into scraping.
+                if self._scraper and not self._stop_flag:
+                    self._scraper._human_warmup_scroll(120, 300)
+
                 if success:
                     acc_idx         = next_idx
                     current_account = target_account
@@ -846,7 +851,7 @@ class FiltersPage(PageWidget):
         for c in [self.chk_skip_no_bio, self.chk_skip_private,
                   self.chk_skip_no_pic, self.chk_skip_no_contact]:
             c.setFont(T.body()); c.setStyleSheet("background: transparent;")
-        self.chk_skip_no_contact.setChecked(True)
+        self.chk_skip_no_contact.setChecked(False)
         col1.addWidget(self.chk_skip_no_bio); col1.addWidget(self.chk_skip_private)
         col2.addWidget(self.chk_skip_no_pic); col2.addWidget(self.chk_skip_no_contact)
         conditions_grid.addLayout(col1); conditions_grid.addLayout(col2)
@@ -1151,8 +1156,8 @@ class SettingsPage(PageWidget):
             dl_lay.addLayout(r)
             setattr(self, attr_min, wmin); setattr(self, attr_max, wmax)
 
-        add_delay("Between profiles (s):", "sp_prof_min", "sp_prof_max", 1.0, 30.0)
-        add_delay("Between scrolls (s):",  "sp_scrl_min", "sp_scrl_max", 0.5, 15.0)
+        add_delay("Between profiles (s):", "sp_prof_min", "sp_prof_max", 1.0, 300.0)
+        add_delay("Between scrolls (s):",  "sp_scrl_min", "sp_scrl_max", 0.5, 300.0)
         add_delay("Rest between runs (m):", "sp_rest_min", "sp_rest_max", 1, 1440, True)
 
         # ── Account switch mode ───────────────────────────────────────────
@@ -2092,7 +2097,7 @@ class MainWindow(FluentWindow):
         fp.chk_skip_no_bio.setChecked(f.get("skip_no_bio", False))
         fp.chk_skip_private.setChecked(f.get("skip_private", False))
         fp.chk_skip_no_pic.setChecked(f.get("skip_no_profile_pic", False))
-        fp.chk_skip_no_contact.setChecked(f.get("skip_no_contact", True))
+        fp.chk_skip_no_contact.setChecked(f.get("skip_no_contact", False))
         fp.spin_min_posts.setValue(int(f.get("min_posts", 0)))
         fp.chk_enable_post_spin.setChecked(f.get("enable_post_spin", False))
         fp.spin_skip_months.setValue(int(f.get("skip_no_posts_last_n_months", 1)))

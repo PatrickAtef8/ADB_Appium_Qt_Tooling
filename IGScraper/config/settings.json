@@ -1,4 +1,5 @@
 {
+  "sheet_id": "",
   "sheet_tab": "Sheet1",
   "credentials_path": "assets/credentials.json",
   "webhook_url": "",
@@ -8,7 +9,7 @@
     "skip_no_profile_pic": false,
     "skip_no_contact": false,
     "min_posts": 0,
-    "enable_post_spin": true,
+    "enable_post_spin": false,
     "skip_no_posts_last_n_months": 1,
     "keywords": [],
     "only_keywords": []
@@ -20,7 +21,7 @@
     "between_scrolls_max": 3.0,
     "rest_min_minutes": 1,
     "rest_max_minutes": 2,
-    "session_break_every": 5,
+    "session_break_every": 1,
     "switch_mode": "hours",
     "switch_hours": 1
   },
@@ -50,11 +51,12 @@
   "blacklist": [],
   "last_target": "",
   "last_mode": "followers",
-  "last_count": 100,
+  "last_count": 5,
   "last_device": "",
   "targets_per_phone": [
     [],
     [],
     []
-  ]
+  ],
+  "mirror_width": 500
 }

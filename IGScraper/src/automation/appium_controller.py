@@ -25,8 +25,9 @@ _WINDOWS_NO_WINDOW: dict = (
 def _run_hidden(*args, **kwargs):
     """subprocess.run() wrapper that hides console windows on Windows."""
     kwargs.update(_WINDOWS_NO_WINDOW)
-    # Force UTF-8 encoding so Windows cp1252 charmap never causes a crash
-    if kwargs.get("text") or kwargs.get("capture_output"):
+    # Force UTF-8 encoding so Windows cp1252 charmap never causes a crash.
+    # Guard: skip if text=False was explicitly set (binary mode, e.g. screencap).
+    if kwargs.get("text") or (kwargs.get("capture_output") and kwargs.get("text") is not False):
         kwargs.setdefault("encoding", "utf-8")
         kwargs.setdefault("errors", "replace")
     # ── FIX: on Windows, subprocess children spawned with CREATE_NO_WINDOW
@@ -536,10 +537,10 @@ def switch_instagram_account(
     Step 4  Wait and verify Instagram is still running.
     """
     def _log(msg):
-        print(f"[switch] {msg}", flush=True)
+        print(f"[Account Switch] {msg}", flush=True)
 
     try:
-        _log(f"START: {current_account} -> {account_name}")
+        _log(f"Switching from @{current_account} to @{account_name}...")
 
         # ── Step 0: dismiss list, reach own profile page ───────────────────
         #
@@ -554,7 +555,7 @@ def switch_instagram_account(
         #
         # Phase B — Only after the list is confirmed absent (and a settle wait
         #           has passed), look for the chevron or the Profile tab and tap.
-        _log("Step 0: Phase A — dismissing list sheet with Back presses...")
+        _log("Closing open screens...")
         step0_ok = False
 
         LIST_IDS = (
@@ -578,17 +579,17 @@ def switch_instagram_account(
                 time.sleep(0.8)
                 xml2 = _dump_ui(serial)
                 if not _has_list(xml2):
-                    _log(f"  Phase A done after {attempt} back-press(es) — list confirmed gone")
+                    
                     break
                 # List reappeared in the second dump — treat as still present
-                _log(f"  Phase A [{attempt}] list found in re-check — pressing Back")
+                
                 _run_hidden(
                     ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                     capture_output=True, text=True, timeout=5
                 )
                 time.sleep(2.0)
                 continue
-            _log(f"  Phase A [{attempt}] list still present — pressing Back")
+            
             _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
@@ -598,7 +599,7 @@ def switch_instagram_account(
             time.sleep(2.0)
         else:
             # After 10 back presses the list is still there — bail out
-            _log("Step 0 Phase A FAILED: list never dismissed")
+            _log("⚠️ Could not dismiss the current screen")
             return False
 
         # Extra settle: give Instagram time to finish rendering the destination
@@ -606,13 +607,13 @@ def switch_instagram_account(
         time.sleep(1.5)
 
         # Phase B: now safely navigate to own profile page (no list on screen)
-        _log("Step 0: Phase B — navigating to own profile page...")
+        _log("Navigating to profile page...")
         for attempt in range(8):
             xml = _dump_ui(serial)
 
             # Safety: if the list somehow reappeared, go back to Phase A logic
             if _has_list(xml):
-                _log(f"  Phase B [{attempt}] list reappeared — pressing Back again")
+                
                 _run_hidden(
                     ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                     capture_output=True, text=True, timeout=5
@@ -623,7 +624,7 @@ def switch_instagram_account(
             has_chevron = 'id/action_bar_title_chevron' in xml
 
             if has_chevron:
-                _log("  Phase B -> chevron visible. Own profile confirmed.")
+                
                 step0_ok = True
                 break
 
@@ -631,13 +632,13 @@ def switch_instagram_account(
             profile_tab = _find_nav_profile_tab(xml)
 
             if profile_tab:
-                _log(f"  Phase B [{attempt}] -> tapping Profile tab at {profile_tab}")
+                
                 _tap_bounds(serial, *profile_tab)
                 # Wait for profile page + chevron to render
                 time.sleep(3.0)
                 xml2 = _dump_ui(serial)
                 if 'id/action_bar_title_chevron' in xml2 and not _has_list(xml2):
-                    _log("  Phase B -> chevron confirmed after Profile tab tap")
+                    
                     step0_ok = True
                     break
                 # Chevron not there yet — loop again (don't tap Profile tab twice)
@@ -654,7 +655,7 @@ def switch_instagram_account(
                 capture_output=True, text=True, timeout=10
             ).stdout
             if INSTAGRAM_PACKAGE not in top_check:
-                _log(f"  Phase B [{attempt}] Instagram left foreground — re-launching main activity")
+                _log("⚠️ Instagram went to background — relaunching...")
                 _run_hidden(
                     [
                         "adb", "-s", serial, "shell", "am", "start",
@@ -667,7 +668,7 @@ def switch_instagram_account(
                 continue
 
             # Neither chevron nor Profile tab visible — we may be on a sub-screen
-            _log(f"  Phase B [{attempt}] -> no chevron or Profile tab — pressing Back")
+            
             _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
@@ -675,46 +676,46 @@ def switch_instagram_account(
             time.sleep(2.0)
 
         if not step0_ok:
-            _log("Step 0 FAILED")
+            _log("❌ Could not reach profile page")
             return False
 
         # ── Step 1: open switcher if not already open ──────────────────────
-        _log("Step 1: checking if switcher already open...")
+        _log("Opening account switcher...")
         xml = _dump_ui(serial)
         switcher_open = 'id/row_user_textview' in xml
 
         if switcher_open:
-            _log("  -> switcher already open, skipping chevron tap")
+            
             switcher_xml = xml
         else:
-            _log("  -> tapping chevron to open switcher")
+            
             chevron_bounds = _find_bounds(xml,
                 r'resource-id="com\.instagram\.android:id/action_bar_title_chevron"'
                 r'[^>]*bounds="(\[\d+,\d+\]\[\d+,\d+\])"'
             )
-            _log(f"  chevron_bounds={chevron_bounds}")
+            
             if not chevron_bounds:
-                _log("Step 1 FAILED: chevron not found in XML")
-                _log(f"  XML[:400]={xml[:400]}")
+                _log("❌ Account switcher button not found")
+                
                 return False
 
             _tap_bounds(serial, *chevron_bounds)
             time.sleep(2.5)
 
             # ── Step 2: wait for switcher rows ─────────────────────────────
-            _log("Step 2: waiting for switcher rows...")
+            
             switcher_xml = None
             for i in range(8):
                 xml = _dump_ui(serial)
                 if 'id/row_user_textview' in xml:
                     switcher_xml = xml
-                    _log(f"  -> switcher appeared on poll {i}")
+                    
                     break
-                _log(f"  poll {i}: no switcher yet")
+                
                 time.sleep(1)
 
             if not switcher_xml:
-                _log("Step 2 FAILED: switcher never appeared")
+                _log("❌ Account list did not appear")
                 _run_hidden(
                     ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                     capture_output=True, text=True, timeout=5
@@ -722,13 +723,13 @@ def switch_instagram_account(
                 return False
 
         # ── Step 3: parse rows and tap target ──────────────────────────────
-        _log("Step 3: parsing switcher rows...")
+        
         rows = _parse_switcher_rows(switcher_xml)
-        _log(f"  rows: {[(name, x, y) for name, x, y in rows]}")
+        
 
         if not rows:
-            _log("Step 3 FAILED: no rows parsed")
-            _log(f"  XML snippet: {switcher_xml[switcher_xml.find('row_user_textview')-200:switcher_xml.find('row_user_textview')+200]}")
+            _log("❌ Could not read account list")
+            
             _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
@@ -741,7 +742,7 @@ def switch_instagram_account(
         # Exact name match first
         for name, tx, ty in rows:
             if current_lower and name.lower() == current_lower:
-                _log(f"  skipping current: {name}")
+                
                 continue
             if name.lower() == account_name.lower():
                 target = (name, tx, ty)
@@ -756,7 +757,7 @@ def switch_instagram_account(
                 break
 
         if target is None:
-            _log("Step 3 FAILED: no target row found")
+            _log(f"❌ Account @{account_name} not found in switcher")
             _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
@@ -764,7 +765,7 @@ def switch_instagram_account(
             return False
 
         t_name, t_x, t_y = target
-        _log(f"  tapping '{t_name}' at ({t_x},{t_y})")
+        _log(f"Tapping @{t_name}...")
         _run_hidden(
             ["adb", "-s", serial, "shell", "input", "tap", str(t_x), str(t_y)],
             capture_output=True, text=True, timeout=5
@@ -772,10 +773,10 @@ def switch_instagram_account(
 
         # ── Step 4: wait for switch to complete ────────────────────────────
         time.sleep(7)
-        _log("Step 4: verifying...")
+        _log("Verifying switch...")
         xml = _dump_ui(serial)
         if "unexpected error" in xml.lower():
-            _log("  FAILED: unexpected error on screen")
+            _log("⚠️ Unexpected screen appeared after switch")
             _run_hidden(
                 ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
                 capture_output=True, text=True, timeout=5
@@ -788,18 +789,18 @@ def switch_instagram_account(
             capture_output=True, text=True, timeout=10
         ).stdout
         ok = INSTAGRAM_PACKAGE in top
-        _log(f"  ig_running={ok}")
+        
 
         # Extra confirmation: check active account name appears in XML
         if ok and account_name.lower() in xml.lower():
-            _log(f"  confirmed: '{account_name}' visible in UI")
+            _log(f"✅ Successfully switched to @{account_name}")
         elif ok:
-            _log(f"  note: '{account_name}' not yet visible in UI (may still be loading)")
+            _log(f"⏳ @{account_name} loading, may take a moment...")
 
         return ok
 
     except Exception as e:
-        print(f"[switch] EXCEPTION: {e}", flush=True)
+        print(f"[Account Switch] ❌ Switch failed: {e}", flush=True)
         import traceback; traceback.print_exc()
         return False
 

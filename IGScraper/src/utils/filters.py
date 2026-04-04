@@ -474,6 +474,49 @@ def infer_country_code(phone: str, location_text: str = "") -> str:
     return ""
 
 
+# ── Country code → full country name ─────────────────────────────────────────
+
+COUNTRY_CODE_TO_NAME: dict = {
+    "AF": "Afghanistan", "AL": "Albania", "DZ": "Algeria", "AO": "Angola",
+    "AR": "Argentina", "AM": "Armenia", "AU": "Australia", "AT": "Austria",
+    "AZ": "Azerbaijan", "BH": "Bahrain", "BD": "Bangladesh", "BY": "Belarus",
+    "BE": "Belgium", "BO": "Bolivia", "BR": "Brazil", "BG": "Bulgaria",
+    "KH": "Cambodia", "CM": "Cameroon", "CA": "Canada", "CL": "Chile",
+    "CN": "China", "CO": "Colombia", "CR": "Costa Rica", "HR": "Croatia",
+    "CU": "Cuba", "CY": "Cyprus", "CZ": "Czech Republic", "DK": "Denmark",
+    "DO": "Dominican Republic", "EC": "Ecuador", "EG": "Egypt",
+    "SV": "El Salvador", "EE": "Estonia", "ET": "Ethiopia", "FJ": "Fiji",
+    "FI": "Finland", "FR": "France", "GE": "Georgia", "DE": "Germany",
+    "GH": "Ghana", "GR": "Greece", "GT": "Guatemala", "HT": "Haiti",
+    "HN": "Honduras", "HK": "Hong Kong", "HU": "Hungary", "IS": "Iceland",
+    "IN": "India", "ID": "Indonesia", "IR": "Iran", "IQ": "Iraq",
+    "IE": "Ireland", "IL": "Israel", "IT": "Italy", "JM": "Jamaica",
+    "JP": "Japan", "JO": "Jordan", "KZ": "Kazakhstan", "KE": "Kenya",
+    "KW": "Kuwait", "KG": "Kyrgyzstan", "LV": "Latvia", "LB": "Lebanon",
+    "LY": "Libya", "LT": "Lithuania", "LU": "Luxembourg", "MY": "Malaysia",
+    "MT": "Malta", "MX": "Mexico", "MD": "Moldova", "MA": "Morocco",
+    "MZ": "Mozambique", "MM": "Myanmar", "NP": "Nepal", "NL": "Netherlands",
+    "NZ": "New Zealand", "NI": "Nicaragua", "NG": "Nigeria", "NO": "Norway",
+    "OM": "Oman", "PK": "Pakistan", "PA": "Panama", "PG": "Papua New Guinea",
+    "PY": "Paraguay", "PE": "Peru", "PH": "Philippines", "PL": "Poland",
+    "PT": "Portugal", "PR": "Puerto Rico", "QA": "Qatar", "RO": "Romania",
+    "RU": "Russia", "SA": "Saudi Arabia", "SN": "Senegal", "RS": "Serbia",
+    "SG": "Singapore", "SK": "Slovakia", "ZA": "South Africa",
+    "KR": "South Korea", "ES": "Spain", "LK": "Sri Lanka", "SD": "Sudan",
+    "SE": "Sweden", "CH": "Switzerland", "SY": "Syria", "TW": "Taiwan",
+    "TZ": "Tanzania", "TH": "Thailand", "TT": "Trinidad and Tobago",
+    "TN": "Tunisia", "TR": "Turkey", "UG": "Uganda", "UA": "Ukraine",
+    "AE": "United Arab Emirates", "GB": "United Kingdom", "US": "United States",
+    "UY": "Uruguay", "UZ": "Uzbekistan", "VE": "Venezuela", "VN": "Vietnam",
+    "YE": "Yemen", "ZW": "Zimbabwe", "PS": "Palestine",
+}
+
+
+def country_code_to_name(code: str) -> str:
+    """Return the full country name for a 2-letter ISO code, or empty string."""
+    return COUNTRY_CODE_TO_NAME.get((code or "").upper(), "")
+
+
 # ── Main filter function ──────────────────────────────────────────────────────
 
 def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
@@ -520,7 +563,10 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
             return True
 
     # Recency (no recent post AND no active story)
-    req_days = int(filters.get("require_recent_post_days", 365))
+    # Only active if explicitly set to a positive value in filters.
+    # Default is 0 (disabled) — do NOT default to 365 which would silently
+    # skip inactive accounts even when no recency filter is configured.
+    req_days = int(filters.get("require_recent_post_days", 0))
     if req_days > 0:
         has_recent = account.get("has_recent_post", True)
         has_story = account.get("has_story", False)
@@ -529,7 +575,9 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
 
     # Check for "skip_no_posts_last_n_months"
     months_threshold = int(filters.get("skip_no_posts_last_n_months", 0))
-    if months_threshold > 0:
+    if months_threshold > 0 and not account.get("has_story", False):
+        # Story ring active = account is live, skip the date check entirely.
+        # Only evaluate post date when there is NO active story.
         latest_date_text = account.get("latest_post_date_text", "")
         if latest_date_text:
             try:
