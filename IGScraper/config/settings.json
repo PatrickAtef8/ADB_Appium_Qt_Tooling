@@ -19,8 +19,8 @@
     "between_profiles_max": 2.0,
     "between_scrolls_min": 0.5,
     "between_scrolls_max": 3.0,
-    "rest_min_minutes": 1,
-    "rest_max_minutes": 2,
+    "rest_min_seconds": 500,
+    "rest_max_seconds": 999,
     "session_break_every": 5,
     "switch_mode": "hours",
     "switch_hours": 1
@@ -51,11 +51,12 @@
   "blacklist": [],
   "last_target": "",
   "last_mode": "following",
-  "last_count": 100,
+  "last_count": 5,
   "last_device": "",
   "targets_per_phone": [
     [
-      "mark60445"
+      "mark60445",
+      "nike"
     ],
     [],
     []

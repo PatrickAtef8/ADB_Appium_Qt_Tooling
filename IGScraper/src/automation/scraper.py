@@ -563,11 +563,24 @@ class InstagramScraper:
                 details["full_name"] = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_full_name").text.strip()
             except: pass
             try:
-                details["bio"] = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_bio_text").text.strip()
+                bio_el  = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_bio_text")
+                bio_raw = bio_el.text.strip()
+                # If bio is truncated Instagram appends "… more" or "... more".
+                # Clicking the bio element expands it to the full text.
+                if bio_raw.endswith("more") and ("…" in bio_raw or "..." in bio_raw):
+                    try:
+                        bio_el.click()
+                        time.sleep(1)
+                        bio_el  = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_bio_text")
+                        bio_raw = bio_el.text.strip()
+                    except Exception:
+                        pass
+                details["bio"] = bio_raw
             except: pass
 
             loc_ids = [
                 "com.instagram.android:id/profile_header_location_text",
+                "com.instagram.android:id/profile_header_business_address",
             ]
             for lid in loc_ids:
                 try:
@@ -578,6 +591,28 @@ class InstagramScraper:
                         break
                 except Exception:
                     continue
+
+            # ── Bio location fallback ─────────────────────────────────────────
+            # Only runs when neither dedicated location element had a value.
+            # Only the 📍 pin emoji is a reliable location signal in a bio —
+            # any other heuristic risks false matches.
+            # Collects ALL pin-emoji lines (there may be more than one) and
+            # joins them so none are lost.
+            if not details.get("location") and details.get("bio"):
+                _PIN_EMOJI = "\U0001f4cd"   # 📍
+                _URL_RE    = re.compile(r"(https?://|www\.|\.[a-z]{2,4}\b)", re.I)
+                _EMAIL_RE  = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+                pin_lines = []
+                for line in details["bio"].splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith(_PIN_EMOJI):
+                        candidate = line[len(_PIN_EMOJI):].strip()
+                        if candidate and not _URL_RE.search(candidate) and not _EMAIL_RE.search(candidate):
+                            pin_lines.append(candidate)
+                if pin_lines:
+                    details["location"] = ", ".join(pin_lines)
 
             try:
                 contact_btn = driver.find_element(

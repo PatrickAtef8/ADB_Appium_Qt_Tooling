@@ -506,8 +506,8 @@ class PhoneWorker(QThread):
                         and target != self.targets[-1]
                         and not self._stop_flag):
                     rest_s = random.randint(
-                        int(delays.get("rest_min_minutes", 1)) * 60,
-                        int(delays.get("rest_max_minutes", 5)) * 60,
+                        int(delays.get("rest_min_seconds", 60)),
+                        int(delays.get("rest_max_seconds", 300)),
                     )
                     self._log(f"😴 Resting {rest_s // 60}m {rest_s % 60}s before next target…")
                     self._sleep(rest_s)
@@ -1158,7 +1158,7 @@ class SettingsPage(PageWidget):
 
         add_delay("Between profiles (s):", "sp_prof_min", "sp_prof_max", 1.0, 300.0)
         add_delay("Between scrolls (s):",  "sp_scrl_min", "sp_scrl_max", 0.5, 300.0)
-        add_delay("Rest between runs (m):", "sp_rest_min", "sp_rest_max", 1, 1440, True)
+        add_delay("Rest between runs (s):", "sp_rest_min", "sp_rest_max", 1, 86400, True)
 
         # ── Account switch mode ───────────────────────────────────────────
         lbl_sw = StrongBodyLabel("🔄 Account Switching", dl_card)
@@ -2060,8 +2060,8 @@ class MainWindow(FluentWindow):
             "between_profiles_max":   sp.sp_prof_max.value(),
             "between_scrolls_min":    sp.sp_scrl_min.value(),
             "between_scrolls_max":    sp.sp_scrl_max.value(),
-            "rest_min_minutes":       sp.sp_rest_min.value(),
-            "rest_max_minutes":       sp.sp_rest_max.value(),
+            "rest_min_seconds":       sp.sp_rest_min.value(),
+            "rest_max_seconds":       sp.sp_rest_max.value(),
             "session_break_every":    sp.sp_switch_every.value(),
             "switch_mode":            "hours" if sp.rb_switch_hours.isChecked() else "profiles",
             "switch_hours":           sp.sp_switch_hours.value(),
@@ -2116,8 +2116,8 @@ class MainWindow(FluentWindow):
         sp.sp_prof_max.setValue(d.get("between_profiles_max", 5.0))
         sp.sp_scrl_min.setValue(d.get("between_scrolls_min",  1.0))
         sp.sp_scrl_max.setValue(d.get("between_scrolls_max",  3.0))
-        sp.sp_rest_min.setValue(int(d.get("rest_min_minutes", 30)))
-        sp.sp_rest_max.setValue(int(d.get("rest_max_minutes", 60)))
+        sp.sp_rest_min.setValue(int(d.get("rest_min_seconds", 1800)))
+        sp.sp_rest_max.setValue(int(d.get("rest_max_seconds", 3600)))
         sp.sp_switch_every.setValue(int(d.get("session_break_every", 50)))
         switch_mode = d.get("switch_mode", "profiles")
         sp.rb_switch_hours.setChecked(switch_mode == "hours")
