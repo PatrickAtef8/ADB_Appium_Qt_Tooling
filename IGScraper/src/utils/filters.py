@@ -311,47 +311,33 @@ def extract_phone(text: str) -> str:
 
 def infer_country_code(phone: str, location_text: str = "") -> str:
     """
-    Try to infer 2-letter country code from phone prefix or location text.
-    Returns empty string if cannot infer.
+    Try to infer 2-letter country code from location text or phone prefix.
+    Location text is checked FIRST - it is more reliable than phone prefixes
+    (which can be ambiguous, e.g. local numbers without country code).
+    Falls back to phone prefix only when location gives no result.
 
     Key fix: +1 numbers (NANP) are disambiguated by area code so that
     Canadian numbers (e.g. +1-647-...) are correctly identified as CA,
     Caribbean island numbers map to their specific country, and everything
     else defaults to US.
     """
-    if phone:
-        cleaned = re.sub(r"[^\d]", "", phone)
-        if cleaned.startswith("00"):
-            cleaned = cleaned[2:]
-
-        # ── NANP special case ────────────────────────────────────────────────
-        if cleaned.startswith("1") and len(cleaned) >= 4:
-            return _resolve_nanp(cleaned)
-
-        # ── General longest-prefix match (3 -> 2 -> 1 digits) ───────────────
-        for length in (3, 2, 1):
-            prefix = cleaned[:length]
-            if prefix in COUNTRY_PHONE_PREFIXES:
-                return COUNTRY_PHONE_PREFIXES[prefix]
-
-    # ── Location text keyword fallback ───────────────────────────────────────
     COUNTRY_KEYWORDS = {
         # North America
         "united states": "US", "usa": "US", "u.s.a": "US", "u.s.": "US",
         "canada": "CA",
-        "mexico": "MX", "méxico": "MX",
+        "mexico": "MX", "mexico": "MX",
         # Europe
         "united kingdom": "GB", "uk": "GB", "england": "GB",
         "scotland": "GB", "wales": "GB", "northern ireland": "GB",
         "germany": "DE", "deutschland": "DE",
         "france": "FR",
-        "spain": "ES", "españa": "ES",
+        "spain": "ES", "espana": "ES",
         "italy": "IT", "italia": "IT",
         "portugal": "PT",
         "netherlands": "NL", "holland": "NL",
         "belgium": "BE", "belgique": "BE",
         "switzerland": "CH", "suisse": "CH",
-        "austria": "AT", "österreich": "AT",
+        "austria": "AT", "osterreich": "AT",
         "sweden": "SE", "sverige": "SE",
         "norway": "NO", "norge": "NO",
         "denmark": "DK", "danmark": "DK",
@@ -431,7 +417,7 @@ def infer_country_code(phone: str, location_text: str = "") -> str:
         "cambodia": "KH",
         "taiwan": "TW",
         "hong kong": "HK",
-        "turkey": "TR", "türkiye": "TR",
+        "turkey": "TR", "turkiye": "TR",
         "afghanistan": "AF",
         "uzbekistan": "UZ",
         "kazakhstan": "KZ",
@@ -467,10 +453,30 @@ def infer_country_code(phone: str, location_text: str = "") -> str:
         "el salvador": "SV",
         "nicaragua": "NI",
     }
-    loc_lower = location_text.lower()
-    for keyword, code in COUNTRY_KEYWORDS.items():
-        if keyword in loc_lower:
-            return code
+
+    # ── 1. Location text FIRST (most reliable) ────────────────────────────────
+    if location_text:
+        loc_lower = location_text.lower()
+        for keyword, code in COUNTRY_KEYWORDS.items():
+            if keyword in loc_lower:
+                return code
+
+    # ── 2. Phone prefix fallback (only when location gave nothing) ────────────
+    if phone:
+        cleaned = re.sub(r"[^\d]", "", phone)
+        if cleaned.startswith("00"):
+            cleaned = cleaned[2:]
+
+        # NANP special case
+        if cleaned.startswith("1") and len(cleaned) >= 4:
+            return _resolve_nanp(cleaned)
+
+        # General longest-prefix match (3 -> 2 -> 1 digits)
+        for length in (3, 2, 1):
+            prefix = cleaned[:length]
+            if prefix in COUNTRY_PHONE_PREFIXES:
+                return COUNTRY_PHONE_PREFIXES[prefix]
+
     return ""
 
 

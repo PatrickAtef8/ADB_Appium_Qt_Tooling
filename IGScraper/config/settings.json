@@ -1,5 +1,5 @@
 {
-  "sheet_id": "",
+  "sheet_id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
   "sheet_tab": "Sheet1",
   "credentials_path": "assets/credentials.json",
   "webhook_url": "",
@@ -9,7 +9,7 @@
     "skip_no_profile_pic": false,
     "skip_no_contact": false,
     "min_posts": 0,
-    "enable_post_spin": false,
+    "enable_post_spin": true,
     "skip_no_posts_last_n_months": 1,
     "keywords": [],
     "only_keywords": []
@@ -21,7 +21,7 @@
     "between_scrolls_max": 3.0,
     "rest_min_minutes": 1,
     "rest_max_minutes": 2,
-    "session_break_every": 1,
+    "session_break_every": 5,
     "switch_mode": "hours",
     "switch_hours": 1
   },
@@ -38,7 +38,7 @@
   },
   "devices": [
     {
-      "serial": null
+      "serial": "emulator-5554"
     },
     {
       "serial": null
@@ -50,11 +50,13 @@
   "target_list": [],
   "blacklist": [],
   "last_target": "",
-  "last_mode": "followers",
-  "last_count": 5,
+  "last_mode": "following",
+  "last_count": 100,
   "last_device": "",
   "targets_per_phone": [
-    [],
+    [
+      "mark60445"
+    ],
     [],
     []
   ],

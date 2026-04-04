@@ -588,18 +588,52 @@ class InstagramScraper:
                 time.sleep(2)
 
                 try:
+                    # ── Read only from the contact bottom-sheet ───────────────
+                    # The sheet always contains a "Contact" header label followed
+                    # by section labels ("Call", "Text", "Email", "WhatsApp") and
+                    # their values. We wait until the "Contact" header is visible,
+                    # then collect ONLY the values that appear AFTER it. This
+                    # prevents picking up phone numbers that happen to be in the
+                    # bio text (which stays in the DOM behind the sheet).
                     all_text_els = driver.find_elements(
                         AppiumBy.CLASS_NAME, "android.widget.TextView"
                     )
-                    for el in all_text_els:
-                        txt = el.text.strip()
-                        if txt and not details["email"]:
+                    texts = [el.text.strip() for el in all_text_els if el.text.strip()]
+
+                    # Find where the contact sheet starts (the "Contact" header)
+                    sheet_start = None
+                    for i, t in enumerate(texts):
+                        if t.lower() == "contact":
+                            sheet_start = i
+                            break
+
+                    # Only iterate text elements that are INSIDE the sheet
+                    sheet_texts = texts[sheet_start + 1:] if sheet_start is not None else []
+
+                    # Section labels immediately precede their value
+                    phone_labels = {"call", "text", "whatsapp", "phone", "mobile", "sms"}
+                    email_labels = {"email"}
+                    prev = ""
+                    for txt in sheet_texts:
+                        lower = txt.lower()
+                        # Direct email extraction on any item
+                        if not details["email"]:
                             found_email = extract_email(txt)
                             if found_email:
                                 details["email"] = found_email
-                        if txt and not details["phone"]:
-                            if re.search(r"\+?\d[\d\s\-\(\)]{6,}", txt):
+                        # Phone: only if this item follows a phone-type label,
+                        # OR the previous label was a phone label,
+                        # OR it looks like a phone and it starts with + (international)
+                        if not details["phone"]:
+                            is_after_phone_label = prev.lower() in phone_labels
+                            looks_like_phone = bool(re.search(r"\+?\d[\d\s\-\(\)]{6,}", txt))
+                            starts_with_plus = txt.startswith("+")
+                            if is_after_phone_label and looks_like_phone:
                                 details["phone"] = extract_phone(txt)
+                            elif looks_like_phone and starts_with_plus:
+                                # Accept international format (+34...) even without label
+                                details["phone"] = extract_phone(txt)
+                        prev = txt
                 except Exception:
                     pass
 
@@ -1000,6 +1034,9 @@ class InstagramScraper:
 
             # If location is empty but we detected a country from the phone number,
             # fill location with the full country name derived from the country code.
+            # Note: infer_country_code already checks location text first internally,
+            # so country_code here reflects location keywords if any were found.
+            # We only fill location from country_code when location is truly empty.
             if not details.get("location") and details.get("country_code"):
                 details["location"] = country_code_to_name(details["country_code"])
 
