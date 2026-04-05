@@ -1,5 +1,5 @@
 {
-  "sheet_id": "",
+  "sheet_id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
   "sheet_tab": "Sheet1",
   "credentials_path": "assets/credentials.json",
   "webhook_url": "",
@@ -7,11 +7,20 @@
     "skip_no_bio": false,
     "skip_private": false,
     "skip_no_profile_pic": false,
-    "skip_no_contact": false,
+    "skip_no_contact": true,
     "min_posts": 0,
-    "enable_post_spin": false,
+    "enable_post_spin": true,
     "skip_no_posts_last_n_months": 1,
-    "keywords": [],
+    "keywords": [
+      "fashion",
+      "clothes",
+      "clothing",
+      "ferla",
+      "love",
+      "buy",
+      "need",
+      "distinctive"
+    ],
     "only_keywords": []
   },
   "delays": {
@@ -38,7 +47,7 @@
   },
   "devices": [
     {
-      "serial": null
+      "serial": "emulator-5554"
     },
     {
       "serial": null
@@ -51,10 +60,12 @@
   "blacklist": [],
   "last_target": "",
   "last_mode": "following",
-  "last_count": 5,
+  "last_count": 100,
   "last_device": "",
   "targets_per_phone": [
-    [],
+    [
+      "victima_showroom"
+    ],
     [],
     []
   ],

@@ -532,20 +532,72 @@ class InstagramScraper:
             "latest_post_date_text": "",
         }
 
-        try:
-            try:
-                el = driver.find_element(AppiumBy.ANDROID_UIAUTOMATOR, f'new UiSelector().text("{username}")')
-                el.click()
-            except:
-                all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
-                found = False
-                for tv in all_tvs:
-                    if tv.text.strip().lower() == username.lower():
-                        tv.click()
-                        found = True
-                        break
-                if not found: return details
+        # Track whether we actually navigated into a profile page.
+        # run() must only call press_back() when this is True.
+        details["_navigated_in"] = False
 
+        try:
+            # ── Tap the username row in the following/followers list ──────────
+            # We MUST scope the tap to actual follow-list row containers so we
+            # never accidentally tap a story ring, highlight bubble, or a
+            # username that appears as a subtitle in a different row.
+            FOLLOW_ROW_IDS = [
+                "com.instagram.android:id/follow_list_container",
+                "com.instagram.android:id/unified_follow_list_user_container",
+                "com.instagram.android:id/row_user_container_base",
+            ]
+            USERNAME_IDS = [
+                "com.instagram.android:id/follow_list_username",
+                "com.instagram.android:id/row_user_primary_text",
+            ]
+            tapped = False
+            for row_id in FOLLOW_ROW_IDS:
+                if tapped:
+                    break
+                try:
+                    rows = driver.find_elements(AppiumBy.ID, row_id)
+                    for row in rows:
+                        for uid in USERNAME_IDS:
+                            try:
+                                u_el = row.find_element(AppiumBy.ID, uid)
+                                if u_el.text.strip().lower() == username.lower():
+                                    u_el.click()
+                                    tapped = True
+                                    break
+                            except Exception:
+                                continue
+                        if tapped:
+                            break
+                except Exception:
+                    continue
+
+            # Fallback: find the TextView with exactly this text, but only
+            # if it is NOT inside a story/reel/highlight element.
+            if not tapped:
+                all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+                for tv in all_tvs:
+                    if tv.text.strip().lower() != username.lower():
+                        continue
+                    # Reject elements whose ancestor resource-id suggests a
+                    # story bubble or highlight tray
+                    try:
+                        parent_id = tv.find_element(
+                            AppiumBy.XPATH, "./ancestor::*[@resource-id]"
+                        ).get_attribute("resource-id") or ""
+                        if any(x in parent_id for x in (
+                            "story", "reel", "highlight", "tray"
+                        )):
+                            continue
+                    except Exception:
+                        pass
+                    tv.click()
+                    tapped = True
+                    break
+
+            if not tapped:
+                return details   # could not find username row — stay on list
+
+            details["_navigated_in"] = True
             time.sleep(3)
 
             try:
@@ -614,74 +666,104 @@ class InstagramScraper:
                 if pin_lines:
                     details["location"] = "\n".join(pin_lines)
 
-            try:
-                contact_btn = driver.find_element(
-                    AppiumBy.ANDROID_UIAUTOMATOR,
-                    'new UiSelector().textContains("Contact").clickable(true)'
-                )
-                contact_btn.click()
-                time.sleep(2)
-
+            # ── Contact button (profile header area only) ─────────────────────
+            # We must NOT use a broad textContains("Contact") selector because
+            # it can match DM buttons, nav items, or "Contact us" links and
+            # navigate away from the profile — causing screen drift.
+            # Instead, look for known resource-IDs for the contact action row,
+            # and only fall back to text matching when the button text is an
+            # exact known label (not a substring match).
+            _CONTACT_BTN_IDS = [
+                "com.instagram.android:id/profile_header_call_button",
+                "com.instagram.android:id/profile_header_email_button",
+                "com.instagram.android:id/profile_header_contact_button",
+                "com.instagram.android:id/contact_button",
+            ]
+            _EXACT_CONTACT_LABELS = {"contact", "email", "call", "text", "whatsapp"}
+            contact_btn = None
+            # Try by resource-id first (most reliable)
+            for _cid in _CONTACT_BTN_IDS:
                 try:
-                    # ── Read only from the contact bottom-sheet ───────────────
-                    # The sheet always contains a "Contact" header label followed
-                    # by section labels ("Call", "Text", "Email", "WhatsApp") and
-                    # their values. We wait until the "Contact" header is visible,
-                    # then collect ONLY the values that appear AFTER it. This
-                    # prevents picking up phone numbers that happen to be in the
-                    # bio text (which stays in the DOM behind the sheet).
-                    all_text_els = driver.find_elements(
-                        AppiumBy.CLASS_NAME, "android.widget.TextView"
+                    contact_btn = driver.find_element(AppiumBy.ID, _cid)
+                    break
+                except Exception:
+                    continue
+            # Fall back to exact-text match scoped to profile header area
+            if contact_btn is None:
+                try:
+                    _all_btns = driver.find_elements(
+                        AppiumBy.XPATH,
+                        '//android.widget.Button | //android.widget.TextView[@clickable="true"]'
                     )
-                    texts = [el.text.strip() for el in all_text_els if el.text.strip()]
-
-                    # Find where the contact sheet starts (the "Contact" header)
-                    sheet_start = None
-                    for i, t in enumerate(texts):
-                        if t.lower() == "contact":
-                            sheet_start = i
+                    for _btn in _all_btns:
+                        _txt = (_btn.text or "").strip().lower()
+                        if _txt in _EXACT_CONTACT_LABELS:
+                            contact_btn = _btn
                             break
-
-                    # Only iterate text elements that are INSIDE the sheet
-                    sheet_texts = texts[sheet_start + 1:] if sheet_start is not None else []
-
-                    # Section labels immediately precede their value
-                    phone_labels = {"call", "text", "whatsapp", "phone", "mobile", "sms"}
-                    email_labels = {"email"}
-                    prev = ""
-                    for txt in sheet_texts:
-                        lower = txt.lower()
-                        # Direct email extraction on any item
-                        if not details["email"]:
-                            found_email = extract_email(txt)
-                            if found_email:
-                                details["email"] = found_email
-                        # Phone: only if this item follows a phone-type label,
-                        # OR the previous label was a phone label,
-                        # OR it looks like a phone and it starts with + (international)
-                        if not details["phone"]:
-                            is_after_phone_label = prev.lower() in phone_labels
-                            looks_like_phone = bool(re.search(r"\+?\d[\d\s\-\(\)]{6,}", txt))
-                            starts_with_plus = txt.startswith("+")
-                            if is_after_phone_label and looks_like_phone:
-                                details["phone"] = extract_phone(txt)
-                            elif looks_like_phone and starts_with_plus:
-                                # Accept international format (+34...) even without label
-                                details["phone"] = extract_phone(txt)
-                        prev = txt
                 except Exception:
                     pass
 
-                driver.back()
-                time.sleep(1)
-            except Exception:
-                pass
+            if contact_btn is not None:
+                try:
+                    contact_btn.click()
+
+                    # ── Wait for the sheet to fully load ─────────────────────
+                    _CONTACT_HEADER_VARIANTS = {"contact", "call", "email", "whatsapp", "text", "phone", "mobile", "sms"}
+                    for _wait_attempt in range(3):
+                        time.sleep(1.0)
+                        try:
+                            _probe = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
+                            _probe_texts = [e.text.strip().lower() for e in _probe if e.text.strip()]
+                            if any(t in _CONTACT_HEADER_VARIANTS for t in _probe_texts):
+                                break
+                        except Exception:
+                            pass
+
+                    try:
+                        all_text_els = driver.find_elements(
+                            AppiumBy.CLASS_NAME, "android.widget.TextView"
+                        )
+                        texts = [el.text.strip() for el in all_text_els if el.text.strip()]
+
+                        sheet_start = None
+                        for i, t in enumerate(texts):
+                            if t.lower() == "contact":
+                                sheet_start = i
+                                break
+
+                        sheet_texts = texts[sheet_start + 1:] if sheet_start is not None else texts
+
+                        phone_labels = {"call", "text", "whatsapp", "phone", "mobile", "sms"}
+                        prev = ""
+                        for txt in sheet_texts:
+                            if not details["email"]:
+                                found_email = extract_email(txt)
+                                if found_email:
+                                    details["email"] = found_email
+                            if not details["phone"]:
+                                is_after_phone_label = prev.lower() in phone_labels
+                                looks_like_phone = bool(re.search(r"\+?\d[\d\s\-\(\)]{6,}", txt))
+                                starts_with_plus = txt.startswith("+")
+                                if is_after_phone_label and looks_like_phone:
+                                    details["phone"] = extract_phone(txt)
+                                elif looks_like_phone and starts_with_plus:
+                                    details["phone"] = extract_phone(txt)
+                            prev = txt
+                    except Exception:
+                        pass
+
+                    driver.back()
+                    time.sleep(1)
+                except Exception:
+                    pass
 
             if not details["email"]:
                 try:
+                    # Use exact text "Email" only — textContains would also match
+                    # unrelated elements and could navigate away from the profile.
                     email_btn = driver.find_element(
                         AppiumBy.ANDROID_UIAUTOMATOR,
-                        'new UiSelector().textContains("Email").clickable(true)'
+                        'new UiSelector().text("Email").clickable(true)'
                     )
                     email_text = email_btn.get_attribute("content-desc") or email_btn.text
                     found = extract_email(email_text)
@@ -869,10 +951,78 @@ class InstagramScraper:
             except Exception as pic_ex:
                 details["has_profile_pic"] = True
 
-            if not details["is_private"] and details["post_count"] > 0:
+            # ── Bio contact extraction ────────────────────────────────────────
+            # If the Contact button didn't yield an email/phone, scan the bio
+            # text directly. This covers accounts that put contact details in
+            # the bio without a Contact button.
+            if not details["email"] and details.get("bio"):
+                _bio_email = extract_email(details["bio"])
+                if _bio_email:
+                    details["email"] = _bio_email
+            if not details["phone"] and details.get("bio"):
+                # Only accept international-format numbers from bio (starts with +)
+                # to avoid grabbing follower counts or other digit strings.
+                _bio_phone_m = re.search(r"\+\d[\d\s\-\(\)]{6,}", details["bio"])
+                if _bio_phone_m:
+                    details["phone"] = extract_phone(_bio_phone_m.group(0))
+
+            # Accounts with 0 posts cannot have an "old" post — the post-age
+            # filter must never reject them.  Set has_recent_post=True
+            # unconditionally here; it will be overwritten to False below
+            # only when the post-spin actually finds and checks a real post.
+            if not details["is_private"]:
                 details["has_recent_post"] = True
-                
-                enable_spin = filters.get("enable_post_spin", False) if filters else False
+
+            if not details["is_private"] and details["post_count"] > 0:
+                # ── Early-exit guard — post-date spin is the LAST check ───────
+                # Evaluate every cheap filter condition BEFORE doing the
+                # expensive post-date check (opening a post, reading its date).
+                # If the account would already be skipped for ANY other reason,
+                # skip the post-spin entirely.
+                _skip_early = False
+                if filters:
+                    # 1. Private account
+                    if not _skip_early and filters.get("skip_private", False):
+                        if details.get("is_private", False):
+                            _skip_early = True
+
+                    # 2. No bio
+                    if not _skip_early and filters.get("skip_no_bio", False):
+                        if not details.get("bio", "").strip():
+                            _skip_early = True
+
+                    # 3. No profile picture
+                    if not _skip_early and filters.get("skip_no_profile_pic", False):
+                        if not details.get("has_profile_pic", True):
+                            _skip_early = True
+
+                    # 4. Keyword blacklist
+                    if not _skip_early:
+                        _kws = filters.get("keywords", [])
+                        if _kws:
+                            _haystack = " ".join([
+                                details.get("username", ""),
+                                details.get("full_name", ""),
+                                details.get("bio", ""),
+                            ]).lower()
+                            if any(kw.strip().lower() and kw.strip().lower() in _haystack for kw in _kws):
+                                _skip_early = True
+
+                    # 5. Minimum posts
+                    if not _skip_early:
+                        _min_posts = int(filters.get("min_posts", 0))
+                        if _min_posts > 0 and details.get("post_count", 0) < _min_posts:
+                            _skip_early = True
+
+                    # 6. No contact info — skip only when NEITHER bio NOR
+                    #    Contact button yielded an email OR a phone number.
+                    if not _skip_early and filters.get("skip_no_contact", False):
+                        _has_email = bool(details.get("email", "").strip())
+                        _has_phone = bool(details.get("phone", "").strip())
+                        if not _has_email and not _has_phone:
+                            _skip_early = True
+
+                enable_spin = (filters.get("enable_post_spin", False) if filters else False) and not _skip_early
                 months_threshold = int(filters.get("skip_no_posts_last_n_months", 0)) if filters else 0
 
                 # ── Story-ring short-circuit ──────────────────────────────────
@@ -934,8 +1084,17 @@ class InstagramScraper:
                             if post_el: break
 
                             if attempt_find < 2:
-                                self._log(f"🔍 Post grid not visible yet, scrolling... (attempt {attempt_find+1})")
-                                self.scroll_list(swipe_distance=0.2)
+                                self._log(f"📜 Date not visible yet, scrolling... (attempt {attempt_find+1})")
+                                # Use Appium swipe (session-aware) instead of ADB shell
+                                # swipe to avoid accidentally triggering stories/reels
+                                # on the profile page during a blind coordinate swipe.
+                                try:
+                                    _sz = driver.get_window_size()
+                                    _w, _h = _sz["width"], _sz["height"]
+                                    driver.swipe(_w // 2, int(_h * 0.65),
+                                                 _w // 2, int(_h * 0.35), 600)
+                                except Exception:
+                                    pass
                                 time.sleep(2.0)
                         
                         if post_el:
@@ -1025,7 +1184,15 @@ class InstagramScraper:
                                 if date_text: break
                                 
                                 self._log(f"📜 Date not visible yet, scrolling... (attempt {attempt+1})")
-                                self.scroll_list(swipe_distance=0.4) # Uses ADB shell swipe now
+                                # Safe Appium swipe — does not fire ADB input events
+                                # that could accidentally exit the post view.
+                                try:
+                                    _sz2 = driver.get_window_size()
+                                    _w2, _h2 = _sz2["width"], _sz2["height"]
+                                    driver.swipe(_w2 // 2, int(_h2 * 0.70),
+                                                 _w2 // 2, int(_h2 * 0.30), 600)
+                                except Exception:
+                                    pass
                                 time.sleep(2)
                             
                             if date_text:
@@ -1119,6 +1286,245 @@ class InstagramScraper:
         except Exception as e:
             self._log(f"⚠️ Navigation error: {e}")
             return False
+
+    # ── Screen verification & recovery ───────────────────────────────────────
+
+    def _verify_on_list(self) -> bool:
+        """
+        Return True if the screen is currently showing a followers/following
+        list (i.e. we see the expected row containers).  False means we have
+        drifted somewhere else — a story viewer, Reels, DMs, home feed, etc.
+
+        Retries up to 3 times with a short sleep to absorb Instagram's page
+        transition animations, so a momentarily blank screen between profile
+        visits does not trigger a false-positive recovery.
+        """
+        LIST_ROW_IDS = [
+            "com.instagram.android:id/follow_list_container",
+            "com.instagram.android:id/row_user_container_base",
+            "com.instagram.android:id/unified_follow_list_user_container",
+            "com.instagram.android:id/follow_list_sorting_option_container",
+        ]
+        for _retry in range(3):
+            try:
+                driver = self.ctrl.driver
+                for lid in LIST_ROW_IDS:
+                    try:
+                        els = driver.find_elements(AppiumBy.ID, lid)
+                        if els:
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            if _retry < 2:
+                time.sleep(1.0)   # wait for page transition to complete
+        return False
+
+    def _recover_to_list(self, target_username: str, mode: str) -> bool:
+        """
+        Full recovery when the scraper has drifted to a wrong screen
+        (story viewer, Reels, DMs, accidental tap, etc.).
+
+        Strategy (in order of escalation):
+          1. If we detect a story/reel viewer, press Back once first.
+          2. Try up to 4 regular Back presses to unwind the back-stack.
+          3. If still not on the list, force-stop Instagram via ADB and
+             relaunch it, then re-navigate to the target profile and list.
+
+        Returns True if we successfully land back on the followers/following
+        list, False if all attempts fail (caller should stop the run).
+        """
+        serial = self.ctrl._device_serial or ""
+        driver = self.ctrl.driver
+        self._log("⚠️ Screen drift detected — attempting recovery...")
+
+        # ── Step 1: escape story/reel viewer with a single Back ──────────────
+        try:
+            story_ids = [
+                "com.instagram.android:id/reel_viewer_progress_container",
+                "com.instagram.android:id/reel_viewer_root",
+                "com.instagram.android:id/story_progress_container",
+                "com.instagram.android:id/clips_viewer_fragment_container",
+            ]
+            for sid in story_ids:
+                try:
+                    if driver.find_elements(AppiumBy.ID, sid):
+                        self._log("↩️ Escaping story/reel viewer...")
+                        driver.back()
+                        time.sleep(1.5)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # ── Step 2: try up to 4 Back presses to unwind ───────────────────────
+        for i in range(4):
+            if self._verify_on_list():
+                self._log("✅ Recovery successful (back-press).")
+                return True
+            try:
+                driver.back()
+                time.sleep(1.2)
+            except Exception:
+                break
+
+        if self._verify_on_list():
+            self._log("✅ Recovery successful (back-press).")
+            return True
+
+        # ── Step 3: soft recovery — Home → relaunch Instagram → Search ───────
+        # Press Home to get out of whatever stuck state we're in, then bring
+        # Instagram back to the foreground and try to navigate normally.
+        # This avoids the disruptive force-stop unless absolutely necessary.
+        self._log("🏠 Pressing Home to escape stuck screen...")
+        try:
+            driver.press_keycode(3)   # HOME — guaranteed regardless of screen state
+            time.sleep(2.0)
+
+            # Bring Instagram back to the foreground via Appium activate_app
+            driver.activate_app("com.instagram.android")
+            time.sleep(3.0)
+
+            # Dismiss any dialogs that may have appeared
+            for label in ("Try Again", "OK", "Close", "Not Now", "Cancel"):
+                try:
+                    btn = driver.find_element(
+                        AppiumBy.ANDROID_UIAUTOMATOR,
+                        f'new UiSelector().text("{label}").clickable(true)'
+                    )
+                    btn.click()
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+
+            # Try to navigate to the profile via the search tab as usual
+            self._log(f"🔍 Attempting soft re-navigation to @{target_username}...")
+            if self.navigate_to_profile(target_username) and self.open_list(mode):
+                self._log("✅ Recovery successful (home → relaunch).")
+                return True
+
+        except Exception as e:
+            self._log(f"⚠️ Soft recovery failed: {e}")
+
+        # ── Step 4: force-stop Instagram and do a full re-navigation ─────────
+        self._log("🔄 Force-stopping Instagram for full recovery...")
+        try:
+            _run_hidden(
+                ["adb", "-s", serial, "shell", "am", "force-stop",
+                 "com.instagram.android"],
+                capture_output=True, text=True, timeout=10,
+            )
+            time.sleep(2.5)
+            # Relaunch Instagram using the monkey tool — this fires the launcher
+            # intent exactly as if the user tapped the app icon, works on all
+            # Android versions and never opens a "recent task" instead.
+            _run_hidden(
+                [
+                    "adb", "-s", serial, "shell", "monkey",
+                    "-p", "com.instagram.android",
+                    "-c", "android.intent.category.LAUNCHER",
+                    "1",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+
+            # ── Wait for Instagram to be the foreground app ───────────────
+            # Poll until Instagram is confirmed in the foreground, trying
+            # multiple ADB signals before falling back to a flat wait.
+            ig_ready = False
+            for _attempt in range(40):   # up to 20 s (40 × 0.5 s)
+                time.sleep(0.5)
+                try:
+                    # Method 1: dumpsys activity (works on all Android versions)
+                    act_out = _run_hidden(
+                        ["adb", "-s", serial, "shell", "dumpsys", "activity",
+                         "activities"],
+                        capture_output=True, text=True, timeout=10,
+                    ).stdout
+                    if "com.instagram.android" in act_out and (
+                        "mResumedActivity" in act_out or
+                        "ResumedActivity" in act_out or
+                        "topResumedActivity" in act_out
+                    ):
+                        for line in act_out.splitlines():
+                            if ("mResumedActivity" in line or
+                                "ResumedActivity" in line or
+                                "topResumedActivity" in line) \
+                                    and "com.instagram.android" in line:
+                                ig_ready = True
+                                break
+                    if ig_ready:
+                        break
+
+                    # Method 2: check current focused package via dumpsys window
+                    win_out = _run_hidden(
+                        ["adb", "-s", serial, "shell", "dumpsys", "window",
+                         "windows"],
+                        capture_output=True, text=True, timeout=10,
+                    ).stdout
+                    for line in win_out.splitlines():
+                        if ("mCurrentFocus" in line or "mFocusedApp" in line) \
+                                and "com.instagram.android" in line:
+                            ig_ready = True
+                            break
+                    if ig_ready:
+                        break
+                except Exception:
+                    pass
+
+            if not ig_ready:
+                # Fallback: flat wait then try to bring Instagram forward once more
+                self._log("⚠️ Instagram readiness check timed out — forcing relaunch...")
+                try:
+                    _run_hidden(
+                        [
+                            "adb", "-s", serial, "shell", "monkey",
+                            "-p", "com.instagram.android",
+                            "-c", "android.intent.category.LAUNCHER",
+                            "1",
+                        ],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                except Exception:
+                    pass
+                time.sleep(5.0)
+            else:
+                # Small extra buffer so the UI is interactive, not just foregrounded
+                time.sleep(2.0)
+
+        except Exception as e:
+            self._log(f"❌ Force-stop failed: {e}")
+            return False
+
+        # Dismiss any post-launch dialogs (update prompts, rate-limit warnings)
+        try:
+            for _ in range(3):
+                for label in ("Try Again", "OK", "Close", "Not Now", "Cancel"):
+                    try:
+                        btn = driver.find_element(
+                            AppiumBy.ANDROID_UIAUTOMATOR,
+                            f'new UiSelector().text("{label}").clickable(true)'
+                        )
+                        btn.click()
+                        time.sleep(0.8)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Re-navigate to the target profile and open the list
+        self._log(f"🔍 Re-navigating to @{target_username} after recovery...")
+        if not self.navigate_to_profile(target_username):
+            self._log("❌ Recovery failed — could not navigate to profile.")
+            return False
+        if not self.open_list(mode):
+            self._log("❌ Recovery failed — could not open list.")
+            return False
+
+        self._log("✅ Recovery successful (full restart).")
+        return True
 
     def scroll_list(self, swipe_distance: float = 0.6):
         """Scroll the list down using ADB shell swipe for better stability."""
@@ -1254,6 +1660,8 @@ class InstagramScraper:
 
         self._log(f"✅ Opened {mode} list. Starting collection...")
         consecutive_empty = 0
+        recovery_failures = 0   # count consecutive failed recovery attempts
+        mid_batch_recovered = False  # True when drift recovery happened mid-batch (skip scroll)
 
         while collected < max_count and not self._stop_flag:
             if self._need_reopen_list:
@@ -1289,6 +1697,26 @@ class InstagramScraper:
                     break
                 consecutive_empty = 0
                 continue
+
+            # ── Screen-state check: ensure we are still on the list ───────────
+            # This fires every iteration so any accidental tap (story, Reels,
+            # DM, etc.) is caught immediately before we try to read accounts.
+            if not self._verify_on_list():
+                self._log("🔍 Not on the followers/following list — recovering...")
+                if self._recover_to_list(target_username, mode):
+                    recovery_failures = 0
+                    consecutive_empty = 0
+                    continue   # restart iteration cleanly on the correct screen
+                else:
+                    recovery_failures += 1
+                    self._log(f"❌ Recovery attempt {recovery_failures} failed.")
+                    if recovery_failures >= 3:
+                        self._log("❌ Too many failed recovery attempts — stopping.")
+                        break
+                    time.sleep(5.0)
+                    continue
+            else:
+                recovery_failures = 0   # reset on confirmed good screen
 
             accounts = self._extract_visible_accounts()
 
@@ -1328,10 +1756,18 @@ class InstagramScraper:
 
                 uname = acc["username"].lower()
 
-                # ── Hard blacklist gate: BEFORE any profile tap ──────────────
-                if uname in seen_usernames or uname in blacklist:
+                # ── Gate 1: already seen this scroll session (in-memory dedup) ─
+                if uname in seen_usernames:
                     continue
                 seen_usernames.add(uname)
+
+                # ── Gate 2: already collected in a previous run (blacklist) ────
+                # Check BEFORE opening the profile so we never waste time
+                # visiting, post-spinning, or contact-scraping an account that
+                # was already exported.
+                if uname in blacklist:
+                    self._log(f"⏭️ @{acc['username']} skipped (blacklisted)")
+                    continue
 
                 # ── Story-ring shortcut ──────────────────────────────────────
                 # If the ring was already detected in the list view and no
@@ -1351,24 +1787,54 @@ class InstagramScraper:
                     if acc_has_story and not details.get("has_story"):
                         details["has_story"] = True
                     acc.update(details)
-                    self.ctrl.press_back()
+                    # Only press Back if we actually navigated into a profile.
+                    # open_profile_details() sets _navigated_in=False when it
+                    # could not find the username row and returned immediately,
+                    # meaning the driver is still on the list — pressing Back
+                    # in that case would exit the list and cause screen drift.
+                    if details.get("_navigated_in", True):
+                        self.ctrl.press_back()
                     time.sleep(_rand(profile_delay_min, profile_delay_max))
+
+                    # ── Mid-batch drift guard ────────────────────────────────
+                    # After pressing Back from a profile, verify we are still
+                    # on the list before processing the next account in this
+                    # batch. If we drifted (story viewer, Reels, accidental tap)
+                    # recover now instead of silently skipping the remaining
+                    # accounts in the batch.
+                    if not self._verify_on_list():
+                        self._log("🔍 Mid-batch drift — recovering before continuing...")
+                        if self._recover_to_list(target_username, mode):
+                            recovery_failures = 0
+                        else:
+                            recovery_failures += 1
+                            self._log(f"❌ Mid-batch recovery failed ({recovery_failures}).")
+                            if recovery_failures >= 3:
+                                self._log("❌ Too many failed recovery attempts — stopping.")
+                                self._stop_flag = True
+                        mid_batch_recovered = True
+                        break  # break inner for-loop; outer while restarts cleanly
+
                 elif acc_has_story and story_satisfies_activity:
                     acc.setdefault("has_recent_post", True)
                     self._log(f"⚡ @{acc['username']} is active (has a story) — skipping profile visit")
 
-                if should_skip(acc, filters, blacklist):
-                    self._log(f"⏭️ @{acc['username']} skipped (doesn't match filters)")
+
+                _skip_reason: list = []
+                if should_skip(acc, filters, blacklist, _skip_reason):
+                    reason_str = _skip_reason[0] if _skip_reason else "unknown filter"
+                    self._log(f"⏭️ @{acc['username']} skipped ({reason_str})")
+                    add_to_blacklist(acc["username"])
+                    blacklist.add(uname)
                     continue
 
                 if self.on_account_found:
                     self.on_account_found(acc)
 
-                add_to_blacklist(acc["username"])
-                # Also add to local blacklist set to prevent re-processing in same loop
-                blacklist.add(uname)
-                
                 collected += 1
+
+                add_to_blacklist(acc["username"])
+                blacklist.add(uname)
 
                 if self.on_progress:
                     self.on_progress(collected, max_count)
@@ -1384,9 +1850,10 @@ class InstagramScraper:
                 if self.on_switch_check:
                     self.on_switch_check(collected)
 
-            if not self._need_reopen_list:
+            if not self._need_reopen_list and not mid_batch_recovered:
                 self.scroll_list()
                 time.sleep(_rand(scroll_delay_min, scroll_delay_max))
+            mid_batch_recovered = False
 
         self._log(f"🏁 All done! Collected {collected} account(s).")
         return collected

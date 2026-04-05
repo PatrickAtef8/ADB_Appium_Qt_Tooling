@@ -2,9 +2,34 @@
 Persistent blacklist manager — stores scraped/skipped usernames to disk.
 """
 import os
+import sys
 import json
 
-BLACKLIST_PATH = os.path.join(os.path.dirname(__file__), "../../config/blacklist.json")
+
+def _resolve_blacklist_path() -> str:
+    """
+    Return an absolute path to config/blacklist.json that is stable
+    regardless of the working directory or whether the app is run as
+    a plain Python script or a PyInstaller-frozen executable.
+
+    PyInstaller sets sys.frozen=True and sys.executable to the .exe path.
+    In that case the config folder lives next to the executable.
+    When run as a normal script, we walk up from this file's location to
+    the project root (the directory that contains the 'config' folder).
+    Using __file__-relative traversal fixes the original bug where
+    os.getcwd()-based resolution produced a different path depending on
+    which directory the app was launched from.
+    """
+    if getattr(sys, "frozen", False):
+        # PyInstaller bundle — config/ sits beside the .exe
+        base = os.path.dirname(sys.executable)
+    else:
+        # Normal Python — go up from src/utils/ → src/ → project root
+        base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(base, "config", "blacklist.json")
+
+
+BLACKLIST_PATH = _resolve_blacklist_path()
 
 
 def load_blacklist() -> set:

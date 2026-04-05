@@ -465,19 +465,34 @@ def infer_country_code(phone: str, location_text: str = "") -> str:
 
     # ── 2. Phone prefix fallback (only when location gave nothing) ────────────
     if phone:
-        cleaned = re.sub(r"[^\d]", "", phone)
+        # Detect whether the number was in explicit international format BEFORE
+        # stripping non-digits. Only +XX or 00XX prefixed numbers reliably carry
+        # a country code — local numbers that happen to start with the same
+        # digits as a country code (e.g. Spanish "912…" vs India "+91") must NOT
+        # be matched against 1- or 2-digit country prefixes.
+        phone_stripped = phone.strip()
+        is_international = phone_stripped.startswith("+") or phone_stripped.startswith("00")
+
+        cleaned = re.sub(r"[^\d]", "", phone_stripped)
         if cleaned.startswith("00"):
             cleaned = cleaned[2:]
 
-        # NANP special case
-        if cleaned.startswith("1") and len(cleaned) >= 4:
+        # NANP special case — only when international format confirmed
+        if is_international and cleaned.startswith("1") and len(cleaned) >= 4:
             return _resolve_nanp(cleaned)
 
-        # General longest-prefix match (3 -> 2 -> 1 digits)
-        for length in (3, 2, 1):
-            prefix = cleaned[:length]
-            if prefix in COUNTRY_PHONE_PREFIXES:
-                return COUNTRY_PHONE_PREFIXES[prefix]
+        # 3-digit prefixes are globally unambiguous — safe to match always.
+        prefix3 = cleaned[:3]
+        if prefix3 in COUNTRY_PHONE_PREFIXES:
+            return COUNTRY_PHONE_PREFIXES[prefix3]
+
+        # 2-digit and 1-digit prefixes are only safe when the number explicitly
+        # carries a country code (i.e. international format).
+        if is_international:
+            for length in (2, 1):
+                prefix = cleaned[:length]
+                if prefix in COUNTRY_PHONE_PREFIXES:
+                    return COUNTRY_PHONE_PREFIXES[prefix]
 
     return ""
 
@@ -527,37 +542,46 @@ def country_code_to_name(code: str) -> str:
 
 # ── Main filter function ──────────────────────────────────────────────────────
 
-def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
+def should_skip(account: dict, filters: dict, blacklist: set,
+                _skip_reason: list = None) -> bool:
     """
     Returns True if the account should be skipped / blacklisted.
     account dict keys: username, full_name, bio, is_private,
                        has_profile_pic, post_count, has_recent_post,
                        has_story, email, phone
+
+    If _skip_reason is a list, the reason string is appended to it so the
+    caller can log exactly which filter triggered the skip.
     """
+    def _reject(reason: str) -> bool:
+        if _skip_reason is not None:
+            _skip_reason.append(reason)
+        return True
+
     username = account.get("username", "").lower()
 
     # Blacklist check
     if username in blacklist:
-        return True
+        return _reject("blacklisted")
 
     # Private
     if filters.get("skip_private") and account.get("is_private", False):
-        return True
+        return _reject("private account")
 
     # No bio
     if filters.get("skip_no_bio") and not account.get("bio", "").strip():
-        return True
+        return _reject("no bio")
 
     # No profile pic
     if filters.get("skip_no_profile_pic") and not account.get("has_profile_pic", True):
-        return True
+        return _reject("no profile pic")
 
     # No contact info (email or phone)
     if filters.get("skip_no_contact"):
         has_email = bool(account.get("email", "").strip())
         has_phone = bool(account.get("phone", "").strip())
         if not has_email and not has_phone:
-            return True
+            return _reject("no email and no phone")
 
     # Minimum posts
     min_posts = int(filters.get("min_posts", 0))
@@ -568,72 +592,35 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
         except (ValueError, TypeError):
             post_count = 0
         if post_count < min_posts:
-            return True
+            return _reject(f"post count {post_count} < min {min_posts}")
 
     # Recency (no recent post AND no active story)
-    # Only active if explicitly set to a positive value in filters.
-    # Default is 0 (disabled) — do NOT default to 365 which would silently
-    # skip inactive accounts even when no recency filter is configured.
+    # Only active if explicitly set to a positive value in filters AND the
+    # "enable_post_spin" checkbox is OFF (i.e. the old simple recency flag).
+    # When enable_post_spin is ON, recency is handled by the months-threshold
+    # block below; we must NOT double-fire this older check or it will skip
+    # accounts that have already been confirmed recent by the post-spin.
     req_days = int(filters.get("require_recent_post_days", 0))
-    if req_days > 0:
+    if req_days > 0 and not filters.get("enable_post_spin", False):
         has_recent = account.get("has_recent_post", True)
         has_story = account.get("has_story", False)
         if not has_recent and not has_story:
-            return True
+            return _reject(f"no recent post (req_days={req_days})")
 
     # Check for "skip_no_posts_last_n_months"
+    # Only active when the "Enable post-spin" checkbox is ON in the UI.
+    # The actual date parsing and age calculation already happened inside
+    # open_profile_details() which set has_recent_post=False when the post
+    # was older than the threshold.  We simply trust that flag here — we do
+    # NOT re-parse the raw date text because it may contain suffixes like
+    # "• See translation" that break silent parsing.
+    enable_post_spin = filters.get("enable_post_spin", False)
     months_threshold = int(filters.get("skip_no_posts_last_n_months", 0))
-    if months_threshold > 0 and not account.get("has_story", False):
-        # Story ring active = account is live, skip the date check entirely.
-        # Only evaluate post date when there is NO active story.
-        latest_date_text = account.get("latest_post_date_text", "")
-        if latest_date_text:
-            try:
-                post_date = None
-                now = datetime.now()
-
-                m_ago = re.search(r"(\d+)\s+(day|hour|minute|week)s?\s+ago", latest_date_text, re.I)
-                if m_ago:
-                    val = int(m_ago.group(1))
-                    unit = m_ago.group(2).lower()
-                    if unit == "day": post_date = now - timedelta(days=val)
-                    elif unit == "hour": post_date = now - timedelta(hours=val)
-                    elif unit == "minute": post_date = now - timedelta(minutes=val)
-                    elif unit == "week": post_date = now - timedelta(weeks=val)
-
-                if not post_date:
-                    m_short = re.search(r"^(\d+)([dhwm])$", latest_date_text.strip(), re.I)
-                    if m_short:
-                        val = int(m_short.group(1))
-                        unit = m_short.group(2).lower()
-                        if unit == "d": post_date = now - timedelta(days=val)
-                        elif unit == "h": post_date = now - timedelta(hours=val)
-                        elif unit == "m": post_date = now - timedelta(minutes=val)
-                        elif unit == "w": post_date = now - timedelta(weeks=val)
-
-                if not post_date:
-                    clean_text = latest_date_text.replace(".", "").strip()
-                    for fmt in ["%B %d, %Y", "%d %B %Y", "%B %d", "%d %B",
-                                "%b %d, %Y", "%d %b %Y", "%b %d", "%d %b"]:
-                        try:
-                            post_date = datetime.strptime(clean_text, fmt)
-                            if "%Y" not in fmt:
-                                post_date = post_date.replace(year=now.year)
-                                if post_date > now:
-                                    post_date = post_date.replace(year=now.year - 1)
-                            break
-                        except ValueError:
-                            continue
-
-                if post_date:
-                    threshold_days = int(months_threshold * 30.44)
-                    threshold_date = now - timedelta(days=threshold_days)
-                    if post_date < threshold_date:
-                        return True
-            except Exception:
-                pass
-        elif account.get("post_count", 0) > 0:
-            pass
+    if enable_post_spin and months_threshold > 0 and not account.get("has_story", False):
+        if account.get("has_recent_post") is False:
+            return _reject(
+                f"post too old (> {months_threshold} month(s))"
+            )
 
     # Keyword blacklist
     keywords = filters.get("keywords", [])
@@ -645,7 +632,7 @@ def should_skip(account: dict, filters: dict, blacklist: set) -> bool:
         ]).lower()
         for kw in keywords:
             if kw.strip().lower() and kw.strip().lower() in haystack:
-                return True
+                return _reject(f"keyword match: {kw!r}")
 
     return False
 
