@@ -134,6 +134,107 @@ class InstagramScraper:
     def _find_all(self, by, value):
         return self.ctrl.driver.find_elements(by, value)
 
+    # ── Session health ────────────────────────────────────────────────────────
+
+    def _is_session_alive(self) -> bool:
+        """
+        Return True if the UiAutomator2 Appium session is still responsive.
+
+        Uses driver.page_source as a lightweight probe — it requires a round-
+        trip to the UiAutomator2 server on the device, so any crash of the
+        instrumentation process will raise an exception here rather than
+        inside navigate_to_profile() or _verify_on_list().
+        """
+        if not self.ctrl.driver:
+            return False
+        try:
+            _ = self.ctrl.driver.page_source
+            return True
+        except Exception:
+            return False
+
+    def _restart_appium_session(self) -> bool:
+        """
+        Tear down the dead Appium/UiAutomator2 session and create a fresh one.
+
+        This does NOT force-stop Instagram — the app stays alive on the device.
+        We only disconnect and reconnect the WebDriver so UiAutomator2 is
+        reinstalled/relaunched by Appium, giving us a healthy session again.
+
+        Returns True if the new session was created successfully, False otherwise.
+        """
+        self._log("🔁 UiAutomator2 session is dead — restarting Appium session...")
+        serial = self.ctrl._device_serial
+        if not serial:
+            self._log("❌ Cannot restart session: no device serial stored.")
+            return False
+
+        # Quietly kill the dead session object (may already be gone)
+        try:
+            self.ctrl.driver.quit()
+        except Exception:
+            pass
+        self.ctrl.driver = None
+
+        # Give the device a moment to release the accessibility lock
+        time.sleep(3.0)
+
+        try:
+            success = self.ctrl.start_session(serial)
+            if success:
+                self._log("✅ Appium session restarted successfully.")
+            else:
+                self._log("❌ Appium session restart returned False.")
+            return success
+        except Exception as e:
+            self._log(f"❌ Appium session restart failed: {e}")
+            return False
+
+    def _navigate_with_retry(
+        self,
+        target_username: str,
+        mode: str,
+        max_restarts: int = 3,
+    ) -> bool:
+        """
+        Navigate to *target_username*'s profile and open the followers/following
+        list, restarting the Appium session up to *max_restarts* times if
+        UiAutomator2 crashes mid-navigation.
+
+        Returns True when both navigate_to_profile() and open_list() succeed,
+        False if we exhaust all restart attempts.
+        """
+        for attempt in range(1, max_restarts + 1):
+            # Ensure session is alive before trying to use it
+            if not self._is_session_alive():
+                self._log(f"🔁 Session dead before navigation (attempt {attempt}/{max_restarts}) — restarting...")
+                if not self._restart_appium_session():
+                    self._log("❌ Session restart failed — giving up.")
+                    return False
+                time.sleep(2.0)
+
+            try:
+                if not self.navigate_to_profile(target_username):
+                    self._log(f"❌ navigate_to_profile failed (attempt {attempt}/{max_restarts})")
+                    # Not a crash — profile just not found; no point retrying
+                    return False
+                if not self.open_list(mode):
+                    self._log(f"❌ open_list failed (attempt {attempt}/{max_restarts})")
+                    return False
+                return True
+            except Exception as _nav_err:
+                self._log(
+                    f"⚠️ Navigation crashed ({_nav_err.__class__.__name__}) "
+                    f"on attempt {attempt}/{max_restarts} — restarting session..."
+                )
+                if not self._restart_appium_session():
+                    self._log("❌ Session restart failed — giving up.")
+                    return False
+                time.sleep(2.0)
+
+        self._log(f"❌ Navigation failed after {max_restarts} restart attempts.")
+        return False
+
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def navigate_to_profile(self, username: str) -> bool:
@@ -1336,8 +1437,21 @@ class InstagramScraper:
         list, False if all attempts fail (caller should stop the run).
         """
         serial = self.ctrl._device_serial or ""
-        driver = self.ctrl.driver
         self._log("⚠️ Screen drift detected — attempting recovery...")
+
+        # ── Dead-session guard ───────────────────────────────────────────────
+        # The UiAutomator2 instrumentation process can be killed by the OS or
+        # by Instagram's background-process suppression.  When that happens,
+        # every subsequent driver.find_element() raises WebDriverException and
+        # the whole recovery fails before it can do anything useful.
+        # We probe the session first and restart it if it is dead, BEFORE
+        # attempting any Appium-based recovery steps.
+        if not self._is_session_alive():
+            if not self._restart_appium_session():
+                self._log("❌ Recovery aborted: could not revive Appium session.")
+                return False
+
+        driver = self.ctrl.driver
 
         # ── Step 1: escape story/reel viewer with a single Back ──────────────
         try:
@@ -1364,6 +1478,12 @@ class InstagramScraper:
             if self._verify_on_list():
                 self._log("✅ Recovery successful (back-press).")
                 return True
+            if not self._is_session_alive():
+                self._log("🔁 Session died during back-press recovery — restarting...")
+                if not self._restart_appium_session():
+                    return False
+                driver = self.ctrl.driver
+                break   # session fresh; fall through to soft/force-stop recovery
             try:
                 driver.back()
                 time.sleep(1.2)
@@ -1401,7 +1521,7 @@ class InstagramScraper:
 
             # Try to navigate to the profile via the search tab as usual
             self._log(f"🔍 Attempting soft re-navigation to @{target_username}...")
-            if self.navigate_to_profile(target_username) and self.open_list(mode):
+            if self._navigate_with_retry(target_username, mode):
                 self._log("✅ Recovery successful (home → relaunch).")
                 return True
 
@@ -1516,15 +1636,111 @@ class InstagramScraper:
 
         # Re-navigate to the target profile and open the list
         self._log(f"🔍 Re-navigating to @{target_username} after recovery...")
-        if not self.navigate_to_profile(target_username):
-            self._log("❌ Recovery failed — could not navigate to profile.")
-            return False
-        if not self.open_list(mode):
-            self._log("❌ Recovery failed — could not open list.")
+        if not self._navigate_with_retry(target_username, mode):
+            self._log("❌ Recovery failed — could not navigate to profile or open list.")
             return False
 
         self._log("✅ Recovery successful (full restart).")
         return True
+
+    def _dismiss_reload_button(self) -> bool:
+        """
+        Detect and tap the reload/retry button Instagram renders at the bottom
+        of a followers/following list when lazy-loading fails.
+
+        Confirmed via ui_dump.xml:
+          - Parent container : com.instagram.android:id/row_load_more_button
+                               (ViewAnimator — clickable=FALSE, do NOT tap this)
+          - Tappable child   : android.widget.ImageView, content-desc="Retry"
+                               (clickable=TRUE — this is what we tap)
+
+        IMPORTANT: The button lives below the visible viewport while scrolling,
+        so is_displayed() always returns False even though find_element() finds
+        it in the hierarchy tree.  We must NOT gate on is_displayed() — finding
+        the element in the tree is enough signal to act on it.  We scroll it
+        into view via UiAutomator's scrollIntoView before tapping so the tap
+        coordinates are on-screen.
+
+        Returns True if the button was found and tapped, False otherwise.
+        """
+        driver = self.ctrl.driver
+
+        # ── Strategy 1 (primary): exact match on confirmed content-desc "Retry" ──
+        # The ImageView child has content-desc="Retry" (capital R, no extra text).
+        # We scope the search inside the known parent container ID so we never
+        # accidentally tap an unrelated "Retry" element elsewhere on screen.
+        # NOTE: No is_displayed() check — the element is off-screen (below fold)
+        # while scrolling but still present in the hierarchy.  Scrolling it into
+        # view first ensures the subsequent tap lands on a visible coordinate.
+        try:
+            container = driver.find_element(
+                AppiumBy.ID,
+                "com.instagram.android:id/row_load_more_button"
+            )
+            # Scroll the container into the visible viewport before tapping.
+            # UiAutomator's scrollIntoView is the most reliable way to do this
+            # without triggering an accidental list scroll via ADB swipe.
+            try:
+                driver.find_element(
+                    AppiumBy.ANDROID_UIAUTOMATOR,
+                    'new UiScrollable(new UiSelector().scrollable(true))'
+                    '.scrollIntoView(new UiSelector()'
+                    '.resourceId("com.instagram.android:id/row_load_more_button"))'
+                )
+            except Exception:
+                pass  # scrollIntoView failure is non-fatal; try tapping anyway
+
+            # Find the clickable ImageView child with content-desc "Retry"
+            try:
+                retry_btn = container.find_element(
+                    AppiumBy.ANDROID_UIAUTOMATOR,
+                    'new UiSelector().description("Retry")'
+                )
+                self._log("🔄 Show More Button detected (row_load_more_button > Retry) — tapping...")
+                retry_btn.click()
+                time.sleep(2.5)
+                return True
+            except Exception:
+                # Child search failed — tap the ImageView directly by class
+                try:
+                    img = container.find_element(AppiumBy.CLASS_NAME, "android.widget.ImageView")
+                    if img.get_attribute("clickable") == "true":
+                        self._log("🔄 Show More Button detected (ImageView fallback) — tapping...")
+                        img.click()
+                        time.sleep(2.5)
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # ── Strategy 2 (fallback): global scan for content-desc="Retry" ─────────
+        # Catches future IG versions that may remove the row_load_more_button ID
+        # but keep the same ImageView content-desc.
+        # Also no is_displayed() check here — same off-screen reasoning applies.
+        try:
+            # scrollIntoView by content-desc as a best-effort scroll first
+            try:
+                driver.find_element(
+                    AppiumBy.ANDROID_UIAUTOMATOR,
+                    'new UiScrollable(new UiSelector().scrollable(true))'
+                    '.scrollIntoView(new UiSelector().description("Retry"))'
+                )
+            except Exception:
+                pass
+
+            retry_btn = driver.find_element(
+                AppiumBy.ANDROID_UIAUTOMATOR,
+                'new UiSelector().description("Retry").clickable(true)'
+            )
+            self._log("🔄 Show More Button detected (global Retry desc) — tapping...")
+            retry_btn.click()
+            time.sleep(2.5)
+            return True
+        except Exception:
+            pass
+
+        return False
 
     def scroll_list(self, swipe_distance: float = 0.6):
         """Scroll the list down using ADB shell swipe for better stability."""
@@ -1650,12 +1866,8 @@ class InstagramScraper:
         profile_delay_min = delays.get("between_profiles_min",  2.0)
         profile_delay_max = delays.get("between_profiles_max",  4.0)
 
-        if not self.navigate_to_profile(target_username):
-            self._log(f"❌ Could not open @{target_username}'s profile")
-            return 0
-
-        if not self.open_list(mode):
-            self._log(f"❌ Could not open {mode} list for @{target_username}")
+        if not self._navigate_with_retry(target_username, mode):
+            self._log(f"❌ Could not open @{target_username}'s {mode} list")
             return 0
 
         self._log(f"✅ Opened {mode} list. Starting collection...")
@@ -1689,11 +1901,8 @@ class InstagramScraper:
                 except Exception:
                     pass
 
-                if not self.navigate_to_profile(target_username):
+                if not self._navigate_with_retry(target_username, mode):
                     self._log("❌ Account switch failed — stopping")
-                    break
-                if not self.open_list(mode):
-                    self._log("❌ Could not reopen list after account switch — stopping")
                     break
                 consecutive_empty = 0
                 continue
@@ -1719,6 +1928,19 @@ class InstagramScraper:
                 recovery_failures = 0   # reset on confirmed good screen
 
             accounts = self._extract_visible_accounts()
+
+            # ── Check for a reload/retry button on EVERY iteration ───────────
+            # The Retry button appears at the bottom of the list when Instagram
+            # fails to lazy-load the next batch (network hiccup, soft rate-limit).
+            # It can be present even when some accounts are still visible above it,
+            # so we must check here — BEFORE the `if not accounts` branch — to
+            # avoid scrolling past it without ever tapping it.
+            # The button lives below the visible viewport while scrolling, so
+            # _dismiss_reload_button() now scrolls it into view before tapping
+            # (is_displayed() is NOT used as a guard — see method docstring).
+            if self._dismiss_reload_button():
+                consecutive_empty = 0   # reset — the list is live again
+                continue
 
             # _extract_visible_accounts returns [] with a "Suggested" log when
             # it hits the boundary. Distinguish that from a genuine empty page
@@ -1793,7 +2015,25 @@ class InstagramScraper:
                     # meaning the driver is still on the list — pressing Back
                     # in that case would exit the list and cause screen drift.
                     if details.get("_navigated_in", True):
-                        self.ctrl.press_back()
+                        try:
+                            self.ctrl.press_back()
+                        except Exception as _back_err:
+                            # UiAutomator2 crashed mid-back-press.
+                            # Delegate fully to _recover_to_list which handles
+                            # dead-session restart + re-navigation in one place.
+                            self._log(f"⚠️ press_back() failed ({_back_err.__class__.__name__}) — "
+                                      "recovering...")
+                            if self._recover_to_list(target_username, mode):
+                                recovery_failures = 0
+                            else:
+                                recovery_failures += 1
+                                self._log(f"❌ Recovery failed after press_back() crash ({recovery_failures}).")
+                                if recovery_failures >= 3:
+                                    self._log("❌ Too many failed recovery attempts — stopping.")
+                                    self._stop_flag = True
+                            mid_batch_recovered = True
+                            break
+
                     time.sleep(_rand(profile_delay_min, profile_delay_max))
 
                     # ── Mid-batch drift guard ────────────────────────────────
@@ -1802,7 +2042,7 @@ class InstagramScraper:
                     # batch. If we drifted (story viewer, Reels, accidental tap)
                     # recover now instead of silently skipping the remaining
                     # accounts in the batch.
-                    if not self._verify_on_list():
+                    if not mid_batch_recovered and not self._verify_on_list():
                         self._log("🔍 Mid-batch drift — recovering before continuing...")
                         if self._recover_to_list(target_username, mode):
                             recovery_failures = 0

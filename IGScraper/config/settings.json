@@ -21,7 +21,7 @@
     "between_scrolls_max": 3.0,
     "rest_min_seconds": 100,
     "rest_max_seconds": 500,
-    "session_break_every": 5,
+    "session_break_every": 100,
     "switch_mode": "hours",
     "switch_hours": 1
   },
@@ -51,12 +51,12 @@
   "blacklist": [],
   "last_target": "",
   "last_mode": "following",
-  "last_count": 100,
+  "last_count": 20,
   "last_device": "",
   "targets_per_phone": [
     [],
     [],
     []
   ],
-  "mirror_width": 500
+  "mirror_width": 659
 }
