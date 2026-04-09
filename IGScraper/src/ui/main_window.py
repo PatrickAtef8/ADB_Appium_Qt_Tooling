@@ -8,7 +8,8 @@ import random
 from datetime import datetime, time as dtime
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore    import Qt, QThread, QTime, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore    import Qt, QThread, QTime, QTimer, pyqtSignal, QObject, QUrl
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PyQt6.QtGui     import QFont, QColor, QIcon, QPixmap, QImageReader
 from PyQt6.QtWidgets import (
     QAbstractSpinBox, QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
@@ -1306,6 +1307,7 @@ class MainWindow(FluentWindow):
         self._refresh_devices()
         self._reload_blacklist_ui()
         self._on_schedule_toggled()   # apply enabled/disabled state on load
+        self._setup_network_monitor() # start internet connectivity watcher
 
     # ── Persistent mirror panel ───────────────────────────────────────────
     def _init_persistent_mirror(self):
@@ -1809,14 +1811,14 @@ class MainWindow(FluentWindow):
                 title=f"{count} {label} connected",
                 content=f"{names} — select a slot to assign.",
                 orient=Qt.Orientation.Horizontal,
-                isClosable=True, duration=4000, parent=self,
+                isClosable=True, duration=5000, parent=self,
             )
         else:
             InfoBar.warning(
                 title="No devices found",
                 content="Connect a phone via USB and press Refresh.",
                 orient=Qt.Orientation.Horizontal,
-                isClosable=True, duration=4000, parent=self,
+                isClosable=True, duration=6000, parent=self,
             )
         self._log(f"🔍 Found {len(devices)} device(s).")
 
@@ -1991,7 +1993,7 @@ class MainWindow(FluentWindow):
         serial = combo_dev.currentData()
 
         if not serial:
-            InfoBar.warning("No Device", f"Phone {row_idx + 1} has no device assigned.", parent=self)
+            InfoBar.warning("No Device", f"Phone {row_idx + 1} has no device assigned.", isClosable=True, duration=6000, parent=self)
             return
 
         if self._mirror_phone_idx == row_idx:
@@ -2133,7 +2135,7 @@ class MainWindow(FluentWindow):
         assigned = self._get_assigned_devices()
 
         if not assigned:
-            InfoBar.warning("No Devices", "Assign at least one phone in the Dashboard.", parent=self)
+            InfoBar.warning("No Devices", "Assign at least one phone in the Dashboard.", isClosable=True, duration=6000, parent=self)
             return
 
         phone_targets = self._get_phone_targets()
@@ -2142,6 +2144,8 @@ class MainWindow(FluentWindow):
             InfoBar.warning(
                 "No Targets",
                 "Enter at least one username in any phone's target box.",
+                isClosable=True,
+                duration=6000,
                 parent=self,
             )
             return
@@ -2183,7 +2187,7 @@ class MainWindow(FluentWindow):
                 err_msg,
                 orient=Qt.Orientation.Horizontal,
                 isClosable=True,
-                duration=6000,
+                duration=8000,
                 parent=self,
             )
             # Re-enable Start so the user can try again
@@ -2210,7 +2214,7 @@ class MainWindow(FluentWindow):
                 serials, log_callback=self._log
             )
         except RuntimeError as e:
-            InfoBar.error("Appium Failed", str(e)[:300], parent=self)
+            InfoBar.error("Appium Failed", str(e)[:300], isClosable=True, duration=8000, parent=self)
             self._log(f"❌ Appium startup failed: {e}")
             self._update_start_button_state()
             return
@@ -2333,7 +2337,7 @@ class MainWindow(FluentWindow):
         self._done_phones += 1
         self._log(f"❌ Phone {phone_idx+1} error: {msg}")
         self._on_phone_status(phone_idx, "error ❌")
-        InfoBar.error(f"Phone {phone_idx+1} Error", msg[:200], parent=self)
+        InfoBar.error(f"Phone {phone_idx+1} Error", msg[:200], isClosable=True, duration=8000, parent=self)
         if self._done_phones >= self._active_phones:
             self._all_done()
 
@@ -2343,6 +2347,8 @@ class MainWindow(FluentWindow):
         InfoBar.success(
             "Complete!",
             f"All phones finished. {self._collected} accounts saved to Google Sheets.",
+            isClosable=True,
+            duration=8000,
             parent=self,
         )
         self._reset_ui_after_done()
@@ -2371,7 +2377,7 @@ class MainWindow(FluentWindow):
         cfg = self._collect_cfg()
         save_config(cfg)
         if not cfg["sheet_id"]:
-            InfoBar.warning("Missing Sheet ID", "Enter your Google Sheet ID first.", parent=self)
+            InfoBar.warning("Missing Sheet ID", "Enter your Google Sheet ID first.", isClosable=True, duration=6000, parent=self)
             return
         self._log("🔗 Authenticating with Google Sheets (browser may open)…")
         # Disable the test button while auth runs so the user can't double-click
@@ -2384,7 +2390,7 @@ class MainWindow(FluentWindow):
             self._sheets_client = client
             self.settings_page.lbl_sheet_status.setText(f"✅ Connected · {rows} rows")
             self._log(f"✅ Google Sheet connected — {rows} existing rows.")
-            InfoBar.success("Connected!", f"Google Sheets ready. {rows} existing rows.", parent=self)
+            InfoBar.success("Connected!", f"Google Sheets ready. {rows} existing rows.", isClosable=True, duration=5000, parent=self)
             try:
                 self.settings_page.btn_test_sheets.setEnabled(True)
             except Exception:
@@ -2394,7 +2400,7 @@ class MainWindow(FluentWindow):
             self._sheets_client = None
             self.settings_page.lbl_sheet_status.setText("❌ Not connected")
             self._log(f"❌ Sheets error: {err_msg}")
-            InfoBar.error("Connection Failed", err_msg, parent=self)
+            InfoBar.error("Connection Failed", err_msg, isClosable=True, duration=8000, parent=self)
             try:
                 self.settings_page.btn_test_sheets.setEnabled(True)
             except Exception:
@@ -2415,9 +2421,9 @@ class MainWindow(FluentWindow):
         if os.path.exists(tp):
             os.remove(tp)
             self._log("🔑 OAuth token revoked.")
-            InfoBar.success("Token Revoked", "Will re-authenticate on next connect.", parent=self)
+            InfoBar.success("Token Revoked", "Will re-authenticate on next connect.", isClosable=True, duration=5000, parent=self)
         else:
-            InfoBar.info("No Token", "No saved token found.", parent=self)
+            InfoBar.info("No Token", "No saved token found.", isClosable=True, duration=5000, parent=self)
 
     # ── Blacklist helpers ─────────────────────────────────────────────────
     def _reload_blacklist_ui(self):
@@ -2444,10 +2450,12 @@ class MainWindow(FluentWindow):
             InfoBar.success(
                 "Downloaded",
                 f"Blacklist exported ({len(bl)} entries) → {os.path.basename(path)}",
+                isClosable=True,
+                duration=5000,
                 parent=self,
             )
         except Exception as exc:
-            InfoBar.error("Export Failed", str(exc), parent=self)
+            InfoBar.error("Export Failed", str(exc), isClosable=True, duration=8000, parent=self)
 
     def _import_blacklist_txt(self):
         """Import usernames from a .txt file (one per line) — merges with existing list."""
@@ -2469,10 +2477,12 @@ class MainWindow(FluentWindow):
                 "Imported",
                 f"Added {added} new entr{'y' if added == 1 else 'ies'} "
                 f"({len(bl)} total in blacklist).",
+                isClosable=True,
+                duration=5000,
                 parent=self,
             )
         except Exception as exc:
-            InfoBar.error("Import Failed", str(exc), parent=self)
+            InfoBar.error("Import Failed", str(exc), isClosable=True, duration=8000, parent=self)
 
     def _clear_blacklist(self):
         if QMessageBox.question(
@@ -2482,13 +2492,13 @@ class MainWindow(FluentWindow):
         ) == QMessageBox.StandardButton.Yes:
             clear_blacklist()
             self._reload_blacklist_ui()
-            InfoBar.success("Cleared", "Blacklist cleared.", parent=self)
+            InfoBar.success("Cleared", "Blacklist cleared.", isClosable=True, duration=5000, parent=self)
 
     # ── Export ────────────────────────────────────────────────────────────
     def _export_csv(self):
         table = self.results_page.table
         if table.rowCount() == 0:
-            InfoBar.warning("No Data", "No accounts collected yet.", parent=self)
+            InfoBar.warning("No Data", "No accounts collected yet.", isClosable=True, duration=6000, parent=self)
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export CSV", "scraped_accounts.csv", "CSV Files (*.csv)"
@@ -2508,12 +2518,24 @@ class MainWindow(FluentWindow):
                         (table.item(row, col).text() if table.item(row, col) else "")
                         for col in range(table.columnCount())
                     ])
-            InfoBar.success("Exported", f"{table.rowCount()} rows saved to {path}", parent=self)
+            InfoBar.success("Exported", f"{table.rowCount()} rows saved to {path}", isClosable=True, duration=5000, parent=self)
         except Exception as e:
-            InfoBar.error("Export Failed", str(e), parent=self)
+            InfoBar.error("Export Failed", str(e), isClosable=True, duration=8000, parent=self)
 
     # ── Cleanup ───────────────────────────────────────────────────────────
     def closeEvent(self, event):
+        # ── Exit confirmation ─────────────────────────────────────────────────
+        reply = QMessageBox.question(
+            self,
+            "Exit Cansa",
+            "Are you sure you want to exit?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+
         cfg = self._collect_cfg()
         cfg["mirror_width"] = getattr(self, "_mirror_width", 500)
         save_config(cfg)
@@ -2525,6 +2547,77 @@ class MainWindow(FluentWindow):
         if hasattr(self, "mirror"):
             self.mirror.detach()
         event.accept()
+
+
+    # ── Network monitor ───────────────────────────────────────────────────
+    def _setup_network_monitor(self):
+        """
+        Poll internet connectivity every 15 seconds using Qt's own network
+        stack (no extra threads, no sockets).  Shows an InfoBar warning when
+        the connection drops and a success bar when it comes back.
+        """
+        self._net_manager   = QNetworkAccessManager(self)
+        self._net_was_up    = True   # assume online at start
+        self._net_bar_shown = False  # track whether the warning bar is live
+        self._net_fail_count = 0     # consecutive failures needed before showing toast
+        self._net_bar       = None   # reference to the live "No Internet" InfoBar
+
+        self._net_timer = QTimer(self)
+        self._net_timer.setInterval(15_000)   # check every 15 s
+        self._net_timer.timeout.connect(self._check_network)
+        self._net_timer.start()
+
+        # Run one check ~2 s after startup so the window is fully painted first
+        QTimer.singleShot(2_000, self._check_network)
+
+    def _check_network(self):
+        """Fire a lightweight HEAD request to check connectivity."""
+        req = QNetworkRequest(QUrl("https://www.google.com"))
+        req.setTransferTimeout(6_000)
+        reply = self._net_manager.head(req)
+        reply.finished.connect(lambda: self._on_net_reply(reply))
+
+    def _on_net_reply(self, reply):
+        from PyQt6.QtNetwork import QNetworkReply
+        err = reply.error()
+        reply.deleteLater()
+
+        is_up = (err == QNetworkReply.NetworkError.NoError)
+
+        if not is_up and self._net_was_up:
+            # Require 2 consecutive failures before declaring offline
+            # (prevents false positives from a single slow/blocked request on startup)
+            self._net_fail_count += 1
+            if self._net_fail_count >= 2:
+                self._net_was_up     = False
+                self._net_bar_shown  = True
+                self._net_fail_count = 0
+                self._net_bar = InfoBar.warning(
+                    "No Internet",
+                    "No internet connection detected. Please check your network.",
+                    isClosable=True,
+                    duration=-1,      # stays until dismissed or connection returns (-1 = infinite in QFluentWidgets)
+                    parent=self,
+                )
+
+        elif is_up and not self._net_was_up:
+            # Connection restored — close the yellow bar immediately
+            if self._net_bar is not None:
+                self._net_bar.close()
+                self._net_bar = None
+            self._net_was_up     = True
+            self._net_bar_shown  = False
+            self._net_fail_count = 0
+            InfoBar.success(
+                "Back Online",
+                "Internet connection restored.",
+                isClosable=True,
+                duration=8_000,
+                parent=self,
+            )
+        elif is_up:
+            # Still online — reset any partial fail streak
+            self._net_fail_count = 0
 
 
 if __name__ == "__main__":
