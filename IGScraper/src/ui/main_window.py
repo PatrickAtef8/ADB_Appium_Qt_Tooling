@@ -345,7 +345,15 @@ class PhoneWorker(QThread):
             def on_account(acc):
                 if self._stop_flag:
                     return
-                saved = self.sheets.append_account(acc)
+                # Google Sheets is optional — sheets is None when user disabled it
+                if self.sheets is not None:
+                    try:
+                        saved = self.sheets.append_account(acc)
+                    except Exception as sheets_exc:
+                        self._log(f"⚠️ Sheets write failed (skipping): {sheets_exc}")
+                        saved = True   # still emit so webhook fires
+                else:
+                    saved = True       # no dedup via sheets; always treat as new
                 if saved:
                     self.signals.account.emit(acc)
                     if webhook_url:
@@ -386,13 +394,21 @@ class PhoneWorker(QThread):
 
                 # ── Working-hours end-time enforcement ───────────────────────
                 # This check runs after every collected profile so scraping
-                # stops as soon as the end time is reached, not just between targets.
+                # pauses as soon as the end time is reached, not just between
+                # targets.  We only stop the *scraper* here (so the current
+                # target loop exits cleanly).  The outer "for target in targets"
+                # loop already calls _wait_for_schedule() at the top of every
+                # iteration, so it will automatically block until the next
+                # window opens — no extra logic needed here.
+                # We do NOT touch self._stop_flag: if the user pressed Stop All,
+                # that flag is already True and must stay True so the outer loop
+                # exits rather than resuming scraping.
                 if schedule.get("enabled") and self._is_past_schedule_end(schedule):
                     end = dtime(schedule["end_hour"], schedule["end_minute"])
-                    self._log(f"⏰ Working hours ended ({end:%H:%M}). Stopping scraping…")
-                    self._stop_flag = True
+                    self._log(f"⏰ Working hours ended ({end:%H:%M}). Stopping.")
                     if self._scraper:
                         self._scraper.stop()
+                    self._stop_flag = True
                     return
 
                 if len(device_accounts) <= 1 or self._stop_flag:
@@ -476,9 +492,15 @@ class PhoneWorker(QThread):
                 on_switch_check=_check_and_switch,
             )
 
-            for target in self.targets:
-                if self._stop_flag:
-                    break
+            # ── Target loop ──────────────────────────────────────────────────
+            # We use an index instead of `for target in self.targets` so that
+            # when working hours end mid-scrape we can re-run the SAME target
+            # (with the remaining quota) after the next window opens, rather
+            # than silently advancing to the next target or stopping entirely.
+            target_idx = 0
+            while target_idx < len(self.targets) and not self._stop_flag:
+                target = self.targets[target_idx]
+
                 if schedule.get("enabled"):
                     self._wait_for_schedule(schedule)
                 if self._stop_flag:
@@ -487,31 +509,94 @@ class PhoneWorker(QThread):
                 self._log(f"🎯 Processing target: @{target}")
                 self.signals.status.emit(idx, f"@{target}")
 
-                count = self._scraper.run(
-                    target_username=target,
-                    mode=mode,
-                    max_count=max_per_target,
-                    filters=filters,
-                    delays=delays,
-                    fetch_details=True,
-                    blacklist=blacklist,
-                )
-                total_collected += count
-                self._log(f"✅ @{target} done — {count} this run, {total_collected} total")
+                # Clear both stop flags before (re-)running a target.
+                # _hours_interrupted is set by _check_and_switch when the
+                # schedule end fires; we read it after run() returns to decide
+                # whether to re-queue this target.
+                if self._scraper:
+                    self._scraper._stop_flag = False
+                    self._scraper._hours_interrupted = False
 
-                if self._stop_flag:
-                    break
+                # ── Retry loop for navigation failures ───────────────────
+                # scraper.run() returns 0 without raising when it cannot open
+                # the profile or the follower/following list (network hiccup,
+                # Instagram rate-limit, stale Appium state, etc.). Retry up to
+                # 2 extra times with a 30 s cool-down before giving up, so a
+                # single transient failure doesn't silently skip the whole target.
+                # We never retry if the user pressed Stop.
+                _MAX_TARGET_RETRIES = 2
+                count = 0
+                for _attempt in range(1 + _MAX_TARGET_RETRIES):
+                    if self._stop_flag:
+                        break
+                    if _attempt > 0:
+                        self._log(
+                            f"⚠️ @{target} returned 0 accounts — "
+                            f"retrying in 30 s (attempt {_attempt}/{_MAX_TARGET_RETRIES})…"
+                        )
+                        self._sleep(30)
+                        if self._stop_flag:
+                            break
+                        if self._scraper:
+                            self._scraper._stop_flag = False
+                            self._scraper._hours_interrupted = False
 
-                # Rest between targets (skip for the last target)
-                if (len(self.targets) > 1
-                        and target != self.targets[-1]
-                        and not self._stop_flag):
-                    rest_s = random.randint(
-                        int(delays.get("rest_min_seconds", 60)),
-                        int(delays.get("rest_max_seconds", 300)),
+                    count = self._scraper.run(
+                        target_username=target,
+                        mode=mode,
+                        max_count=max_per_target,
+                        filters=filters,
+                        delays=delays,
+                        fetch_details=True,
+                        blacklist=blacklist,
                     )
-                    self._log(f"😴 Resting {rest_s // 60}m {rest_s % 60}s before next target…")
-                    self._sleep(rest_s)
+                    # Don't retry if: user stopped, hours interrupted (will
+                    # re-run whole target next window), or real accounts found.
+                    hours_hit = getattr(self._scraper, "_hours_interrupted", False)
+                    if self._stop_flag or hours_hit or count > 0:
+                        break
+
+                # ── Device lost mid-scrape? ──────────────────────────────────
+                # If the scraper set _session_dead, the device became
+                # unrecoverable (not a normal finish). Break out of the target
+                # loop so the worker emits signals.error → triggers auto-restart.
+                session_dead = getattr(self._scraper, "_session_dead", False)
+                if session_dead and not self._stop_flag:
+                    raise RuntimeError(
+                        f"Device lost mid-scrape on @{target} "
+                        f"(collected {count}/{max_per_target} before session died)"
+                    )
+
+                total_collected += count
+
+                # ── Decide whether to advance or re-run this target ──────
+                hours_hit = getattr(self._scraper, "_hours_interrupted", False)
+                if hours_hit and not self._stop_flag:
+                    # Hours ended mid-target. Stay on the same target_idx so
+                    # _wait_for_schedule (top of while loop) blocks until the
+                    # next window, then re-runs this target from scratch.
+                    # Log how many were already collected this partial run.
+                    remaining = max_per_target - count
+                    self._log(
+                        f"⏸️ @{target} paused after {count} accounts "
+                        f"(need {remaining} more). Will resume next window."
+                    )
+                    # Don't advance target_idx — loop back to wait
+                else:
+                    self._log(f"✅ @{target} done — {count} this run, {total_collected} total")
+                    target_idx += 1   # advance to next target
+
+                    if self._stop_flag:
+                        break
+
+                    # Rest between targets (skip for the last target)
+                    if (target_idx < len(self.targets) and not self._stop_flag):
+                        rest_s = random.randint(
+                            int(delays.get("rest_min_seconds", 60)),
+                            int(delays.get("rest_max_seconds", 300)),
+                        )
+                        self._log(f"😴 Resting {rest_s // 60}m {rest_s % 60}s before next target…")
+                        self._sleep(rest_s)
 
             self.signals.finished.emit(idx, total_collected)
 
@@ -523,20 +608,79 @@ class PhoneWorker(QThread):
             if self._controller:
                 self._controller.stop_session()
 
+    @staticmethod
+    def _schedule_duration(schedule: dict):
+        """Return the timedelta duration of the configured window."""
+        from datetime import timedelta
+        start_t = dtime(schedule["start_hour"], schedule["start_minute"])
+        end_t   = dtime(schedule["end_hour"],   schedule["end_minute"])
+        if end_t > start_t:
+            return timedelta(hours=end_t.hour - start_t.hour,
+                             minutes=end_t.minute - start_t.minute)
+        return timedelta(days=1) - timedelta(hours=start_t.hour - end_t.hour,
+                                             minutes=start_t.minute - end_t.minute)
+
+    @staticmethod
+    def _next_window(schedule: dict):
+        """
+        Return the next FUTURE (win_start, win_end) datetimes.
+        start_t has already passed today → win_start is tomorrow.
+        """
+        from datetime import timedelta
+        now     = datetime.now()
+        start_t = dtime(schedule["start_hour"], schedule["start_minute"])
+        win_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                second=0, microsecond=0)
+        if win_start <= now:
+            win_start += timedelta(days=1)
+        duration = PhoneWorker._schedule_duration(schedule)
+        return win_start, win_start + duration
+
+    def _in_schedule_window(self, schedule: dict) -> bool:
+        """
+        Return True only if we are inside a window that:
+          1. Started AFTER the schedule was saved (saved_at), and
+          2. Has not yet ended.
+
+        Using saved_at as the anchor prevents a just-passed start from
+        being treated as "active" when the user configured it after the
+        fact.
+        """
+        from datetime import timedelta
+        now     = datetime.now()
+        start_t = dtime(schedule["start_hour"], schedule["start_minute"])
+
+        # Most recent past occurrence of start_t
+        prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                 second=0, microsecond=0)
+        if prev_start > now:
+            prev_start -= timedelta(days=1)
+
+        prev_end = prev_start + self._schedule_duration(schedule)
+
+        # Only active if the window started after the config was saved
+        saved_at_str = schedule.get("saved_at", "")
+        try:
+            saved_at = datetime.fromisoformat(saved_at_str)
+        except (ValueError, TypeError):
+            saved_at = datetime.min   # no saved_at → conservative: never active
+
+        return (prev_start >= saved_at) and (now < prev_end)
+
     def _wait_for_schedule(self, schedule: dict):
-        start = dtime(schedule["start_hour"], schedule["start_minute"])
-        end   = dtime(schedule["end_hour"],   schedule["end_minute"])
+        start_t = dtime(schedule["start_hour"], schedule["start_minute"])
+        end_t   = dtime(schedule["end_hour"],   schedule["end_minute"])
         while not self._stop_flag:
-            now = datetime.now().time()
-            if start <= now <= end:
+            if self._in_schedule_window(schedule):
                 return
-            self._log(f"⏰ Outside hours ({start:%H:%M}–{end:%H:%M}). Waiting…")
+            win_start, _ = self._next_window(schedule)
+            self._log(f"⏰ Outside hours ({start_t:%H:%M}–{end_t:%H:%M}). "
+                      f"Next window: {win_start.strftime('%a %I:%M %p')}. Waiting…")
             self._sleep(60)
 
     def _is_past_schedule_end(self, schedule: dict) -> bool:
-        """Return True if the current time is past the schedule end time."""
-        end = dtime(schedule["end_hour"], schedule["end_minute"])
-        return datetime.now().time() > end
+        """Return True if the current time is outside the active schedule window."""
+        return not self._in_schedule_window(schedule)
 
     def _sleep(self, seconds: int):
         for _ in range(seconds):
@@ -787,6 +931,12 @@ class DashboardPage(QWidget):
         time_row.addWidget(self.time_end)
         time_row.addStretch()
         sched_lay.addLayout(time_row)
+
+        self.lbl_sched_preview = CaptionLabel("", sched_card)
+        self.lbl_sched_preview.setStyleSheet("background: transparent; color: #3b82f6;")
+        self.lbl_sched_preview.setWordWrap(True)
+        sched_lay.addWidget(self.lbl_sched_preview)
+
         bottom_row.addWidget(sched_card, 1)
 
         left_lay.addLayout(bottom_row)
@@ -1065,6 +1215,13 @@ class SettingsPage(PageWidget):
         lbl_sh.setFont(T.heading()); lbl_sh.setStyleSheet("background: transparent;")
         sh_lay.addWidget(lbl_sh)
 
+        # Enable/disable toggle
+        self.chk_enable_sheets = CheckBox("Enable Google Sheets export", sh_card)
+        self.chk_enable_sheets.setFont(T.body())
+        self.chk_enable_sheets.setStyleSheet("background: transparent;")
+        self.chk_enable_sheets.setChecked(True)
+        sh_lay.addWidget(self.chk_enable_sheets)
+
         def _row(label, widget):
             r = QHBoxLayout()
             lbl = CaptionLabel(label, sh_card)
@@ -1096,6 +1253,26 @@ class SettingsPage(PageWidget):
         self.lbl_sheet_status.setFont(T.body()); self.lbl_sheet_status.setStyleSheet("background: transparent;")
         btns_row.addWidget(self.lbl_sheet_status); btns_row.addStretch()
         sh_lay.addLayout(btns_row)
+
+        # Keep a list of all sheet-detail widgets so we can en/disable them together
+        self._sheet_detail_widgets = [
+            self.inp_sheet_id, self.inp_sheet_tab, self.inp_creds,
+            self.btn_browse_creds, self.btn_test_sheets, self.btn_revoke_token,
+        ]
+
+        def _on_sheets_toggle(state):
+            enabled = self.chk_enable_sheets.isChecked()
+            for w in self._sheet_detail_widgets:
+                w.setEnabled(enabled)
+            if not enabled:
+                self.lbl_sheet_status.setText("Disabled")
+            else:
+                self.lbl_sheet_status.setText("Not connected")
+
+        self.chk_enable_sheets.stateChanged.connect(_on_sheets_toggle)
+        # Apply initial state
+        _on_sheets_toggle(self.chk_enable_sheets.isChecked())
+
         self.add(sh_card)
 
         # Webhook & Appium side by side
@@ -1749,6 +1926,8 @@ class MainWindow(FluentWindow):
         dp.btn_start.clicked.connect(self._start_scraping)
         dp.btn_stop.clicked.connect(self._stop_all)
         dp.chk_schedule.stateChanged.connect(self._on_schedule_toggled)
+        dp.time_start.timeChanged.connect(self._update_schedule_preview)
+        dp.time_end.timeChanged.connect(self._update_schedule_preview)
 
         for i, (combo_dev, combo_acc, lbl_port, lbl_status, btn_view) in enumerate(dp.device_rows):
             combo_dev.currentIndexChanged.connect(
@@ -1781,14 +1960,72 @@ class MainWindow(FluentWindow):
                 w is dp.chk_schedule or dp.chk_schedule.isChecked()
             ))
 
+    def _update_schedule_preview(self, _=None):
+        """Recompute and show when the next window will actually run."""
+        from datetime import datetime, time as dtime, timedelta
+        dp = self.dashboard_page
+        if not dp.chk_schedule.isChecked():
+            dp.lbl_sched_preview.setText("")
+            return
+        ts = dp.time_start.time()
+        te = dp.time_end.time()
+        start_t = dtime(ts.hour(), ts.minute())
+        end_t   = dtime(te.hour(), te.minute())
+        now     = datetime.now()
+
+        if end_t > start_t:
+            duration = timedelta(hours=end_t.hour - start_t.hour,
+                                 minutes=end_t.minute - start_t.minute)
+        else:
+            duration = timedelta(days=1) - timedelta(hours=start_t.hour - end_t.hour,
+                                                      minutes=start_t.minute - end_t.minute)
+
+        # Most recent past start occurrence
+        prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                 second=0, microsecond=0)
+        if prev_start > now:
+            prev_start -= timedelta(days=1)
+        prev_end = prev_start + duration
+
+        # Active only if prev_start >= saved_at AND still inside window
+        # For preview purposes saved_at = "right now" (user is editing live)
+        # so we show active only if the window genuinely started before now
+        # AND would still be running — but since user is editing, treat as
+        # "the moment they finish and click Start" = now.
+        # We show active if prev_start is recent enough that the window is running.
+        # Since we can't know saved_at here, just show the next start always as
+        # the honest answer — user decides.
+        next_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                 second=0, microsecond=0)
+        if next_start <= now:
+            next_start += timedelta(days=1)
+        next_end = next_start + duration
+
+        # Show active only if currently inside window AND prev_start is very recent
+        # (within last 5 minutes) — meaning the window just started and user likely
+        # intended it. Otherwise show next window.
+        in_window = (prev_start <= now < prev_end) and                     ((now - prev_start).total_seconds() <= 300)
+
+        if in_window:
+            dp.lbl_sched_preview.setText(
+                f"▶ Active now — ends {prev_end.strftime('%a %I:%M %p')}"
+            )
+            dp.lbl_sched_preview.setStyleSheet("background: transparent; color: #22c55e;")
+        else:
+            dp.lbl_sched_preview.setText(
+                f"⏳ Next window: {next_start.strftime('%a %I:%M %p')} → {next_end.strftime('%a %I:%M %p')}"
+            )
+            dp.lbl_sched_preview.setStyleSheet("background: transparent; color: #f59e0b;")
+
     def _on_schedule_toggled(self, _state=None):
         """Enable/disable time pickers based on the Working Hours checkbox."""
         dp = self.dashboard_page
         enabled = dp.chk_schedule.isChecked()
         for w in [dp.time_start, dp.time_end,
                   dp._lbl_sched_start, dp._lbl_sched_end, dp._lbl_sched_arrow,
-                  dp.lbl_sched_desc]:
+                  dp.lbl_sched_desc, dp.lbl_sched_preview]:
             w.setEnabled(enabled)
+        self._update_schedule_preview()
 
     def _refresh_devices(self):
         devices = get_connected_devices()
@@ -2035,11 +2272,13 @@ class MainWindow(FluentWindow):
         ts = dp.time_start.time()
         te = dp.time_end.time()
         cfg["schedule"] = {
-            "enabled":      dp.chk_schedule.isChecked(),
-            "start_hour":   ts.hour(),
-            "start_minute": ts.minute(),
-            "end_hour":     te.hour(),
-            "end_minute":   te.minute(),
+            "enabled":        dp.chk_schedule.isChecked(),
+            "start_hour":     ts.hour(),
+            "start_minute":   ts.minute(),
+            "end_hour":       te.hour(),
+            "end_minute":     te.minute(),
+            "saved_at":       datetime.now().isoformat(),
+
         }
         cfg["filters"] = {
             "skip_no_bio":              fp.chk_skip_no_bio.isChecked(),
@@ -2056,6 +2295,7 @@ class MainWindow(FluentWindow):
         cfg["sheet_tab"]        = sp.inp_sheet_tab.text().strip() or "Sheet1"
         cfg["credentials_path"] = sp.inp_creds.text().strip()
         cfg["webhook_url"]      = sp.inp_webhook.text().strip()
+        cfg["sheets_enabled"]   = sp.chk_enable_sheets.isChecked()
         cfg["appium"]["host"]   = sp.inp_appium_host.text().strip()
         cfg["delays"] = {
             "between_profiles_min":   sp.sp_prof_min.value(),
@@ -2095,6 +2335,7 @@ class MainWindow(FluentWindow):
         dp.time_start.setTime(QTime(s.get("start_hour", 8),  s.get("start_minute", 0)))
         dp.time_end.setTime(QTime(s.get("end_hour",   20),   s.get("end_minute",   0)))
 
+
         f = c.get("filters", {})
         fp.chk_skip_no_bio.setChecked(f.get("skip_no_bio", False))
         fp.chk_skip_private.setChecked(f.get("skip_private", False))
@@ -2111,6 +2352,7 @@ class MainWindow(FluentWindow):
         sp.inp_sheet_tab.setText(c.get("sheet_tab", "Sheet1"))
         sp.inp_creds.setText(c.get("credentials_path", "assets/credentials.json"))
         sp.inp_webhook.setText(c.get("webhook_url", ""))
+        sp.chk_enable_sheets.setChecked(c.get("sheets_enabled", True))
         sp.inp_appium_host.setText(c.get("appium", {}).get("host", "127.0.0.1"))
 
         d = c.get("delays", {})
@@ -2152,6 +2394,20 @@ class MainWindow(FluentWindow):
 
         save_config(cfg)
 
+        # Capture everything _launch_scraping needs (closure over local vars)
+        _cfg           = cfg
+        _assigned      = assigned
+        _phone_targets = phone_targets
+        _total_targets = total_targets
+
+        # ── If Google Sheets is disabled, skip auth entirely ──────────────────
+        if not cfg.get("sheets_enabled", True):
+            self._sheets_client = None
+            self._log("ℹ️ Google Sheets disabled — skipping auth.")
+            self.dashboard_page.btn_start.setEnabled(False)
+            self._launch_scraping(_cfg, _assigned, _phone_targets, _total_targets)
+            return
+
         self._log("🔗 Connecting to Google Sheets…")
         # Disable Start button while OAuth may open a browser — re-enabled on failure
         self.dashboard_page.btn_start.setEnabled(False)
@@ -2161,12 +2417,6 @@ class MainWindow(FluentWindow):
             and getattr(self._sheets_client, "_worksheet", None) is not None
             and getattr(self._sheets_client, "sheet_id", None) == cfg["sheet_id"]
         )
-
-        # Capture everything _launch_scraping needs (closure over local vars)
-        _cfg           = cfg
-        _assigned      = assigned
-        _phone_targets = phone_targets
-        _total_targets = total_targets
 
         def _on_sheets_success(client):
             self._sheets_client = client
@@ -2223,6 +2473,9 @@ class MainWindow(FluentWindow):
         self._active_phones = len(assigned)
         self._done_phones   = 0
         self._workers       = []
+        # Store metadata needed to restart a single phone after error
+        self._phone_meta: dict = {}   # row_idx -> {serial, port, targets, cfg}
+        self._serial_to_port  = serial_to_port
 
         rp = self.results_page
         rp.table.setRowCount(0)
@@ -2251,6 +2504,15 @@ class MainWindow(FluentWindow):
                 self._log(f"ℹ️ Phone {row_idx+1} [{serial}] — no targets, skipping.")
                 self._active_phones -= 1
                 continue
+
+            # Save metadata so we can restart this phone independently
+            self._phone_meta[row_idx] = {
+                "serial":           serial,
+                "port":             port,
+                "targets":          targets_for_phone,
+                "cfg":              cfg,
+                "restart_attempts": 0,   # counts consecutive auto-restarts
+            }
 
             worker = PhoneWorker(
                 phone_index=row_idx,
@@ -2324,6 +2586,10 @@ class MainWindow(FluentWindow):
             rp.phone_status_labels[phone_idx].setText(f"Phone {phone_idx+1}: {status}")
 
     def _on_phone_finished(self, phone_idx: int, count: int):
+        # Reset restart counter — this phone recovered and ran to completion
+        meta = getattr(self, "_phone_meta", {}).get(phone_idx)
+        if meta:
+            meta["restart_attempts"] = 0
         self._done_phones += 1
         self._log(
             f"✅ Phone {phone_idx+1} finished — {count} accounts. "
@@ -2334,19 +2600,139 @@ class MainWindow(FluentWindow):
             self._all_done()
 
     def _on_phone_error(self, phone_idx: int, msg: str):
-        self._done_phones += 1
         self._log(f"❌ Phone {phone_idx+1} error: {msg}")
         self._on_phone_status(phone_idx, "error ❌")
         InfoBar.error(f"Phone {phone_idx+1} Error", msg[:200], isClosable=True, duration=8000, parent=self)
-        if self._done_phones >= self._active_phones:
-            self._all_done()
+
+        # ── Auto-restart this phone after a short delay ───────────────────────
+        # Only restart if we still have metadata for this phone AND scraping
+        # has not been fully stopped by the user (btn_stop still enabled means
+        # at least one phone was running).
+        meta = getattr(self, "_phone_meta", {}).get(phone_idx)
+        stop_btn_active = self.dashboard_page.btn_stop.isEnabled()
+
+        _MAX_RESTARTS = 3
+
+        if meta and stop_btn_active:
+            meta["restart_attempts"] += 1
+            if meta["restart_attempts"] > _MAX_RESTARTS:
+                self._log(
+                    f"🛑 Phone {phone_idx+1} failed {_MAX_RESTARTS} restart attempts — giving up."
+                )
+                self._on_phone_status(phone_idx, "failed ❌")
+                self._done_phones += 1
+                if self._done_phones >= self._active_phones:
+                    self._all_done()
+                return
+            self._log(
+                f"🔄 Phone {phone_idx+1} will auto-restart in 15 s… "
+                f"(attempt {meta['restart_attempts']}/{_MAX_RESTARTS})"
+            )
+            self._on_phone_status(phone_idx, "restarting…")
+            QTimer.singleShot(15_000, lambda: self._restart_phone(phone_idx))
+        else:
+            # No restart possible — count this phone as done
+            self._done_phones += 1
+            if self._done_phones >= self._active_phones:
+                self._all_done()
+
+    def _wait_for_device(self, serial: str, timeout: int = 120) -> bool:
+        """
+        Block until the device is fully booted and ADB-reachable.
+        Returns True if ready within timeout seconds, False otherwise.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                result = subprocess.run(
+                    ["adb", "-s", serial, "get-state"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.stdout.strip() == "device":
+                    boot = subprocess.run(
+                        ["adb", "-s", serial, "shell",
+                         "getprop", "sys.boot_completed"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if boot.stdout.strip() == "1":
+                        return True
+            except Exception:
+                pass
+            time.sleep(3)
+        return False
+
+    def _restart_phone(self, phone_idx: int):
+        """Spawn a fresh PhoneWorker for phone_idx using saved metadata."""
+        meta = getattr(self, "_phone_meta", {}).get(phone_idx)
+        if not meta:
+            return
+        # If user pressed Stop while the 15 s timer was running, abort.
+        if not self.dashboard_page.btn_stop.isEnabled():
+            self._done_phones += 1
+            if self._done_phones >= self._active_phones:
+                self._all_done()
+            return
+
+        serial  = meta["serial"]
+        port    = meta["port"]
+        targets = meta["targets"]
+        cfg     = meta["cfg"]
+
+        self._log(f"🔄 Restarting Phone {phone_idx+1} [{serial}]…")
+        self._on_phone_status(phone_idx, "Waiting for device…")
+
+        # ── Wait for device to be fully booted before spawning worker ─────────
+        # Without this, get_instagram_accounts() runs while the device is still
+        # booting and returns the fake ['Account 1'] fallback, causing the new
+        # session to fail immediately.
+        # Run in a background thread so we never block the Qt main thread.
+        def _wait_and_spawn():
+            self._log(f"⏳ Phone {phone_idx+1} — waiting for device to be ready (up to 120 s)…")
+            if not self._wait_for_device(serial, timeout=120):
+                self._log(f"⚠️ Phone {phone_idx+1} — device not reachable after 120 s, will retry…")
+                self._on_phone_error(phone_idx, f"Device {serial} did not come back online in time")
+                return
+
+            # Extra grace period so Instagram finishes loading after boot
+            self._log(f"✅ Phone {phone_idx+1} — device ready. Waiting 10 s for apps to settle…")
+            time.sleep(10)
+            self._on_phone_status(phone_idx, "Restarting…")
+
+            worker = PhoneWorker(
+                phone_index=phone_idx,
+                serial=serial,
+                appium_port=port,
+                targets=targets,
+                config=cfg,
+                sheets_client=self._sheets_client,
+            )
+            worker.signals.log.connect(self._log)
+            worker.signals.account.connect(self._on_account)
+            worker.signals.progress.connect(self._on_progress)
+            worker.signals.finished.connect(self._on_phone_finished)
+            worker.signals.error.connect(self._on_phone_error)
+            worker.signals.status.connect(self._on_phone_status)
+            worker.signals.account_switched.connect(self._on_auto_switch)
+
+            # Replace the old (dead) worker entry in self._workers
+            for i, w in enumerate(self._workers):
+                if w.phone_index == phone_idx:
+                    self._workers[i] = worker
+                    break
+            else:
+                self._workers.append(worker)
+
+            worker.start()
+            self._log(f"📱 Phone {phone_idx+1} restarted on port {port}.")
+
+        threading.Thread(target=_wait_and_spawn, daemon=True).start()
 
     def _all_done(self):
         self._log(f"🏁 All phones done. Total collected: {self._collected} accounts.")
         self._reload_blacklist_ui()
         InfoBar.success(
             "Complete!",
-            f"All phones finished. {self._collected} accounts saved to Google Sheets.",
+            f"All phones finished. {self._collected} accounts collected.",
             isClosable=True,
             duration=8000,
             parent=self,

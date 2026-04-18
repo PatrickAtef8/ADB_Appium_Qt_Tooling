@@ -622,7 +622,8 @@ def should_skip(account: dict, filters: dict, blacklist: set,
                 f"post too old (> {months_threshold} month(s))"
             )
 
-    # Keyword blacklist
+    # Keyword blacklist — exact whole-word match only.
+    # Uses word-boundary regex so "ted" does NOT match "united" or "credited".
     keywords = filters.get("keywords", [])
     if keywords:
         haystack = " ".join([
@@ -631,7 +632,8 @@ def should_skip(account: dict, filters: dict, blacklist: set,
             account.get("bio", ""),
         ]).lower()
         for kw in keywords:
-            if kw.strip().lower() and kw.strip().lower() in haystack:
+            kw_clean = kw.strip().lower()
+            if kw_clean and re.search(r"\b" + re.escape(kw_clean) + r"\b", haystack):
                 return _reject(f"keyword match: {kw!r}")
 
     return False

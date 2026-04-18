@@ -118,6 +118,7 @@ class SheetsClient:
     def append_account(self, account: dict) -> bool:
         """
         Append an account row. Returns False if duplicate.
+        Retries up to 3 times on transient API errors (e.g. 503 Service Unavailable).
         """
         if not self._worksheet:
             raise RuntimeError("Sheet not connected.")
@@ -142,10 +143,25 @@ class SheetsClient:
                 account.get("profile_url", ""),
                 account.get("scraped_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             ]
-            self._worksheet.append_row(row, value_input_option="USER_ENTERED")
-            self._known_usernames.add(username)
 
-        return True
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    self._worksheet.append_row(row, value_input_option="USER_ENTERED")
+                    self._known_usernames.add(username)
+                    return True
+                except gspread.exceptions.APIError as exc:
+                    last_exc = exc
+                    # Only retry on transient server-side errors (5xx).
+                    # 4xx errors (bad request, auth) are permanent — raise immediately.
+                    status = getattr(exc, "response", None)
+                    code = status.status_code if status is not None else 0
+                    if code and code < 500:
+                        raise
+                    import time as _time
+                    _time.sleep(2 ** attempt)   # 1s, 2s, 4s back-off
+
+            raise last_exc
 
     def get_row_count(self) -> int:
         if not self._worksheet:

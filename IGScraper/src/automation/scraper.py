@@ -117,7 +117,9 @@ class InstagramScraper:
         self.on_progress = on_progress
         self.on_switch_check = on_switch_check
         self._stop_flag = False
+        self._hours_interrupted = False   # set True by PhoneWorker when schedule end fires
         self._need_reopen_list = False   # set True after account switch to force re-navigation
+        self._session_dead = False        # set True when device is lost mid-scrape (unrecoverable)
 
     def stop(self):
         self._stop_flag = True
@@ -411,6 +413,31 @@ class InstagramScraper:
         driver = self.ctrl.driver
         self._log(f"Opening {mode} list...")
         time.sleep(2)
+
+        # ── Already on the list? ─────────────────────────────────────────────
+        # If the app is already showing the followers/following list (e.g. left
+        # open from a previous run), skip the stat-button tap entirely.
+        # Also handles the case where a search box is overlaid on the list:
+        # press Back once to dismiss it, then confirm we're on the list.
+        if self._verify_on_list():
+            self._log(f"✅ Already on {mode} list — skipping open.")
+            return True
+
+        # Dismiss a search box that may be open on top of the list page
+        try:
+            driver.find_element(
+                AppiumBy.ANDROID_UIAUTOMATOR,
+                'new UiSelector().className("android.widget.EditText")'
+            )
+            # Search box is visible — press Back to close it
+            self._log("🔙 Search box detected on list page — dismissing...")
+            driver.back()
+            time.sleep(1.5)
+            if self._verify_on_list():
+                self._log(f"✅ Back to {mode} list after dismissing search box.")
+                return True
+        except Exception:
+            pass
 
         MAX_WAIT   = 30   # total seconds to keep retrying before giving up
         RETRY_WAIT = 3    # seconds to wait between attempts
@@ -1801,7 +1828,9 @@ class InstagramScraper:
             blacklist = set()
 
         self._stop_flag = False
+        self._hours_interrupted = False
         self._need_reopen_list = False
+        self._session_dead = False
         collected = 0
         seen_usernames = set()
 
@@ -1809,10 +1838,20 @@ class InstagramScraper:
         scroll_delay_max  = delays.get("between_scrolls_max",   3.0)
         profile_delay_min = delays.get("between_profiles_min",  2.0)
         profile_delay_max = delays.get("between_profiles_max",  4.0)
+        # Fast-scroll mode: when N consecutive batches are 100% blacklisted/seen,
+        # reduce the inter-scroll delay to 0.3 s so the tool zips through already-
+        # processed sections without changing any other behaviour.
+        _FAST_SCROLL_THRESHOLD = 3      # batches in a row before speeding up
+        _FAST_SCROLL_DELAY     = 0.3    # seconds between scrolls in fast mode
+        _consec_all_skipped    = 0      # counter reset whenever a new account is processed
 
-        if not self.navigate_to_profile(target_username):
-            self._log(f"❌ Could not open @{target_username}'s profile")
-            return 0
+        # ── Already on the list? ────────────────────────────────────────────
+        # If the app is already sitting on the correct list (e.g. launched
+        # with it open), skip navigation entirely — open_list() will confirm.
+        if not self._verify_on_list():
+            if not self.navigate_to_profile(target_username):
+                self._log(f"❌ Could not open @{target_username}'s profile")
+                return 0
 
         if not self.open_list(mode):
             self._log(f"❌ Could not open {mode} list for @{target_username}")
@@ -1832,11 +1871,13 @@ class InstagramScraper:
                 self._log("⚠️ Session dead at loop top — restarting before continuing...")
                 if not self._restart_appium_session():
                     self._log("❌ Could not revive session — stopping.")
+                    self._session_dead = True
                     break
                 # After restart the screen state is unknown — run recovery
                 # to get back onto the followers/following list.
                 if not self._recover_to_list(target_username, mode):
                     self._log("❌ Could not recover to list after session restart — stopping.")
+                    self._session_dead = True
                     break
 
             if self._need_reopen_list:
@@ -1866,9 +1907,11 @@ class InstagramScraper:
 
                 if not self.navigate_to_profile(target_username):
                     self._log("❌ Account switch failed — stopping")
+                    self._session_dead = True
                     break
                 if not self.open_list(mode):
                     self._log("❌ Could not reopen list after account switch — stopping")
+                    self._session_dead = True
                     break
                 consecutive_empty = 0
                 continue
@@ -1887,6 +1930,7 @@ class InstagramScraper:
                     self._log(f"❌ Recovery attempt {recovery_failures} failed.")
                     if recovery_failures >= 3:
                         self._log("❌ Too many failed recovery attempts — stopping.")
+                        self._session_dead = True
                         break
                     time.sleep(5.0)
                     continue
@@ -1923,6 +1967,8 @@ class InstagramScraper:
 
             consecutive_empty = 0
 
+            batch_new = 0   # accounts in this batch that were NOT in blacklist/seen
+
             for acc in accounts:
                 if self._stop_flag or self._need_reopen_list:
                     break
@@ -1943,6 +1989,8 @@ class InstagramScraper:
                 if uname in blacklist:
                     self._log(f"⏭️ @{acc['username']} skipped (blacklisted)")
                     continue
+
+                batch_new += 1  # this account is genuinely new
 
                 # ── Story-ring shortcut ──────────────────────────────────────
                 # If the ring was already detected in the list view and no
@@ -1994,6 +2042,7 @@ class InstagramScraper:
                             self._log(f"❌ Mid-batch recovery failed ({recovery_failures}).")
                             if recovery_failures >= 3:
                                 self._log("❌ Too many failed recovery attempts — stopping.")
+                                self._session_dead = True
                                 self._stop_flag = True
                         mid_batch_recovered = True
                         break  # break inner for-loop; outer while restarts cleanly
@@ -2033,9 +2082,23 @@ class InstagramScraper:
                 if self.on_switch_check:
                     self.on_switch_check(collected)
 
+            # ── Fast-scroll mode ─────────────────────────────────────────────
+            # If every visible account in this batch was already blacklisted /
+            # seen (batch_new == 0), increment the consecutive counter.
+            # After _FAST_SCROLL_THRESHOLD such batches in a row, use a very
+            # short delay so we zip through already-processed sections quickly.
+            # The counter resets the moment any genuinely new account is found.
+            if batch_new == 0:
+                _consec_all_skipped += 1
+            else:
+                _consec_all_skipped = 0
+
             if not self._need_reopen_list and not mid_batch_recovered:
                 self.scroll_list()
-                time.sleep(_rand(scroll_delay_min, scroll_delay_max))
+                if _consec_all_skipped >= _FAST_SCROLL_THRESHOLD:
+                    time.sleep(_FAST_SCROLL_DELAY)
+                else:
+                    time.sleep(_rand(scroll_delay_min, scroll_delay_max))
             mid_batch_recovered = False
 
         self._log(f"🏁 All done! Collected {collected} account(s).")
