@@ -1,6 +1,6 @@
 # IGScraper
 
-A Windows desktop application for collecting publicly visible Instagram profile data
+A desktop application for collecting publicly visible Instagram profile data
 from followers and following lists, with multi-device Android automation, a live
 screen mirror, and export to Google Sheets, webhook, and CSV.
 
