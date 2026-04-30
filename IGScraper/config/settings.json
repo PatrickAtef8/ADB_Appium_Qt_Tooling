@@ -1,15 +1,15 @@
 {
-  "sheet_id": "152ykgLcTWjLxHNEtWBWKnorWxAZx6xXe5yAOUtQaG7A",
+  "sheet_id": "",
   "sheet_tab": "Sheet1",
   "credentials_path": "assets/credentials.json",
-  "webhook_url": "https://webhook.site/da216a49-b0ff-44bb-ba50-f41ab4fd461b",
+  "webhook_url": "",
   "filters": {
     "skip_no_bio": false,
     "skip_private": false,
-    "skip_no_profile_pic": true,
-    "skip_no_contact": true,
-    "min_posts": 15,
-    "enable_post_spin": true,
+    "skip_no_profile_pic": false,
+    "skip_no_contact": false,
+    "min_posts": 0,
+    "enable_post_spin": false,
     "skip_no_posts_last_n_months": 1,
     "keywords": [],
     "only_keywords": []
@@ -31,13 +31,34 @@
     "start_minute": 0,
     "end_hour": 19,
     "end_minute": 0,
-    "saved_at": "2026-04-25T13:06:39.606460"
+    "saved_at": "2026-04-30T08:13:40.062171"
   },
   "appium": {
     "host": "127.0.0.1",
     "port": 4723
   },
   "devices": [
+    {
+      "serial": null
+    },
+    {
+      "serial": null
+    },
+    {
+      "serial": null
+    },
+    {
+      "serial": null
+    },
+    {
+      "serial": null
+    },
+    {
+      "serial": null
+    },
+    {
+      "serial": null
+    },
     {
       "serial": null
     },
@@ -55,12 +76,88 @@
   "last_count": 100,
   "last_device": "",
   "targets_per_phone": [
-    [
-      "victima_showroom"
-    ],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
     [],
     []
   ],
-  "sheets_enabled": true,
-  "mirror_width": 558
+  "sheets_enabled": false,
+  "mirror_width": 600,
+  "ip_rotation": {
+    "enabled": false,
+    "interval_min_minutes": 5.0,
+    "interval_max_minutes": 15.0
+  },
+  "main_account": {
+    "enabled": false,
+    "phone_slot": 0,
+    "working_hours_windows": [],
+    "daily_limit": {
+      "enabled": false,
+      "hours": 4,
+      "minutes": 0
+    },
+    "stories": {
+      "enabled": false,
+      "watch_min": 3,
+      "watch_max": 7,
+      "rest_short_min": 10.0,
+      "rest_short_max": 30.0,
+      "short_cycles_min": 3,
+      "short_cycles_max": 6,
+      "rest_long_min": 80.0,
+      "rest_long_max": 100.0,
+      "watch_seconds_min": 3.0,
+      "watch_seconds_max": 8.0,
+      "like_enabled": false,
+      "like_pct": 30,
+      "react_enabled": false,
+      "react_pct": 10,
+      "comment_enabled": false,
+      "comment_pct": 5
+    },
+    "feed": {
+      "enabled": false,
+      "num_scrolls": 2,
+      "scroll_min": 2.0,
+      "scroll_max": 4.0,
+      "like_enabled": false,
+      "like_pct": 20,
+      "comment_enabled": false,
+      "comment_pct": 10
+    },
+    "reels": {
+      "enabled": false,
+      "num_reels": 10,
+      "watch_seconds_min": 5.0,
+      "watch_seconds_max": 15.0,
+      "like_enabled": false,
+      "like_pct": 30,
+      "comment_enabled": false,
+      "comment_pct": 5
+    },
+    "replies": {
+      "spintax_templates": [],
+      "openai_api_key": "",
+      "openai_context": "Write a short friendly reply to this Instagram story."
+    }
+  },
+  "phone_nicknames": [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
+  ]
 }

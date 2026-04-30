@@ -19,7 +19,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 from .appium_controller import AppiumController, _run_hidden
 from src.utils.filters import extract_email, extract_phone, infer_country_code, country_code_to_name, should_skip
-from src.utils.blacklist import add_to_blacklist
+from src.utils.blacklist import add_to_blacklist, add_to_keyword_blacklist, load_keyword_blacklist
 
 # ── Instagram Resource IDs ────────────────────────────────────────────────────
 IG_SEARCH_TAB_LABELS = [
@@ -229,6 +229,22 @@ class InstagramScraper:
         # After clicking the search tab, IG sometimes lands on an Explore/Reels
         # page where the EditText isn't immediately visible. We retry up to 4
         # times, re-clicking the search icon each time, before giving up.
+        #
+        # Edge case: if a following-list panel was open in history, IG may show
+        # that list's own EditText before the real search page loads. Guard
+        # against this by doing one extra search-tab click before the first
+        # attempt — this ensures we land on the real search page.
+        try:
+            for retry_label in IG_SEARCH_TAB_LABELS:
+                try:
+                    driver.find_element(AppiumBy.ACCESSIBILITY_ID, retry_label).click()
+                    time.sleep(1.5)
+                    break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         search_box = None
         for attempt in range(4):
             try:
@@ -415,10 +431,6 @@ class InstagramScraper:
         time.sleep(2)
 
         # ── Already on the list? ─────────────────────────────────────────────
-        # If the app is already showing the followers/following list (e.g. left
-        # open from a previous run), skip the stat-button tap entirely.
-        # Also handles the case where a search box is overlaid on the list:
-        # press Back once to dismiss it, then confirm we're on the list.
         if self._verify_on_list():
             self._log(f"✅ Already on {mode} list — skipping open.")
             return True
@@ -470,10 +482,13 @@ class InstagramScraper:
             for res_id in STAT_ID_MAP.get(mode_lower, STAT_FALLBACK_IDS):
                 try:
                     el = driver.find_element(AppiumBy.ID, res_id)
-                    
                     el.click()
-                    time.sleep(2.5)
-                    return True
+                    # Verify the list actually loaded — don't just trust the click
+                    for _ in range(6):
+                        time.sleep(1.0)
+                        if self._verify_on_list():
+                            return True
+                    # Click landed but list didn't appear — try next strategy
                 except Exception:
                     continue
 
@@ -482,10 +497,12 @@ class InstagramScraper:
                 for tv in all_tvs:
                     txt = tv.text.lower()
                     if mode_lower in txt and any(c.isdigit() for c in txt):
-                        
                         tv.click()
-                        time.sleep(2.5)
-                        return True
+                        for _ in range(6):
+                            time.sleep(1.0)
+                            if self._verify_on_list():
+                                return True
+                        break
             except Exception:
                 pass
 
@@ -494,21 +511,279 @@ class InstagramScraper:
                     AppiumBy.ANDROID_UIAUTOMATOR,
                     f'new UiSelector().descriptionContains("{mode}")'
                 )
-                
                 el.click()
-                time.sleep(2.5)
-                return True
+                for _ in range(6):
+                    time.sleep(1.0)
+                    if self._verify_on_list():
+                        return True
             except Exception:
                 pass
 
         self._log(f"❌ Could not open {mode} list")
         return False
 
-    def _extract_visible_accounts(self) -> List[Dict]:
+    def _dismiss_keyboard(self):
+        """Dismiss the on-screen keyboard without triggering a Back navigation.
+
+        CRITICAL: driver.hide_keyboard() on UiAutomator2 sends KEYCODE_BACK (4)
+        which Instagram interprets as "close the search panel", collapsing the
+        EditText entirely from the view hierarchy.  We must NOT use it here.
+
+        Instead we press KEYCODE_ENTER (66) which confirms/dismisses the IME
+        without any back-stack side-effect, keeping the EditText visible and
+        focused on the list panel.
+        """
+        try:
+            self.ctrl.driver.press_keycode(66)   # KEYCODE_ENTER — dismisses IME only
+            time.sleep(0.4)
+        except Exception:
+            pass
+
+    def _keyword_no_results(self) -> bool:
+        """Return True if Instagram is showing a 'no results' indicator for the
+        current in-list keyword search, so we can skip collecting immediately."""
+        NO_RESULT_TEXTS = (
+            "No users found.",
+            "No results found.",
+            "No accounts found.",
+            "No results",
+            "No users found",
+        )
+        try:
+            tvs = self.ctrl.driver.find_elements(
+                AppiumBy.CLASS_NAME, "android.widget.TextView"
+            )
+            for tv in tvs:
+                txt = (tv.text or "").strip()
+                if txt in NO_RESULT_TEXTS:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _scroll_list_to_top(self):
+        """Scroll the followers/following list back to the top so the search
+        EditText header comes back into view.
+
+        Uses repeated ADB coordinate swipes (same mechanism as scroll_list())
+        instead of UiScrollable.scrollToBeginning() — the UIAutomator call
+        was device-dependent and on some devices would overshoot past the list
+        header and navigate back to the profile page, landing on the followers
+        tab instead of the following tab.
+        """
+        serial = self.ctrl._device_serial or ""
+        try:
+            size_out = _run_hidden(
+                ["adb", "-s", serial, "shell", "wm", "size"],
+                capture_output=True, text=True
+            ).stdout
+            m = re.search(r"(\d+)x(\d+)", size_out)
+            w, h = (int(m.group(1)), int(m.group(2))) if m else (1080, 1920)
+        except Exception:
+            w, h = 1080, 1920
+
+        # Swipe downward on screen = scroll list upward (toward top)
+        # Repeat up to 6 times to reach the top from any scroll depth
+        for _ in range(6):
+            try:
+                _run_hidden([
+                    "adb", "-s", serial, "shell", "input", "swipe",
+                    str(w // 2), str(int(h * 0.30)),   # start low on screen
+                    str(w // 2), str(int(h * 0.80)),   # end high on screen
+                    "400"
+                ], capture_output=True)
+                time.sleep(0.4)
+                # Stop early if the search EditText is now visible
+                try:
+                    self.ctrl.driver.find_element(
+                        AppiumBy.ANDROID_UIAUTOMATOR,
+                        'new UiSelector().className("android.widget.EditText")'
+                    )
+                    break
+                except Exception:
+                    pass
+            except Exception:
+                break
+
+    def _collect_keyword_accounts(
+        self, keywords: list, target_username: str = "", mode: str = "following"
+    ) -> List[Dict]:
+        """
+        For each keyword, type it into the in-list search box, collect all
+        visible results (scrolling within the panel), then move to the next
+        keyword.  Returns a deduplicated list of account dicts.
+
+        target_username / mode are used to recover back to the list if
+        scrolling accidentally dismisses the bottom-sheet panel.
+        """
+        from appium.webdriver.common.appiumby import AppiumBy
+
+        collected: dict = {}   # username -> account dict  (dedup by key)
+        driver = self.ctrl.driver
+        serial = self.ctrl._device_serial or ""
+
+        # ── Inner helpers ─────────────────────────────────────────────────────
+
+        def _find_search_box():
+            """Locate the EditText in the list search header (up to 5 retries)."""
+            for _ in range(5):
+                try:
+                    return driver.find_element(
+                        AppiumBy.ANDROID_UIAUTOMATOR,
+                        'new UiSelector().className("android.widget.EditText")'
+                    )
+                except Exception:
+                    time.sleep(1)
+            return None
+
+        def _safe_clear():
+            """Clear the search box and dismiss the keyboard, swallowing errors."""
+            try:
+                sb = driver.find_element(
+                    AppiumBy.ANDROID_UIAUTOMATOR,
+                    'new UiSelector().className("android.widget.EditText")'
+                )
+                self._dismiss_keyboard()
+                sb.click()
+                time.sleep(0.3)
+                _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_CTRL_A"], capture_output=True)
+                time.sleep(0.2)
+                _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_DEL"], capture_output=True)
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+        def _safe_scroll_down():
+            """Same swipe distance as scroll_list() — 60% (h*0.75 → h*0.15)."""
+            try:
+                size_out = _run_hidden(
+                    ["adb", "-s", serial, "shell", "wm", "size"],
+                    capture_output=True, text=True
+                ).stdout
+                m = re.search(r"(\d+)x(\d+)", size_out)
+                w, h = (int(m.group(1)), int(m.group(2))) if m else (1080, 1920)
+                _run_hidden([
+                    "adb", "-s", serial, "shell", "input", "swipe",
+                    str(w // 2), str(int(h * 0.75)),
+                    str(w // 2), str(int(h * 0.15)),
+                    "600"
+                ])
+            except Exception:
+                pass
+
+        # ── Per-keyword loop ──────────────────────────────────────────────────
+
+        for keyword in keywords:
+            keyword = keyword.strip()
+            if not keyword:
+                continue
+
+            self._log(f"🔍 Searching list for keyword: '{keyword}'")
+
+            # ── Guard: verify we are still on the list panel ──────────────────
+            # After scrolling through many results the panel can drift (the
+            # swipe lands outside the bottom sheet and dismisses it).
+            # Use the same _recover_to_list() path that the main run loop uses.
+            if not self._verify_on_list():
+                self._log("⚠️  List panel lost — recovering before next keyword...")
+                if not self._recover_to_list(target_username, mode):
+                    self._log("❌ Could not recover to list — stopping keyword search.")
+                    break
+
+            # ── Scroll back to top so the search EditText is visible ──────────
+            self._scroll_list_to_top()
+            time.sleep(0.5)
+
+            # ── Locate the search box ─────────────────────────────────────────
+            search_box = _find_search_box()
+            if search_box is None:
+                self._log(f"⚠️  Could not find list search box for keyword '{keyword}' — skipping.")
+                continue
+
+            try:
+                self._dismiss_keyboard()
+                search_box.click()
+                time.sleep(0.5)
+                _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_CTRL_A"], capture_output=True)
+                time.sleep(0.2)
+                _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_DEL"], capture_output=True)
+                time.sleep(0.3)
+                search_box.send_keys(keyword)
+                self._dismiss_keyboard()
+                time.sleep(3.0)
+            except Exception as e:
+                self._log(f"⚠️  Could not type keyword '{keyword}': {e}")
+                continue
+
+            # ── Short-circuit: no accounts match ─────────────────────────────
+            # NOTE: With only 1 result, Instagram may briefly show "No results"
+            # while loading, or render a single row in a non-scrollable layout.
+            # Always do a fallback _extract_visible_accounts() check before
+            # declaring 0 results — if visible rows exist, it's NOT empty.
+            if self._keyword_no_results():
+                # Double-check: maybe 1 result renders without the normal list
+                _fallback_check = self._extract_visible_accounts()
+                if not _fallback_check:
+                    self._log(f"✅ Keyword '{keyword}': found 0 accounts.")
+                    _safe_clear()
+                    continue
+                # Visible accounts exist despite the "no results" text — proceed
+
+            # ── Collect filtered results ──────────────────────────────────────
+            keyword_seen: set = set()
+            consecutive_empty = 0
+
+            while True:
+                if self._keyword_no_results():
+                    break
+
+                batch = self._extract_visible_accounts()
+                new_this_scroll = 0
+                for acc in batch:
+                    uname = acc.get("username", "").lower()
+                    if uname and uname not in keyword_seen and uname not in collected:
+                        keyword_seen.add(uname)
+                        collected[uname] = acc
+                        new_this_scroll += 1
+
+                if new_this_scroll == 0:
+                    consecutive_empty += 1
+                else:
+                    consecutive_empty = 0
+
+                if consecutive_empty >= 3:
+                    break
+
+                _safe_scroll_down()
+                time.sleep(0.5)
+
+            self._log(f"✅ Keyword '{keyword}': found {len(keyword_seen)} accounts.")
+
+            # ── Clear search box before next keyword ─────────────────────────
+            _safe_clear()
+
+        self._log(f"🔍 Keyword search complete — {len(collected)} unique accounts across all keywords.")
+        return list(collected.values())
+
+    def _extract_visible_accounts(self) -> list:
         """Extract usernames (and story-ring status) from the current follower/following list screen.
         Stops at the 'Suggested for you' section boundary so suggested accounts are never scraped."""
         driver = self.ctrl.driver
         accounts = []
+
+        # ── Guard: detect "no results" label for keyword search ──────────────
+        # When a keyword yields no matches Instagram shows "No users found." (or
+        # similar).  Return an empty list immediately so the caller's
+        # consecutive_empty counter triggers a clean stop — we must NOT fall
+        # through to the fallback TextView loop which would mistake the label
+        # text for a username.
+        NO_RESULT_TEXTS = (
+            "No users found.",
+            "No results found.",
+            "No accounts found.",
+            "No results",
+            "No users found",
+        )
 
         # ── Guard: detect if "Suggested for you" is visible on screen ────────
         # When the real followers list ends, IG injects a "Suggested for you"
@@ -524,11 +799,24 @@ class InstagramScraper:
         try:
             all_tvs_check = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
             for tv in all_tvs_check:
-                if tv.text.strip() in SUGGESTED_MARKERS:
+                txt_check = tv.text.strip()
+                if txt_check in NO_RESULT_TEXTS:
+                    return []   # no keyword matches — stop immediately
+                if txt_check in SUGGESTED_MARKERS:
                     self._log("🏁 Reached the end of the list.")
                     return []   # empty → consecutive_empty counter → clean stop
         except Exception:
             pass
+
+        # ── Fallback TextView excluded terms (used below) ─────────────────────
+        # Any text that must never be treated as a username, including all
+        # known "no results" strings so they can't slip through even if the
+        # quick check above misses them due to a timing race.
+        _TV_EXCLUDE = {
+            "followers", "following", "posts", "search", "suggested",
+            "no users found.", "no results found.", "no accounts found.",
+            "no results", "no users found",
+        }
 
         try:
             rows = driver.find_elements(AppiumBy.ID, IG_USER_ROW)
@@ -587,9 +875,14 @@ class InstagramScraper:
                 all_tvs = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
                 for tv in all_tvs:
                     txt = tv.text.strip()
-                    if txt and " " not in txt and len(txt) > 2 and len(txt) < 31:
-                        if txt.lower() not in ("followers", "following", "posts", "search", "suggested"):
-                            accounts.append({"username": txt, "full_name": "", "has_story": False})
+                    # Must be non-empty, no spaces (Instagram usernames have none),
+                    # a plausible length, and not a known UI label / no-results string.
+                    if (txt
+                            and " " not in txt
+                            and len(txt) > 2
+                            and len(txt) < 31
+                            and txt.lower() not in _TV_EXCLUDE):
+                        accounts.append({"username": txt, "full_name": "", "has_story": False})
         except Exception as e:
             self._log(f"⚠️ Error while reading account list: {e}")
         return accounts
@@ -757,12 +1050,10 @@ class InstagramScraper:
             # and only fall back to text matching when the button text is an
             # exact known label (not a substring match).
             _CONTACT_BTN_IDS = [
-                "com.instagram.android:id/profile_header_call_button",
-                "com.instagram.android:id/profile_header_email_button",
                 "com.instagram.android:id/profile_header_contact_button",
                 "com.instagram.android:id/contact_button",
             ]
-            _EXACT_CONTACT_LABELS = {"contact", "email", "call", "text", "whatsapp"}
+            _EXACT_CONTACT_LABELS = {"contact"}
             contact_btn = None
             # Try by resource-id first (most reliable)
             for _cid in _CONTACT_BTN_IDS:
@@ -840,20 +1131,6 @@ class InstagramScraper:
                 except Exception:
                     pass
 
-            if not details["email"]:
-                try:
-                    # Use exact text "Email" only — textContains would also match
-                    # unrelated elements and could navigate away from the profile.
-                    email_btn = driver.find_element(
-                        AppiumBy.ANDROID_UIAUTOMATOR,
-                        'new UiSelector().text("Email").clickable(true)'
-                    )
-                    email_text = email_btn.get_attribute("content-desc") or email_btn.text
-                    found = extract_email(email_text)
-                    if found:
-                        details["email"] = found
-                except Exception:
-                    pass
 
             try:
                 all_texts = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
@@ -1833,6 +2110,7 @@ class InstagramScraper:
         self._session_dead = False
         collected = 0
         seen_usernames = set()
+        serial = self.ctrl._device_serial or ""
 
         scroll_delay_min  = delays.get("between_scrolls_min",   1.0)
         scroll_delay_max  = delays.get("between_scrolls_max",   3.0)
@@ -1861,6 +2139,286 @@ class InstagramScraper:
         consecutive_empty = 0
         recovery_failures = 0   # count consecutive failed recovery attempts
         mid_batch_recovered = False  # True when drift recovery happened mid-batch (skip scroll)
+
+        # ── Keyword-mode: search → scrape → next keyword ─────────────────────
+        # For each keyword we:
+        #   1. Type it into the in-list search box (filter is live on screen)
+        #   2. Collect the visible account rows (scrolling within the panel)
+        #   3. Scrape each found account IMMEDIATELY while the filter is still
+        #      active — open_profile_details() can tap the row right now
+        #   4. Clear the search box and move to the next keyword
+        # This means zero second-pass re-searches; every account is visited
+        # the moment it is discovered.
+        only_keywords = filters.get("only_keywords", [])
+        _keyword_pool: list | None = None   # None = normal (non-keyword) mode
+        if only_keywords:
+            self._log(f"🔍 Keyword mode: {only_keywords} — collect & scrape per keyword…")
+            keyword_blacklist = load_keyword_blacklist()
+            _kw_global_seen: set = set()   # cross-keyword dedup
+            _kw_first = True   # skip scroll-to-top on the very first keyword
+
+            for _kw in only_keywords:
+                _kw = _kw.strip()
+                if not _kw:
+                    continue
+                if collected >= max_count or self._stop_flag:
+                    break
+
+                # ── Step 1: type keyword into the list search box ─────────────
+                self._log(f"🔍 Searching list for keyword: '{_kw}'")
+
+                if not self._verify_on_list():
+                    self._log("⚠️  List panel lost — recovering before next keyword...")
+                    if not self._recover_to_list(target_username, mode):
+                        self._log("❌ Could not recover to list — stopping keyword search.")
+                        break
+
+                # Scroll to top so the search EditText is visible.
+                # Skip on the very first keyword — the list just opened at top.
+                if _kw_first:
+                    _kw_first = False
+                else:
+                    self._scroll_list_to_top()
+                    time.sleep(0.5)
+
+                _kw_search_box = None
+                for _ in range(5):
+                    try:
+                        _kw_search_box = self.ctrl.driver.find_element(
+                            AppiumBy.ANDROID_UIAUTOMATOR,
+                            'new UiSelector().className("android.widget.EditText")'
+                        )
+                        break
+                    except Exception:
+                        time.sleep(1)
+
+                if _kw_search_box is None:
+                    self._log(f"⚠️  Could not find list search box for '{_kw}' — skipping.")
+                    continue
+
+                try:
+                    self._dismiss_keyboard()
+                    _kw_search_box.click()
+                    time.sleep(0.5)
+                    # Use safe ADB select-all + delete instead of .clear()
+                    # to avoid Instagram collapsing the search panel
+                    _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_CTRL_A"], capture_output=True)
+                    time.sleep(0.2)
+                    _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_DEL"], capture_output=True)
+                    time.sleep(0.3)
+                    _kw_search_box.send_keys(_kw)
+                    self._dismiss_keyboard()
+                    time.sleep(3.0)
+                except Exception as e:
+                    self._log(f"⚠️  Could not type keyword '{_kw}': {e}")
+                    continue
+
+                # ── Steps 2+3: collect a visible batch → scrape it → scroll → repeat
+                # We never pre-collect all accounts first. Instead we read what is
+                # currently on screen, scrape those rows immediately (they are
+                # visible so open_profile_details can tap them), then scroll down
+                # to reveal the next batch.  This guarantees every account is on
+                # screen when we tap it, regardless of list length.
+                #
+                # Cross-keyword dedup (_kw_global_seen) is applied at SCRAPE time,
+                # not at collect time, so an account like @nikewomen that was already
+                # scraped under 'nike' is still visible and counted during 'women'
+                # — it just gets skipped silently at the scrape gate.
+
+                # Check for no-results first (with single-result fallback guard)
+                _kw_no_results = self._keyword_no_results()
+                if _kw_no_results:
+                    _fb = self._extract_visible_accounts()
+                    if not _fb:
+                        self._log(f"✅ Keyword '{_kw}': found 0 accounts.")
+                        try:
+                            self._dismiss_keyboard()
+                            _kw_search_box = self.ctrl.driver.find_element(
+                                AppiumBy.ANDROID_UIAUTOMATOR,
+                                'new UiSelector().className("android.widget.EditText")'
+                            )
+                            _kw_search_box.click()
+                            time.sleep(0.2)
+                            _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_CTRL_A"], capture_output=True)
+                            time.sleep(0.2)
+                            _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_DEL"], capture_output=True)
+                            time.sleep(0.5)
+                        except Exception:
+                            pass
+                        continue
+                    # else: visible rows exist despite "no results" text — proceed
+
+                _kw_scraped_count = 0   # accounts actually scraped for this keyword
+                _kw_seen: set = set()   # usernames seen this keyword (scroll-dedup only)
+                _kw_consec_empty = 0    # consecutive scrolls with no new visible rows
+
+                _kw_scroll_done = False   # set True after we decide no more scrolling needed
+
+                while not _kw_scroll_done and not self._stop_flag and collected < max_count:
+                    if self._keyword_no_results():
+                        break
+
+                    # Read what is visible RIGHT NOW
+                    _kw_batch = self._extract_visible_accounts()
+                    _kw_new_this_scroll = 0
+
+                    for _acc in _kw_batch:
+                        if collected >= max_count or self._stop_flag:
+                            _kw_scroll_done = True
+                            break
+
+                        _u = _acc.get("username", "").lower()
+                        if not _u or _u in _kw_seen:
+                            continue   # already processed this scroll session
+                        _kw_seen.add(_u)
+                        _kw_new_this_scroll += 1
+
+                        # ── Cross-keyword dedup + blacklist gate (scrape time) ──
+                        if _u in _kw_global_seen or _u in keyword_blacklist or _u in blacklist:
+                            continue
+                        _kw_global_seen.add(_u)
+
+                        # ── Profile visit (account is visible on screen now) ────
+                        _acc_has_story = _acc.get("has_story", False)
+                        _need_contact  = filters.get("skip_no_contact", False)
+                        _story_ok = (
+                            _acc_has_story
+                            and not _need_contact
+                            and int(filters.get("skip_no_posts_last_n_months", 0)) == 0
+                        )
+
+                        if fetch_details and not _story_ok:
+                            _details = self.open_profile_details(_acc["username"], filters=filters)
+                            if _acc_has_story and not _details.get("has_story"):
+                                _details["has_story"] = True
+                            _acc.update(_details)
+                            if _details.get("_navigated_in", True):
+                                try:
+                                    self.ctrl.press_back()
+                                except Exception:
+                                    self._log("⚠️ press_back() failed — restarting session.")
+                                    self._restart_appium_session()
+                            time.sleep(_rand(profile_delay_min, profile_delay_max))
+
+                            # After back, verify we're still on the filtered list.
+                            # If drifted, recover and re-apply the keyword filter.
+                            if not self._verify_on_list():
+                                self._log("🔍 Drift after profile visit — recovering...")
+                                if not self._recover_to_list(target_username, mode):
+                                    self._log("❌ Could not recover — stopping.")
+                                    self._stop_flag = True
+                                    break
+                                # Re-apply keyword filter
+                                try:
+                                    _rb = self.ctrl.driver.find_element(
+                                        AppiumBy.ANDROID_UIAUTOMATOR,
+                                        'new UiSelector().className("android.widget.EditText")'
+                                    )
+                                    self._dismiss_keyboard()
+                                    _rb.click()
+                                    time.sleep(0.3)
+                                    _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_CTRL_A"], capture_output=True)
+                                    time.sleep(0.2)
+                                    _run_hidden(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_DEL"], capture_output=True)
+                                    time.sleep(0.2)
+                                    _rb.send_keys(_kw)
+                                    self._dismiss_keyboard()
+                                    time.sleep(2.5)
+                                except Exception:
+                                    pass
+
+                        elif _acc_has_story and _story_ok:
+                            _acc.setdefault("has_recent_post", True)
+                            self._log(f"⚡ @{_acc['username']} is active (has a story) — skipping profile visit")
+
+                        # ── Filters ────────────────────────────────────────────
+                        _skip_reason: list = []
+                        if should_skip(_acc, filters, blacklist, _skip_reason):
+                            _reason_str = _skip_reason[0] if _skip_reason else "unknown filter"
+                            self._log(f"⏭️ @{_acc['username']} skipped ({_reason_str})")
+                            add_to_keyword_blacklist(_acc["username"])
+                            keyword_blacklist.add(_u)
+                            blacklist.add(_u)
+                            continue
+
+                        if self.on_account_found:
+                            self.on_account_found(_acc)
+
+                        collected += 1
+                        _kw_scraped_count += 1
+                        add_to_keyword_blacklist(_acc["username"])
+                        keyword_blacklist.add(_u)
+                        blacklist.add(_u)
+
+                        if self.on_progress:
+                            self.on_progress(collected, max_count)
+
+                        self._log(
+                            f"[{collected}/{max_count}] ✅ @{_acc['username']} | "
+                            f"email={_acc.get('email', '-')} | "
+                            f"phone={_acc.get('phone', '-')} | "
+                            f"country={_acc.get('country_code', '-')} | "
+                            f"posts={_acc.get('post_count', '-')}"
+                        )
+
+                        if self.on_switch_check:
+                            self.on_switch_check(collected)
+
+                    # ── Scroll to reveal the next batch ────────────────────────
+                    if _kw_new_this_scroll == 0:
+                        _kw_consec_empty += 1
+                    else:
+                        _kw_consec_empty = 0
+
+                    if _kw_consec_empty >= 3:
+                        break   # no new rows after 3 scrolls → end of filtered list
+
+                    self.scroll_list()
+                    time.sleep(0.5)
+
+                if _kw_scraped_count == 0 and _kw_seen:
+                    self._log(f"⏭️ Keyword '{_kw}': all matching accounts already scraped or blacklisted.")
+                elif _kw_scraped_count == 0:
+                    self._log(f"✅ Keyword '{_kw}': no matching accounts found.")
+                else:
+                    self._log(f"✅ Keyword '{_kw}': scraped {_kw_scraped_count} account(s).")
+
+                # ── Step 4: clear search box before next keyword ───────────────
+                # Root cause of the followers-tab drift bug:
+                # Appium's .clear() on the EditText fires a text-changed event
+                # that Instagram interprets as "close search", collapsing the
+                # panel and navigating back — which lands on the followers tab.
+                #
+                # Safe alternative: tap the box to focus it, then send
+                # CTRL+A (select all) + DEL via ADB keyevents. This clears the
+                # text at the OS level without triggering Instagram's panel-
+                # collapse logic, keeping the search panel open.
+                try:
+                    self._dismiss_keyboard()
+                    _clr = self.ctrl.driver.find_element(
+                        AppiumBy.ANDROID_UIAUTOMATOR,
+                        'new UiSelector().className("android.widget.EditText")'
+                    )
+                    _clr.click()
+                    time.sleep(0.3)
+                    # Select all text then delete — safe, no panel collapse
+                    _run_hidden([
+                        "adb", "-s", serial, "shell",
+                        "input", "keyevent", "KEYCODE_CTRL_A"
+                    ], capture_output=True)
+                    time.sleep(0.2)
+                    _run_hidden([
+                        "adb", "-s", serial, "shell",
+                        "input", "keyevent", "KEYCODE_DEL"
+                    ], capture_output=True)
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+
+            self._log(f"✅ @{target_username} done — {collected} this run, {collected} total")
+            return collected
+        else:
+            keyword_blacklist = None
 
         while collected < max_count and not self._stop_flag:
             # ── Session-alive guard ──────────────────────────────────────────
@@ -1937,6 +2495,7 @@ class InstagramScraper:
             else:
                 recovery_failures = 0   # reset on confirmed good screen
 
+            # ── Normal (non-keyword) mode: read visible accounts from list ────
             accounts = self._extract_visible_accounts()
 
             # _extract_visible_accounts returns [] with a "Suggested" log when
@@ -2088,6 +2647,7 @@ class InstagramScraper:
             # After _FAST_SCROLL_THRESHOLD such batches in a row, use a very
             # short delay so we zip through already-processed sections quickly.
             # The counter resets the moment any genuinely new account is found.
+            # In keyword-pool mode there is no scrolling — we drain the pool.
             if batch_new == 0:
                 _consec_all_skipped += 1
             else:

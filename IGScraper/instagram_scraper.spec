@@ -56,7 +56,6 @@ a = Analysis(
 
         # Original config & assets
         ('config/settings.json', 'config'),
-        ('config/blacklist.json', 'config'),
         ('assets/credentials.json', 'assets'),
 
         # scrcpy server JAR for Live Mirror feature

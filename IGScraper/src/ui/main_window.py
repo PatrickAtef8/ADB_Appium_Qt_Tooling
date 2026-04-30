@@ -38,7 +38,14 @@ from src.automation.appium_manager  import AppiumManager
 from src.automation.scraper         import InstagramScraper
 from src.mirror                     import MirrorWidget
 from src.sheets.google_sheets       import SheetsClient, send_webhook
-from src.utils.blacklist            import clear_blacklist, load_blacklist, save_blacklist
+from src.utils.blacklist            import (
+    clear_blacklist, load_blacklist, save_blacklist,
+    clear_keyword_blacklist, load_keyword_blacklist, save_keyword_blacklist,
+)
+from src.utils.completed            import (
+    start_session, record_scraped, mark_target_completed,
+    finish_session, get_summary_path, summary_exists,
+)
 from src.utils.config_manager       import load_config, save_config
 from src.utils.filters              import parse_keywords
 
@@ -58,6 +65,10 @@ from src.utils.filters              import parse_keywords
 # so we apply a small blanket correction whenever running on Windows.
 
 import sys as _sys
+
+# ── Phone slot limit ──────────────────────────────────────────────────────────
+MAX_PHONES = 10   # maximum simultaneous phone / emulator slots
+
 
 def _dpi_scale() -> float:
     """Return a multiplier < 1.0 on Windows to counteract Qt's upscaling."""
@@ -282,6 +293,8 @@ class PhoneWorkerSignals(QObject):
     error           = pyqtSignal(int, str)
     status          = pyqtSignal(int, str)
     account_switched = pyqtSignal(int, str)   # (phone_index, new_account_name)
+    target_done     = pyqtSignal(int, str)    # (phone_index, target_username) — target fully scraped
+    scraped_count   = pyqtSignal(int, int)    # (phone_index, session_total) — live count per phone
 
 
 class PhoneWorker(QThread):
@@ -356,6 +369,9 @@ class PhoneWorker(QThread):
                     saved = True       # no dedup via sheets; always treat as new
                 if saved:
                     self.signals.account.emit(acc)
+                    # Update per-phone session counter
+                    nonlocal total_collected
+                    self.signals.scraped_count.emit(self.phone_index, total_collected + 1)
                     if webhook_url:
                         threading.Thread(
                             target=send_webhook, args=(webhook_url, acc), daemon=True
@@ -584,6 +600,7 @@ class PhoneWorker(QThread):
                     # Don't advance target_idx — loop back to wait
                 else:
                     self._log(f"✅ @{target} done — {count} this run, {total_collected} total")
+                    self.signals.target_done.emit(self.phone_index, target)   # notify UI
                     target_idx += 1   # advance to next target
 
                     if self._stop_flag:
@@ -720,12 +737,48 @@ class PageWidget(ScrollArea):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DashboardPage(QWidget):
+    """
+    Dashboard with dynamic phone slots (1 visible by default, + button adds more up to MAX_PHONES).
+    Each slot shows its device row AND its target-username column together, so adding a phone
+    always expands both sections in sync.
+    """
+
+    # Emitted when a slot is added or removed so MainWindow can (re-)wire signals
+    slot_added   = pyqtSignal(int)   # index of newly shown slot
+    slot_removed = pyqtSignal(int)   # index of hidden slot
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Dashboard")
-        self.device_rows: List[Tuple] = []
+
+        # Public lists kept at MAX_PHONES length (hidden slots still exist in them)
+        self.device_rows: List[Tuple] = []   # (combo_dev, combo_acc, lbl_port, lbl_status, btn_view)
         self.target_rows: List[TextEdit] = []
+        self.nick_edits:  List[LineEdit] = []        # nickname input per phone
+        self.stop_phone_btns: List[PushButton] = []  # individual stop button per phone
+
+        # Per-slot container widgets (one QWidget per slot holding both device row + target col)
+        self._slot_widgets: List[QWidget] = []
+        self._separators:   list = []   # separator QFrame above each slot > 0
+
+        # How many slots are currently visible
+        self._visible_slots: int = 0
+
         self._build()
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def show_slots(self, n: int):
+        """Ensure exactly n slots are visible (used when loading config)."""
+        n = max(1, min(MAX_PHONES, n))
+        while self._visible_slots < n:
+            self._add_slot()
+        # Never hide slots that may have data — only add
+
+    def active_slot_count(self) -> int:
+        return self._visible_slots
+
+    # ── Build ─────────────────────────────────────────────────────────────
 
     def _build(self):
         outer = QHBoxLayout(self)
@@ -737,167 +790,126 @@ class DashboardPage(QWidget):
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setStyleSheet("ScrollArea{border:none;background:transparent;}")
 
-        left_inner = QWidget()
-        left_lay   = QVBoxLayout(left_inner)
-        _m = 24 if _sys.platform == "win32" else 40   # outer horizontal margin
-        _cs = 16 if _sys.platform == "win32" else 24  # card internal margin
-        _sp = 14 if _sys.platform == "win32" else 24  # spacing between cards
+        self._left_inner = QWidget()
+        left_lay = QVBoxLayout(self._left_inner)
+        _m  = 24 if _sys.platform == "win32" else 40
+        _sp = 14 if _sys.platform == "win32" else 24
         left_lay.setContentsMargins(_m, 40, _m, 40)
         left_lay.setSpacing(_sp)
-        left_scroll.setWidget(left_inner)
+        left_scroll.setWidget(self._left_inner)
+        self._left_lay = left_lay
+        self._cs = 16 if _sys.platform == "win32" else 24
 
-        title_lbl = TitleLabel("Dashboard", left_inner)
+        # Title
+        title_lbl = TitleLabel("Dashboard", self._left_inner)
         title_lbl.setFont(T.title())
-        title_lbl.setStyleSheet(f"font-size: {_pts(22)}pt; margin-bottom: {_px(12)}px; background: transparent;")
+        title_lbl.setStyleSheet(
+            f"font-size: {_pts(22)}pt; margin-bottom: {_px(12)}px; background: transparent;"
+        )
         left_lay.addWidget(title_lbl)
 
-        # ── Device rows ───────────────────────────────────────────────────
-        dev_card = CardWidget(left_inner)
-        dev_lay  = QVBoxLayout(dev_card)
-        dev_lay.setContentsMargins(_cs, _cs, _cs, _cs)
-        dev_lay.setSpacing(16 if _sys.platform == "win32" else 20)
+        # ── Phones card ────────────────────────────────────────────────────
+        self._dev_card = CardWidget(self._left_inner)
+        self._dev_lay  = QVBoxLayout(self._dev_card)
+        self._dev_lay.setContentsMargins(self._cs, self._cs, self._cs, self._cs)
+        self._dev_lay.setSpacing(0)   # slots manage their own spacing
 
         hdr_row = QHBoxLayout()
-        h1 = StrongBodyLabel("📱 Connected Phones", dev_card)
-        h1.setFont(T.heading())
-        h1.setStyleSheet("background: transparent;")
+        h1 = StrongBodyLabel("📱 Connected Phones", self._dev_card)
+        h1.setFont(T.heading()); h1.setStyleSheet("background: transparent;")
         hdr_row.addWidget(h1)
         hdr_row.addStretch()
-        self.btn_refresh = PushButton(FIF.SYNC, "Refresh", dev_card)
+        self.btn_refresh = PushButton(FIF.SYNC, "Refresh", self._dev_card)
         self.btn_refresh.setMinimumHeight(_px(34))
         self.btn_refresh.setMinimumWidth(_px(115))
         self.btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         hdr_row.addWidget(self.btn_refresh)
-        dev_lay.addLayout(hdr_row)
+        self._dev_lay.addLayout(hdr_row)
+        self._dev_lay.addSpacing(12)
 
-        for i in range(3):
-            row = QHBoxLayout()
-            row.setSpacing(10 if _sys.platform == "win32" else 16)
+        # Container for the slot rows (inserted before the + button)
+        self._slots_container = QVBoxLayout()
+        self._slots_container.setSpacing(0)
+        self._dev_lay.addLayout(self._slots_container)
 
-            lbl_num = StrongBodyLabel(f"P{i+1}", dev_card)
-            lbl_num.setFont(T.body())
-            lbl_num.setFixedWidth(28 if _sys.platform == "win32" else _px(40))
-            lbl_num.setStyleSheet("background: transparent;")
+        # + / − phone controls — one pair for the whole card
+        self._btn_add = PushButton(FIF.ADD, "Add Phone", self._dev_card)
+        self._btn_add.setFont(T.button())
+        self._btn_add.setMinimumHeight(_px(36))
+        self._btn_add.setFixedWidth(_px(130))
+        self._btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_add.clicked.connect(self._add_slot)
 
-            combo_dev = ComboBox(dev_card)
-            combo_dev.setFont(T.body())
-            combo_dev.setMinimumHeight(_px(36))
-            combo_dev.setPlaceholderText("Select Device")
-            combo_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            combo_dev.setMaximumWidth(220 if _sys.platform == "win32" else 300)
+        self._btn_remove_last = PushButton(FIF.REMOVE, "Remove Phone", self._dev_card)
+        self._btn_remove_last.setFont(T.button())
+        self._btn_remove_last.setMinimumHeight(_px(36))
+        self._btn_remove_last.setFixedWidth(_px(150))
+        self._btn_remove_last.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_remove_last.setEnabled(False)   # disabled when only 1 slot visible
+        self._btn_remove_last.clicked.connect(self._remove_last_slot)
 
-            combo_acc = ComboBox(dev_card)
-            combo_acc.setFont(T.body())
-            combo_acc.setMinimumHeight(_px(36))
-            combo_acc.setFixedWidth(120 if _sys.platform == "win32" else _px(160))
-            combo_acc.setPlaceholderText("Accounts")
+        ctrl_btn_row = QHBoxLayout()
+        ctrl_btn_row.setSpacing(10)
+        ctrl_btn_row.addWidget(self._btn_add)
+        ctrl_btn_row.addWidget(self._btn_remove_last)
+        ctrl_btn_row.addStretch()
+        self._dev_lay.addSpacing(10)
+        self._dev_lay.addLayout(ctrl_btn_row)
 
-            lbl_port = CaptionLabel(f":{4723 + i}", dev_card)
-            lbl_port.setFont(T.caption())
-            lbl_port.setFixedWidth(48 if _sys.platform == "win32" else _px(60))
-            lbl_port.setStyleSheet("background: transparent;")
+        left_lay.addWidget(self._dev_card)
 
-            lbl_status = CaptionLabel("● idle", dev_card)
-            lbl_status.setFont(T.caption())
-            lbl_status.setFixedWidth(58 if _sys.platform == "win32" else _px(75))
-            lbl_status.setStyleSheet("background: transparent;")
+        # ── Targets card ───────────────────────────────────────────────────
+        self._tgt_card = CardWidget(self._left_inner)
+        self._tgt_lay  = QVBoxLayout(self._tgt_card)
+        self._tgt_lay.setContentsMargins(self._cs, self._cs, self._cs, self._cs)
+        self._tgt_lay.setSpacing(12 if _sys.platform == "win32" else 16)
+        lbl_tgt = StrongBodyLabel("🎯 Targets per Phone", self._tgt_card)
+        lbl_tgt.setFont(T.heading()); lbl_tgt.setStyleSheet("background: transparent;")
+        self._tgt_lay.addWidget(lbl_tgt)
 
-            btn_view = PushButton("👁 View", dev_card)
-            btn_view.setFont(T.button())
-            btn_view.setMinimumHeight(_px(34))
-            btn_view.setFixedWidth(75 if _sys.platform == "win32" else _px(90))
-            btn_view.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._targets_grid = QHBoxLayout()
+        self._targets_grid.setSpacing(12 if _sys.platform == "win32" else 20)
+        self._tgt_lay.addLayout(self._targets_grid)
+        left_lay.addWidget(self._tgt_card)
 
-            row.addWidget(lbl_num)
-            row.addWidget(combo_dev)
-            row.addWidget(combo_acc)
-            row.addWidget(lbl_port)
-            row.addWidget(lbl_status)
-            row.addWidget(btn_view)
-            dev_lay.addLayout(row)
-            self.device_rows.append((combo_dev, combo_acc, lbl_port, lbl_status, btn_view))
+        # Pre-build all MAX_PHONES slots (hidden); show slot 0 immediately
+        for i in range(MAX_PHONES):
+            self._build_slot(i)
+        self._add_slot()   # show first slot
 
-        left_lay.addWidget(dev_card)
-
-        # ── Targets ───────────────────────────────────────────────────────
-        tgt_card = CardWidget(left_inner)
-        tgt_lay  = QVBoxLayout(tgt_card)
-        tgt_lay.setContentsMargins(_cs, _cs, _cs, _cs)
-        tgt_lay.setSpacing(12 if _sys.platform == "win32" else 16)
-        lbl_tgt = StrongBodyLabel("🎯 Targets per Phone", tgt_card)
-        lbl_tgt.setFont(T.heading())
-        lbl_tgt.setStyleSheet("background: transparent;")
-        tgt_lay.addWidget(lbl_tgt)
-
-        targets_grid = QHBoxLayout()
-        targets_grid.setSpacing(12 if _sys.platform == "win32" else 20)
-        for i in range(3):
-            col = QVBoxLayout()
-            lbl = CaptionLabel(f"Phone {i+1}", tgt_card)
-            lbl.setFont(T.caption())
-            lbl.setStyleSheet("background: transparent;")
-            txt = TextEdit(tgt_card)
-            txt.setFont(T.body())
-            txt.setPlaceholderText("username1\nusername2")
-            txt.setMinimumHeight(_px(140))
-            col.addWidget(lbl)
-            col.addWidget(txt)
-            targets_grid.addLayout(col)
-            self.target_rows.append(txt)
-        tgt_lay.addLayout(targets_grid)
-        left_lay.addWidget(tgt_card)
-
-        # ── Configuration & Controls ──────────────────────────────────────
+        # ── Configuration & Controls ───────────────────────────────────────
         bottom_row = QHBoxLayout()
         bottom_row.setSpacing(14 if _sys.platform == "win32" else 24)
 
-        # Mode & Count Card
-        mode_card = CardWidget(left_inner)
-        mode_lay = QVBoxLayout(mode_card)
-        mode_lay.setContentsMargins(_cs, _cs, _cs, _cs)
+        mode_card = CardWidget(self._left_inner)
+        mode_lay  = QVBoxLayout(mode_card)
+        mode_lay.setContentsMargins(self._cs, self._cs, self._cs, self._cs)
         mode_lay.setSpacing(0)
         lbl_mode = StrongBodyLabel("⚙️ Run Settings", mode_card)
-        lbl_mode.setFont(T.heading())
-        lbl_mode.setStyleSheet("background: transparent;")
+        lbl_mode.setFont(T.heading()); lbl_mode.setStyleSheet("background: transparent;")
         mode_lay.addWidget(lbl_mode)
         mode_lay.addSpacing(16)
 
-        mode_form = QHBoxLayout()
-        mode_form.setSpacing(0)
-        lbl_m = CaptionLabel("Mode:", mode_card)
-        lbl_m.setFont(T.body())
-        lbl_m.setStyleSheet("background: transparent;")
-        mode_form.addWidget(lbl_m)
-        mode_form.addSpacing(6)
-        self.combo_mode = ComboBox(mode_card)
-        self.combo_mode.setFont(T.body())
-        self.combo_mode.setMinimumHeight(_px(34))
-        self.combo_mode.addItems(["followers", "following"])
-        mode_form.addWidget(self.combo_mode)
-        mode_form.addSpacing(40)
-        lbl_mx = CaptionLabel("Max:", mode_card)
-        lbl_mx.setFont(T.body())
-        lbl_mx.setStyleSheet("background: transparent;")
-        mode_form.addWidget(lbl_mx)
-        mode_form.addSpacing(6)
-        self.spin_count = SpinBox(mode_card)
-        self.spin_count.setFont(T.body())
-        self.spin_count.setMinimumHeight(_px(34))
-        self.spin_count.setRange(1, 50000); self.spin_count.setValue(100)
-        mode_form.addWidget(self.spin_count)
-        mode_form.addStretch(1)
-        mode_lay.addLayout(mode_form)
-        mode_lay.addStretch(1)
+        mode_form = QHBoxLayout(); mode_form.setSpacing(0)
+        lbl_m = CaptionLabel("Mode:", mode_card); lbl_m.setFont(T.body()); lbl_m.setStyleSheet("background: transparent;")
+        mode_form.addWidget(lbl_m); mode_form.addSpacing(6)
+        self.combo_mode = ComboBox(mode_card); self.combo_mode.setFont(T.body())
+        self.combo_mode.setMinimumHeight(_px(34)); self.combo_mode.addItems(["followers", "following"])
+        mode_form.addWidget(self.combo_mode); mode_form.addSpacing(40)
+        lbl_mx = CaptionLabel("Max:", mode_card); lbl_mx.setFont(T.body()); lbl_mx.setStyleSheet("background: transparent;")
+        mode_form.addWidget(lbl_mx); mode_form.addSpacing(6)
+        self.spin_count = SpinBox(mode_card); self.spin_count.setFont(T.body())
+        self.spin_count.setMinimumHeight(_px(34)); self.spin_count.setRange(1, 50000); self.spin_count.setValue(100)
+        mode_form.addWidget(self.spin_count); mode_form.addStretch(1)
+        mode_lay.addLayout(mode_form); mode_lay.addStretch(1)
         bottom_row.addWidget(mode_card, 1)
 
-        # Schedule Card
-        sched_card = CardWidget(left_inner)
-        sched_lay = QVBoxLayout(sched_card)
-        sched_lay.setContentsMargins(_cs, _cs, _cs, _cs)
+        sched_card = CardWidget(self._left_inner)
+        sched_lay  = QVBoxLayout(sched_card)
+        sched_lay.setContentsMargins(self._cs, self._cs, self._cs, self._cs)
         sched_lay.setSpacing(10)
         self.chk_schedule = CheckBox("Working Hours", sched_card)
-        self.chk_schedule.setFont(T.heading())
-        self.chk_schedule.setStyleSheet("background: transparent;")
+        self.chk_schedule.setFont(T.heading()); self.chk_schedule.setStyleSheet("background: transparent;")
         sched_lay.addWidget(self.chk_schedule)
         self.lbl_sched_desc = CaptionLabel(
             "Scraping only runs between these times. Outside this window the bot pauses and waits.",
@@ -906,69 +918,225 @@ class DashboardPage(QWidget):
         self.lbl_sched_desc.setStyleSheet("background: transparent; color: grey;")
         self.lbl_sched_desc.setWordWrap(True)
         sched_lay.addWidget(self.lbl_sched_desc)
-        time_row = QHBoxLayout()
-        time_row.setSpacing(8)
-        self._lbl_sched_start = CaptionLabel("Start:", sched_card)
-        self._lbl_sched_start.setStyleSheet("background: transparent;")
-        self.time_start = TimeEdit(sched_card)
-        self.time_start.setFont(T.body())
-        self.time_start.setMinimumHeight(_px(34))
-        self.time_start.setDisplayFormat("hh:mm AP")
+        time_row = QHBoxLayout(); time_row.setSpacing(8)
+        self._lbl_sched_start = CaptionLabel("Start:", sched_card); self._lbl_sched_start.setStyleSheet("background: transparent;")
+        self.time_start = TimeEdit(sched_card); self.time_start.setFont(T.body())
+        self.time_start.setMinimumHeight(_px(44)); self.time_start.setDisplayFormat("hh:mm AP")
         self.time_start.setToolTip("Scraping START time (e.g. 09:00 AM)")
-        self._lbl_sched_arrow = CaptionLabel("to", sched_card)
-        self._lbl_sched_arrow.setStyleSheet("background: transparent;")
-        self._lbl_sched_end = CaptionLabel("End:", sched_card)
-        self._lbl_sched_end.setStyleSheet("background: transparent;")
-        self.time_end = TimeEdit(sched_card)
-        self.time_end.setFont(T.body())
-        self.time_end.setMinimumHeight(_px(34))
-        self.time_end.setDisplayFormat("hh:mm AP")
+        self._lbl_sched_arrow = CaptionLabel("to", sched_card); self._lbl_sched_arrow.setStyleSheet("background: transparent;")
+        self._lbl_sched_end = CaptionLabel("End:", sched_card); self._lbl_sched_end.setStyleSheet("background: transparent;")
+        self.time_end = TimeEdit(sched_card); self.time_end.setFont(T.body())
+        self.time_end.setMinimumHeight(_px(44)); self.time_end.setDisplayFormat("hh:mm AP")
         self.time_end.setToolTip("Scraping END time (e.g. 06:00 PM)")
-        time_row.addWidget(self._lbl_sched_start)
-        time_row.addWidget(self.time_start)
-        time_row.addWidget(self._lbl_sched_arrow)
-        time_row.addWidget(self._lbl_sched_end)
-        time_row.addWidget(self.time_end)
-        time_row.addStretch()
+        time_row.addWidget(self._lbl_sched_start); time_row.addWidget(self.time_start)
+        time_row.addWidget(self._lbl_sched_arrow); time_row.addWidget(self._lbl_sched_end)
+        time_row.addWidget(self.time_end); time_row.addStretch()
         sched_lay.addLayout(time_row)
-
         self.lbl_sched_preview = CaptionLabel("", sched_card)
         self.lbl_sched_preview.setStyleSheet("background: transparent; color: #3b82f6;")
         self.lbl_sched_preview.setWordWrap(True)
         sched_lay.addWidget(self.lbl_sched_preview)
-
         bottom_row.addWidget(sched_card, 1)
-
         left_lay.addLayout(bottom_row)
 
-        # ── Action Buttons ────────────────────────────────────────────────
-        ctrl_row = QHBoxLayout()
-        ctrl_row.setSpacing(20)
-        self.btn_start = PrimaryPushButton(FIF.PLAY, "START SCRAPING", left_inner)
-        self.btn_start.setFont(T.button())
-        self.btn_start.setMinimumHeight(_px(48))
-        self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_start.setEnabled(False)   # locked until device assigned + accounts detected
+        # Session Summary card
+        sum_card = CardWidget(self._left_inner)
+        sum_lay  = QVBoxLayout(sum_card)
+        sum_lay.setContentsMargins(self._cs, self._cs, self._cs, self._cs)
+        sum_lay.setSpacing(10)
+        lbl_sum = StrongBodyLabel("📋 Session Summary", sum_card)
+        lbl_sum.setFont(T.heading()); lbl_sum.setStyleSheet("background: transparent;")
+        sum_lay.addWidget(lbl_sum)
+        self.lbl_summary_info = CaptionLabel("No sessions run yet.", sum_card)
+        self.lbl_summary_info.setFont(T.body())
+        self.lbl_summary_info.setStyleSheet("background: transparent; color: #94a3b8;")
+        self.lbl_summary_info.setWordWrap(True)
+        sum_lay.addWidget(self.lbl_summary_info)
+        self.btn_download_summary = PushButton(FIF.DOWNLOAD, "Download Summary (.txt)", sum_card)
+        self.btn_download_summary.setFont(T.button())
+        self.btn_download_summary.setMinimumHeight(_px(36))
+        self.btn_download_summary.setCursor(Qt.CursorShape.PointingHandCursor)
+        sum_lay.addWidget(self.btn_download_summary)
+        left_lay.addWidget(sum_card)
 
-        self.btn_stop = PushButton(FIF.CLOSE, "STOP ALL", left_inner)
-        self.btn_stop.setFont(T.button())
-        self.btn_stop.setMinimumHeight(_px(48))
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.setObjectName("btn_stop_danger")
+        # Action buttons
+        ctrl_row = QHBoxLayout(); ctrl_row.setSpacing(20)
+        self.btn_start = PrimaryPushButton(FIF.PLAY, "START SCRAPING", self._left_inner)
+        self.btn_start.setFont(T.button()); self.btn_start.setMinimumHeight(_px(48))
+        self.btn_start.setCursor(Qt.CursorShape.PointingHandCursor); self.btn_start.setEnabled(False)
+        self.btn_stop = PushButton(FIF.CLOSE, "STOP ALL", self._left_inner)
+        self.btn_stop.setFont(T.button()); self.btn_stop.setMinimumHeight(_px(48))
+        self.btn_stop.setEnabled(False); self.btn_stop.setObjectName("btn_stop_danger")
         self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        self.lbl_overall_status = StrongBodyLabel("Ready", left_inner)
+        self.lbl_overall_status = StrongBodyLabel("Ready", self._left_inner)
         self.lbl_overall_status.setFont(T.body())
         self.lbl_overall_status.setStyleSheet("color: #64748b; margin-left: 15px; background: transparent;")
-
-        ctrl_row.addWidget(self.btn_start, 2)
-        ctrl_row.addWidget(self.btn_stop, 1)
+        ctrl_row.addWidget(self.btn_start, 2); ctrl_row.addWidget(self.btn_stop, 1)
         ctrl_row.addWidget(self.lbl_overall_status, 1)
         left_lay.addLayout(ctrl_row)
-
         left_lay.addStretch(1)
+
         outer.addWidget(left_scroll, stretch=65)
         outer.addStretch(35)
+
+    # ── Slot construction ─────────────────────────────────────────────────
+
+    def _build_slot(self, i: int):
+        """Pre-build slot i (hidden). Appends to device_rows and target_rows."""
+        is_win = _sys.platform == "win32"
+
+        # Outer wrapper: holds device row + optional remove link below it
+        outer_w = QWidget(self._dev_card)
+        outer_w.setStyleSheet("background: transparent;")
+        outer_lay = QVBoxLayout(outer_w)
+        outer_lay.setContentsMargins(0, 4, 0, 4)
+        outer_lay.setSpacing(2)
+
+        # Device row
+        dev_w = QWidget(outer_w)
+        dev_w.setStyleSheet("background: transparent;")
+        dev_row = QHBoxLayout(dev_w)
+        dev_row.setContentsMargins(0, 0, 0, 0)
+        dev_row.setSpacing(10 if is_win else 16)
+
+        lbl_num = StrongBodyLabel(f"P{i+1}", dev_w)
+        lbl_num.setFont(T.body())
+        lbl_num.setFixedWidth(28 if is_win else _px(40))
+        lbl_num.setStyleSheet("background: transparent;")
+
+        # Nickname input
+        nick_edit = LineEdit(dev_w); nick_edit.setFont(T.body())
+        nick_edit.setPlaceholderText(f"Phone {i+1}")
+        nick_edit.setFixedWidth(90 if is_win else _px(110))
+        nick_edit.setMinimumHeight(_px(32))
+        nick_edit.setToolTip("Give this phone a nickname")
+
+        combo_dev = ComboBox(dev_w); combo_dev.setFont(T.body())
+        combo_dev.setMinimumHeight(_px(36)); combo_dev.setPlaceholderText("Select Device")
+        combo_dev.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        combo_dev.setMaximumWidth(220 if is_win else 300)
+
+        combo_acc = ComboBox(dev_w); combo_acc.setFont(T.body())
+        combo_acc.setMinimumHeight(_px(36))
+        combo_acc.setFixedWidth(120 if is_win else _px(160))
+        combo_acc.setPlaceholderText("Accounts")
+
+        lbl_port = CaptionLabel(f":{4723 + i}", dev_w); lbl_port.setFont(T.caption())
+        lbl_port.setFixedWidth(48 if is_win else _px(60))
+        lbl_port.setStyleSheet("background: transparent;")
+
+        lbl_status = CaptionLabel("\u25cf idle", dev_w); lbl_status.setFont(T.caption())
+        lbl_status.setFixedWidth(58 if is_win else _px(75))
+        lbl_status.setStyleSheet("background: transparent;")
+
+        btn_view = PushButton("\U0001f441 View", dev_w); btn_view.setFont(T.button())
+        btn_view.setMinimumHeight(_px(34))
+        btn_view.setFixedWidth(75 if is_win else _px(90))
+        btn_view.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # Individual stop button (hidden until scraping starts)
+        btn_stop_phone = PushButton("⏹", dev_w); btn_stop_phone.setFont(T.button())
+        btn_stop_phone.setMinimumHeight(_px(34))
+        btn_stop_phone.setFixedWidth(36 if is_win else _px(44))
+        btn_stop_phone.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_stop_phone.setEnabled(False)
+        btn_stop_phone.setStyleSheet(
+            "PushButton { background: #ef4444; border: none; color: white; border-radius: 6px; }"
+            "PushButton:hover { background: #dc2626; }"
+            "PushButton:disabled { background: #475569; color: #94a3b8; }"
+        )
+
+        dev_row.addWidget(lbl_num)
+        dev_row.addWidget(nick_edit)
+        dev_row.addWidget(combo_dev)
+        dev_row.addWidget(combo_acc)
+        dev_row.addWidget(lbl_port)
+        dev_row.addWidget(lbl_status)
+        dev_row.addWidget(btn_stop_phone)
+        dev_row.addWidget(btn_view)
+        dev_row.addStretch()
+        outer_lay.addWidget(dev_w)
+
+        # No per-slot remove button — removal handled by the shared card-level button
+
+        # Thin separator above every slot after the first
+        if i > 0:
+            sep = QFrame(self._dev_card)
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet("QFrame { background-color: #2d3f55; border: none; max-height: 1px; }")
+            self._separators.append(sep)
+            self._slots_container.addWidget(sep)
+            sep.hide()
+        else:
+            self._separators.append(None)
+
+        self._slots_container.addWidget(outer_w)
+        outer_w.hide()
+
+        # Target column widget
+        tgt_w = QWidget(self._tgt_card)
+        tgt_w.setStyleSheet("background: transparent;")
+        tgt_col = QVBoxLayout(tgt_w)
+        tgt_col.setContentsMargins(0, 0, 0, 0); tgt_col.setSpacing(4)
+
+        lbl_tgt = CaptionLabel(f"Phone {i+1}", tgt_w)
+        lbl_tgt.setFont(T.caption()); lbl_tgt.setStyleSheet("background: transparent;")
+        # Keep reference so nickname changes update this label live
+        nick_edit.textChanged.connect(
+            lambda text, lbl=lbl_tgt, idx=i: lbl.setText(text.strip() or f"Phone {idx+1}")
+        )
+
+        txt = TextEdit(tgt_w); txt.setFont(T.body())
+        txt.setPlaceholderText("username1\nusername2"); txt.setMinimumHeight(_px(140))
+        # transparent so it uses the card background without the dark-box artefact
+        txt.setStyleSheet("TextEdit { background: transparent; border: 1px solid #334155; border-radius: 10px; padding: 6px 10px; }")
+
+        tgt_col.addWidget(lbl_tgt); tgt_col.addWidget(txt)
+        self._targets_grid.addWidget(tgt_w)
+        tgt_w.hide()
+
+        # Register
+        self.device_rows.append((combo_dev, combo_acc, lbl_port, lbl_status, btn_view))
+        self.target_rows.append(txt)
+        self.nick_edits.append(nick_edit)
+        self.stop_phone_btns.append(btn_stop_phone)
+        self._slot_widgets.append((outer_w, tgt_w))
+
+
+    # ── Slot show/hide ────────────────────────────────────────────────────
+
+    def _add_slot(self):
+        """Show the next hidden slot."""
+        i = self._visible_slots
+        if i >= MAX_PHONES:
+            return
+        outer_w, tgt_w = self._slot_widgets[i]
+        if i < len(self._separators) and self._separators[i]:
+            self._separators[i].show()
+        outer_w.show(); tgt_w.show()
+        self._visible_slots += 1
+        self._btn_add.setEnabled(self._visible_slots < MAX_PHONES)
+        self._btn_remove_last.setEnabled(self._visible_slots > 1)
+        self.slot_added.emit(i)
+
+    def _remove_last_slot(self):
+        """Hide the last visible slot (always index _visible_slots - 1)."""
+        i = self._visible_slots - 1
+        if i < 1:   # never remove slot 0
+            return
+        outer_w, tgt_w = self._slot_widgets[i]
+        if i < len(self._separators) and self._separators[i]:
+            self._separators[i].hide()
+        outer_w.hide(); tgt_w.hide()
+        combo_dev = self.device_rows[i][0]
+        combo_dev.blockSignals(True); combo_dev.setCurrentIndex(0); combo_dev.blockSignals(False)
+        self.target_rows[i].clear()
+        if i < len(self.nick_edits):
+            self.nick_edits[i].clear()
+        self._visible_slots -= 1
+        self._btn_add.setEnabled(True)
+        self._btn_remove_last.setEnabled(self._visible_slots > 1)
+        self.slot_removed.emit(i)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1076,28 +1244,57 @@ class FiltersPage(PageWidget):
         bl_lay  = QVBoxLayout(bl_card)
         bl_lay.setContentsMargins(30, 30, 30, 30)
         bl_lay.setSpacing(16)
-        lbl_bl = StrongBodyLabel("🏴 Blacklist", bl_card)
+        lbl_bl = StrongBodyLabel("🏴 Blacklists", bl_card)
         lbl_bl.setFont(T.heading()); lbl_bl.setStyleSheet("background: transparent;")
         bl_lay.addWidget(lbl_bl)
         bl_lay.addWidget(CaptionLabel(
-            "Usernames in this list will NEVER be scraped again. "
-            "Download the .txt file to edit it, then import it back.", bl_card
+            "Two separate blacklist files — one for normal scrapes, one for keyword-mode scrapes. "
+            "They never mix.", bl_card
         ))
 
-        # Count label — updated dynamically by MainWindow
-        self.lbl_bl_count = CaptionLabel("0 entries in blacklist", bl_card)
-        self.lbl_bl_count.setStyleSheet("background: transparent; color: grey;")
-        self.lbl_bl_count.setFont(T.mono())
-        bl_lay.addWidget(self.lbl_bl_count)
+        # ── Side-by-side symmetric panels ─────────────────────────────────
+        panels_row = QHBoxLayout(); panels_row.setSpacing(20)
 
-        bl_btns = QHBoxLayout()
-        self.btn_download_bl = PrimaryPushButton(FIF.DOWNLOAD, "Download .txt", bl_card)
-        self.btn_import_bl   = PushButton(FIF.FOLDER,          "Import .txt",   bl_card)
-        self.btn_clear_bl    = PushButton(FIF.DELETE,          "Clear All",     bl_card)
-        for b in [self.btn_download_bl, self.btn_import_bl, self.btn_clear_bl]:
-            b.setFont(T.button()); b.setMinimumHeight(_px(36)); bl_btns.addWidget(b)
-        bl_btns.addStretch()
-        bl_lay.addLayout(bl_btns)
+        def _bl_panel(title, desc, icon, btn_dl_label, parent):
+            """Return (panel_widget, lbl_count, btn_dl, btn_import, btn_clear)."""
+            panel = QWidget(parent); panel.setStyleSheet("background: transparent;")
+            lay   = QVBoxLayout(panel); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(8)
+            lbl_title = StrongBodyLabel(title, panel)
+            lbl_title.setFont(T.body()); lbl_title.setStyleSheet("background: transparent;")
+            lay.addWidget(lbl_title)
+            lbl_desc = CaptionLabel(desc, panel)
+            lbl_desc.setStyleSheet("background: transparent; color: grey;"); lbl_desc.setWordWrap(True)
+            lay.addWidget(lbl_desc)
+            lbl_count = CaptionLabel("0 entries", panel)
+            lbl_count.setStyleSheet("background: transparent; color: grey;")
+            lbl_count.setFont(T.mono())
+            lay.addWidget(lbl_count)
+            btn_dl  = PrimaryPushButton(FIF.DOWNLOAD, btn_dl_label, panel)
+            btn_imp = PushButton(FIF.FOLDER,  "Import .txt", panel)
+            btn_clr = PushButton(FIF.DELETE,  "Clear",       panel)
+            for b in [btn_dl, btn_imp, btn_clr]:
+                b.setFont(T.button()); b.setMinimumHeight(_px(36)); lay.addWidget(b)
+            lay.addStretch()
+            return panel, lbl_count, btn_dl, btn_imp, btn_clr
+
+        left_panel, self.lbl_bl_count, self.btn_download_bl, self.btn_import_bl, self.btn_clear_bl = \
+            _bl_panel("📋 Main Blacklist",
+                      "Usernames already scraped in normal mode. Never scraped again.",
+                      FIF.DOWNLOAD, "Download blacklist.txt", bl_card)
+
+        right_panel, self.lbl_kw_bl_count, self.btn_download_kw_bl, self.btn_import_kw_bl, self.btn_clear_kw_bl = \
+            _bl_panel("🔑 Keyword-Mode Blacklist",
+                      "Usernames scraped via keyword search. Separate from main blacklist.",
+                      FIF.DOWNLOAD, "Download blacklist_keyword.txt", bl_card)
+
+        panels_row.addWidget(left_panel, 1)
+        # Thin vertical separator
+        sep = QFrame(bl_card); sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color: #334155; background: #334155;"); sep.setFixedWidth(1)
+        panels_row.addWidget(sep)
+        panels_row.addWidget(right_panel, 1)
+        bl_lay.addLayout(panels_row)
+
         self.add(bl_card)
         self.stretch()
 
@@ -1144,10 +1341,11 @@ class ResultsPage(QWidget):
         lbl_live = StrongBodyLabel("📊 Phone Status:", prog_card)
         lbl_live.setFont(T.heading()); lbl_live.setStyleSheet("background: transparent;")
         status_row.addWidget(lbl_live)
-        for i in range(3):
+        for i in range(MAX_PHONES):
             lbl = CaptionLabel(f"Phone {i+1}: idle", prog_card)
             lbl.setFont(T.body())
             lbl.setStyleSheet("color: #64748b; font-weight: 500; background: transparent;")
+            lbl.setVisible(False)   # hidden by default — shown only for active slots
             self.phone_status_labels.append(lbl)
             status_row.addWidget(lbl)
         status_row.addStretch()
@@ -1183,13 +1381,35 @@ class ResultsPage(QWidget):
         exp_row.addWidget(self.btn_export_csv); exp_row.addStretch()
         left_lay.addLayout(exp_row)
 
-        # Activity log
-        lbl_log = StrongBodyLabel("📜 Activity Log", left_inner)
+        # Activity logs — two panels side by side
+        logs_row = QHBoxLayout()
+        logs_row.setSpacing(12)
+
+        # Left: Scraping log
+        scrape_log_col = QVBoxLayout()
+        lbl_log = StrongBodyLabel("📜 Scraping Log", left_inner)
         lbl_log.setFont(T.heading()); lbl_log.setStyleSheet("background: transparent;")
-        left_lay.addWidget(lbl_log)
+        scrape_log_col.addWidget(lbl_log)
         self.log_area = TextEdit(left_inner)
-        self.log_area.setReadOnly(True); self.log_area.setMinimumHeight(_px(250)); self.log_area.setFont(T.mono())
-        left_lay.addWidget(self.log_area)
+        self.log_area.setReadOnly(True)
+        self.log_area.setMinimumHeight(_px(250))
+        self.log_area.setFont(T.mono())
+        scrape_log_col.addWidget(self.log_area)
+        logs_row.addLayout(scrape_log_col, stretch=1)
+
+        # Right: Main Account log
+        ma_log_col = QVBoxLayout()
+        lbl_ma_log = StrongBodyLabel("🌟 Main Account Log", left_inner)
+        lbl_ma_log.setFont(T.heading()); lbl_ma_log.setStyleSheet("background: transparent;")
+        ma_log_col.addWidget(lbl_ma_log)
+        self.ma_log_area = TextEdit(left_inner)
+        self.ma_log_area.setReadOnly(True)
+        self.ma_log_area.setMinimumHeight(_px(250))
+        self.ma_log_area.setFont(T.mono())
+        ma_log_col.addWidget(self.ma_log_area)
+        logs_row.addLayout(ma_log_col, stretch=1)
+
+        left_lay.addLayout(logs_row)
 
         left_lay.addStretch(1)
         outer.addWidget(left_scroll, stretch=65)
@@ -1383,7 +1603,514 @@ class SettingsPage(PageWidget):
         _on_switch_mode_changed()   # apply initial state
 
         self.add(dl_card)
+
+        # ── IP Rotation ───────────────────────────────────────────────────
+        ip_card = CardWidget(self); ip_lay = QVBoxLayout(ip_card)
+        ip_lay.setContentsMargins(30, 30, 30, 30); ip_lay.setSpacing(16)
+        lbl_ip = StrongBodyLabel("🔄 IP Rotation (Mobile Data)", ip_card)
+        lbl_ip.setFont(T.heading()); lbl_ip.setStyleSheet("background: transparent;")
+        ip_lay.addWidget(lbl_ip)
+        ip_lay.addWidget(CaptionLabel(
+            "Rotates IP by toggling mobile data OFF → ON. "
+            "Requires a real SIM card — does NOT work on Wi-Fi or emulators.", ip_card
+        ))
+
+        self.chk_ip_enabled = CheckBox("Enable IP rotation", ip_card)
+        self.chk_ip_enabled.setFont(T.body()); self.chk_ip_enabled.setStyleSheet("background: transparent;")
+        ip_lay.addWidget(self.chk_ip_enabled)
+
+        ip_interval_row = QHBoxLayout()
+        lbl_ip_min = CaptionLabel("Rotate every MIN:", ip_card); lbl_ip_min.setFont(T.body()); lbl_ip_min.setStyleSheet("background: transparent;")
+        self.sp_ip_min = DoubleSpinBox(ip_card); self.sp_ip_min.setRange(1.0, 120.0); self.sp_ip_min.setValue(5.0)
+        self.sp_ip_min.setFont(T.body()); self.sp_ip_min.setMinimumHeight(_px(34)); self.sp_ip_min.setFixedWidth(_px(120))
+        lbl_ip_max = CaptionLabel("MAX (minutes):", ip_card); lbl_ip_max.setFont(T.body()); lbl_ip_max.setStyleSheet("background: transparent;")
+        self.sp_ip_max = DoubleSpinBox(ip_card); self.sp_ip_max.setRange(1.0, 240.0); self.sp_ip_max.setValue(15.0)
+        self.sp_ip_max.setFont(T.body()); self.sp_ip_max.setMinimumHeight(_px(34)); self.sp_ip_max.setFixedWidth(_px(120))
+        ip_interval_row.addWidget(lbl_ip_min); ip_interval_row.addWidget(self.sp_ip_min)
+        ip_interval_row.addSpacing(24)
+        ip_interval_row.addWidget(lbl_ip_max); ip_interval_row.addWidget(self.sp_ip_max)
+        ip_interval_row.addStretch()
+        ip_lay.addLayout(ip_interval_row)
+
+        def _on_ip_toggle():
+            on = self.chk_ip_enabled.isChecked()
+            self.sp_ip_min.setEnabled(on); self.sp_ip_max.setEnabled(on)
+        self.chk_ip_enabled.stateChanged.connect(lambda _: _on_ip_toggle())
+        _on_ip_toggle()
+        ip_card.setVisible(False)  # IP Rotation hidden from UI (backend retained)
+        self.add(ip_card)
+
         self.stretch()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MainAccountPage  — story/feed engagement for one designated phone
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MainAccountPage(PageWidget):
+    """
+    Configuration and control panel for the 'Main Account' engagement mode.
+    One phone slot can be designated as the Main Account: it watches stories
+    (reacting / liking / replying) and browses the feed (liking posts) instead
+    of scraping followers.
+    """
+    def __init__(self, parent=None):
+        super().__init__("Main Account", parent)
+        self._build()
+
+    def _build(self):
+        _cs = 24
+
+        def _lbl(text, parent):
+            l = CaptionLabel(text, parent); l.setFont(T.body()); l.setStyleSheet("background:transparent;")
+            return l
+
+        def _spin(parent, lo, hi, val, w=150, double=False):
+            s = (DoubleSpinBox if double else SpinBox)(parent)
+            s.setRange(lo, hi); s.setValue(val)
+            s.setFont(T.body()); s.setMinimumHeight(_px(34)); s.setMinimumWidth(_px(w))
+            return s
+
+        def _row(*widgets):
+            r = QHBoxLayout()
+            for w in widgets:
+                if isinstance(w, int):
+                    r.addSpacing(w)
+                else:
+                    r.addWidget(w)
+            r.addStretch()
+            return r
+
+        def _engage_row(parent, label_text, chk_attr, pct_attr, default_pct):
+            """Return (layout, checkbox, spinbox) for one engagement action row."""
+            chk = CheckBox(label_text, parent)
+            chk.setFont(T.body()); chk.setStyleSheet("background:transparent;")
+            lbl = _lbl("%:", parent)
+            sp  = _spin(parent, 0, 100, default_pct, w=110)
+            sp.setSuffix("%")
+            row = QHBoxLayout()
+            row.addWidget(chk); row.addSpacing(16); row.addWidget(lbl); row.addWidget(sp); row.addStretch()
+            return row, chk, sp
+
+        # ── Enable + Phone slot ───────────────────────────────────────────
+        en_card = CardWidget(self); en_lay = QVBoxLayout(en_card)
+        en_lay.setContentsMargins(_cs, _cs, _cs, _cs); en_lay.setSpacing(16)
+        lbl_en = StrongBodyLabel("🌟 Main Account Mode", en_card)
+        lbl_en.setFont(T.heading()); lbl_en.setStyleSheet("background:transparent;")
+        en_lay.addWidget(lbl_en)
+        en_lay.addWidget(CaptionLabel(
+            "Designate one phone slot as the Main Account. "
+            "It will engage with stories, feed and reels instead of scraping.", en_card
+        ))
+        slot_row = QHBoxLayout()
+        self.chk_ma_enabled = CheckBox("Enable Main Account", en_card)
+        self.chk_ma_enabled.setFont(T.body()); self.chk_ma_enabled.setStyleSheet("background:transparent;")
+        slot_row.addWidget(self.chk_ma_enabled); slot_row.addSpacing(30)
+        lbl_slot = _lbl("Phone slot:", en_card)
+        self.combo_ma_slot = ComboBox(en_card); self.combo_ma_slot.setFont(T.body())
+        self.combo_ma_slot.setMinimumHeight(_px(36)); self.combo_ma_slot.setFixedWidth(_px(140))
+        for i in range(MAX_PHONES):
+            self.combo_ma_slot.addItem(f"Phone {i+1}", userData=i)
+        slot_row.addWidget(lbl_slot); slot_row.addWidget(self.combo_ma_slot); slot_row.addStretch()
+        en_lay.addLayout(slot_row)
+        self.add(en_card)
+
+        # ── Working hours ─────────────────────────────────────────────────
+        wh_card = CardWidget(self); wh_lay = QVBoxLayout(wh_card)
+        wh_lay.setContentsMargins(_cs, _cs, _cs, _cs); wh_lay.setSpacing(12)
+        lbl_wh = StrongBodyLabel("⏰ Working Hours Windows", wh_card)
+        lbl_wh.setFont(T.heading()); lbl_wh.setStyleSheet("background:transparent;")
+        wh_lay.addWidget(lbl_wh)
+        wh_lay.addWidget(CaptionLabel(
+            "Bot runs during all configured windows. If started mid-window it begins immediately. "
+            "Leave empty to run 24/7.", wh_card
+        ))
+        self.ma_windows: List[Tuple] = []
+        self._wh_container = QVBoxLayout()
+        wh_lay.addLayout(self._wh_container)
+
+        # Single Add + Remove row (matches phone working hours style)
+        wh_btn_row = QHBoxLayout()
+        btn_add_window = PushButton(FIF.ADD, "Add Window", wh_card)
+        btn_add_window.setFont(T.button()); btn_add_window.setMinimumHeight(_px(36))
+        btn_add_window.clicked.connect(self._add_wh_window)
+        self._btn_rm_wh = PushButton(FIF.DELETE, "Remove Last", wh_card)
+        self._btn_rm_wh.setFont(T.button()); self._btn_rm_wh.setMinimumHeight(_px(36))
+        self._btn_rm_wh.clicked.connect(self._remove_last_wh_window)
+        wh_btn_row.addWidget(btn_add_window)
+        wh_btn_row.addWidget(self._btn_rm_wh)
+        wh_btn_row.addStretch()
+        wh_lay.addLayout(wh_btn_row)
+        self.add(wh_card)
+        self._wh_card = wh_card
+
+        # ── Daily time limit ──────────────────────────────────────────────
+        dl_card = CardWidget(self); dl_lay = QVBoxLayout(dl_card)
+        dl_lay.setContentsMargins(_cs, _cs, _cs, _cs); dl_lay.setSpacing(12)
+        lbl_dl = StrongBodyLabel("⏱ Daily Time Limit", dl_card)
+        lbl_dl.setFont(T.heading()); lbl_dl.setStyleSheet("background:transparent;")
+        dl_lay.addWidget(lbl_dl)
+        dl_lay.addWidget(CaptionLabel(
+            "Maximum total engagement time per day. Resets at midnight. "
+            "Idle/waiting time between windows does NOT count. Disable to run unlimited.",
+            dl_card,
+        ))
+
+        self.chk_dl_enabled = CheckBox("Enable daily limit", dl_card)
+        self.chk_dl_enabled.setFont(T.body())
+        self.chk_dl_enabled.setStyleSheet("background:transparent;")
+        dl_lay.addWidget(self.chk_dl_enabled)
+
+        dl_row = QHBoxLayout()
+        lbl_dl_h = CaptionLabel("Hours:", dl_card); lbl_dl_h.setFont(T.body())
+        lbl_dl_h.setStyleSheet("background:transparent;")
+        self.sp_dl_hours = SpinBox(dl_card)
+        self.sp_dl_hours.setRange(0, 23); self.sp_dl_hours.setValue(4)
+        self.sp_dl_hours.setFont(T.body()); self.sp_dl_hours.setMinimumHeight(_px(34))
+        self.sp_dl_hours.setFixedWidth(_px(120))
+
+        lbl_dl_m = CaptionLabel("Minutes:", dl_card); lbl_dl_m.setFont(T.body())
+        lbl_dl_m.setStyleSheet("background:transparent;")
+        self.sp_dl_minutes = SpinBox(dl_card)
+        self.sp_dl_minutes.setRange(0, 59); self.sp_dl_minutes.setValue(0)
+        self.sp_dl_minutes.setFont(T.body()); self.sp_dl_minutes.setMinimumHeight(_px(34))
+        self.sp_dl_minutes.setFixedWidth(_px(120))
+
+        dl_row.addWidget(lbl_dl_h); dl_row.addWidget(self.sp_dl_hours)
+        dl_row.addSpacing(24)
+        dl_row.addWidget(lbl_dl_m); dl_row.addWidget(self.sp_dl_minutes)
+        dl_row.addStretch()
+        dl_lay.addLayout(dl_row)
+
+        def _on_dl_toggle():
+            on = self.chk_dl_enabled.isChecked()
+            self.sp_dl_hours.setEnabled(on)
+            self.sp_dl_minutes.setEnabled(on)
+        self.chk_dl_enabled.stateChanged.connect(lambda _: _on_dl_toggle())
+        _on_dl_toggle()
+        self.add(dl_card)
+
+        # ── Stories config ────────────────────────────────────────────────
+        st_card = CardWidget(self); st_lay = QVBoxLayout(st_card)
+        st_lay.setContentsMargins(_cs, _cs, _cs, _cs); st_lay.setSpacing(10)
+        lbl_st = StrongBodyLabel("📖 Stories Engagement", st_card)
+        lbl_st.setFont(T.heading()); lbl_st.setStyleSheet("background:transparent;")
+        st_lay.addWidget(lbl_st)
+
+        self.chk_st_enabled = CheckBox("Enable story engagement", st_card)
+        self.chk_st_enabled.setFont(T.body()); self.chk_st_enabled.setStyleSheet("background:transparent;")
+        self.chk_st_enabled.setChecked(True)
+        st_lay.addWidget(self.chk_st_enabled)
+
+        # Stories per micro-cycle
+        st_lay.addWidget(_lbl("Stories to watch per burst (MIN / MAX):", st_card))
+        self.sp_st_watch_min = _spin(st_card, 1, 50, 3)
+        self.sp_st_watch_max = _spin(st_card, 1, 100, 7)
+        st_lay.addLayout(_row(_lbl("MIN:", st_card), self.sp_st_watch_min,
+                              20, _lbl("MAX:", st_card), self.sp_st_watch_max))
+
+        # Seconds per story
+        st_lay.addWidget(_lbl("Seconds to watch each story (MIN / MAX):", st_card))
+        self.sp_st_wsec_min = _spin(st_card, 1.0, 60.0, 3.0, double=True)
+        self.sp_st_wsec_max = _spin(st_card, 1.0, 120.0, 8.0, double=True)
+        st_lay.addLayout(_row(_lbl("MIN:", st_card), self.sp_st_wsec_min,
+                              20, _lbl("MAX:", st_card), self.sp_st_wsec_max))
+
+        # Short rest
+        st_lay.addWidget(_lbl("Short rest between bursts — seconds (MIN / MAX):", st_card))
+        self.sp_st_rest_s_min = _spin(st_card, 1.0, 600.0, 10.0, double=True)
+        self.sp_st_rest_s_max = _spin(st_card, 1.0, 600.0, 30.0, double=True)
+        st_lay.addLayout(_row(_lbl("MIN:", st_card), self.sp_st_rest_s_min,
+                              20, _lbl("MAX:", st_card), self.sp_st_rest_s_max))
+
+        # Short cycles before long rest
+        st_lay.addWidget(_lbl("Number of bursts before long rest (MIN / MAX):", st_card))
+        self.sp_st_cycles_min = _spin(st_card, 1, 50, 3)
+        self.sp_st_cycles_max = _spin(st_card, 1, 100, 6)
+        st_lay.addLayout(_row(_lbl("MIN:", st_card), self.sp_st_cycles_min,
+                              20, _lbl("MAX:", st_card), self.sp_st_cycles_max))
+
+        # Long rest
+        st_lay.addWidget(_lbl("Long rest after all bursts — seconds (MIN / MAX):", st_card))
+        self.sp_st_rest_l_min = _spin(st_card, 10.0, 3600.0, 120.0, double=True)
+        self.sp_st_rest_l_max = _spin(st_card, 10.0, 3600.0, 300.0, double=True)
+        st_lay.addLayout(_row(_lbl("MIN:", st_card), self.sp_st_rest_l_min,
+                              20, _lbl("MAX:", st_card), self.sp_st_rest_l_max))
+
+        # Engagement actions
+        st_lay.addWidget(_lbl("Engagement actions (enable toggle + % chance per story):", st_card))
+        r1, self.chk_st_like,    self.sp_st_like_pct    = _engage_row(st_card, "Like",    "", "", 30)
+        r2, self.chk_st_react,   self.sp_st_react_pct   = _engage_row(st_card, "React (😮❤️👏🔥)", "", "", 20)
+        r3, self.chk_st_comment, self.sp_st_comment_pct = _engage_row(st_card, "Comment", "", "", 10)
+        self.chk_st_like.setChecked(True); self.chk_st_react.setChecked(True)
+        st_lay.addLayout(r1); st_lay.addLayout(r2); st_lay.addLayout(r3)
+        self.add(st_card)
+
+        # ── Feed config ───────────────────────────────────────────────────
+        fd_card = CardWidget(self); fd_lay = QVBoxLayout(fd_card)
+        fd_lay.setContentsMargins(_cs, _cs, _cs, _cs); fd_lay.setSpacing(10)
+        lbl_fd = StrongBodyLabel("📰 Feed Engagement", fd_card)
+        lbl_fd.setFont(T.heading()); lbl_fd.setStyleSheet("background:transparent;")
+        fd_lay.addWidget(lbl_fd)
+
+        self.chk_fd_enabled = CheckBox("Enable feed engagement", fd_card)
+        self.chk_fd_enabled.setFont(T.body()); self.chk_fd_enabled.setStyleSheet("background:transparent;")
+        fd_lay.addWidget(self.chk_fd_enabled)
+
+        fd_lay.addWidget(_lbl("Scroll delay — seconds (MIN / MAX):", fd_card))
+        self.sp_fd_scroll_min = _spin(fd_card, 0.5, 30.0, 1.5, double=True)
+        self.sp_fd_scroll_max = _spin(fd_card, 0.5, 60.0, 4.0, double=True)
+        fd_lay.addLayout(_row(_lbl("MIN:", fd_card), self.sp_fd_scroll_min,
+                              20, _lbl("MAX:", fd_card), self.sp_fd_scroll_max))
+
+        fd_lay.addWidget(_lbl("Scrolls per cycle:", fd_card))
+        self.sp_fd_num_scrolls = _spin(fd_card, 1, 200, 10)
+        fd_lay.addLayout(_row(_lbl("Scrolls:", fd_card), self.sp_fd_num_scrolls))
+
+        fd_lay.addWidget(_lbl("Engagement actions:", fd_card))
+        fr1, self.chk_fd_like,    self.sp_fd_like_pct    = _engage_row(fd_card, "Like",    "", "", 40)
+        fr3, self.chk_fd_comment, self.sp_fd_comment_pct = _engage_row(fd_card, "Comment", "", "", 5)
+        self.chk_fd_like.setChecked(True)
+        fd_lay.addLayout(fr1); fd_lay.addLayout(fr3)
+        self.add(fd_card)
+
+        # ── Reels config ──────────────────────────────────────────────────
+        rl_card = CardWidget(self); rl_lay = QVBoxLayout(rl_card)
+        rl_lay.setContentsMargins(_cs, _cs, _cs, _cs); rl_lay.setSpacing(10)
+        lbl_rl = StrongBodyLabel("🎬 Reels Engagement", rl_card)
+        lbl_rl.setFont(T.heading()); lbl_rl.setStyleSheet("background:transparent;")
+        rl_lay.addWidget(lbl_rl)
+
+        self.chk_rl_enabled = CheckBox("Enable reels engagement", rl_card)
+        self.chk_rl_enabled.setFont(T.body()); self.chk_rl_enabled.setStyleSheet("background:transparent;")
+        rl_lay.addWidget(self.chk_rl_enabled)
+
+        rl_lay.addWidget(_lbl("Reels per cycle:", rl_card))
+        self.sp_rl_num_reels = _spin(rl_card, 1, 200, 10)
+        rl_lay.addLayout(_row(_lbl("Reels:", rl_card), self.sp_rl_num_reels))
+
+        rl_lay.addWidget(_lbl("Watch time per reel — seconds (MIN / MAX):", rl_card))
+        self.sp_rl_wsec_min = _spin(rl_card, 1.0, 60.0, 5.0, double=True)
+        self.sp_rl_wsec_max = _spin(rl_card, 1.0, 120.0, 15.0, double=True)
+        rl_lay.addLayout(_row(_lbl("MIN:", rl_card), self.sp_rl_wsec_min,
+                              20, _lbl("MAX:", rl_card), self.sp_rl_wsec_max))
+
+        rl_lay.addWidget(_lbl("Engagement actions:", rl_card))
+        rr1, self.chk_rl_like,    self.sp_rl_like_pct    = _engage_row(rl_card, "Like",    "", "", 30)
+        rr3, self.chk_rl_comment, self.sp_rl_comment_pct = _engage_row(rl_card, "Comment", "", "", 5)
+        self.chk_rl_like.setChecked(True)
+        rl_lay.addLayout(rr1); rl_lay.addLayout(rr3)
+        self.add(rl_card)
+
+        # ── Replies / Comments config ─────────────────────────────────────
+        rp_card = CardWidget(self); rp_lay = QVBoxLayout(rp_card)
+        rp_lay.setContentsMargins(_cs, _cs, _cs, _cs); rp_lay.setSpacing(14)
+        lbl_rp = StrongBodyLabel("💬 Comment / Reply Templates", rp_card)
+        lbl_rp.setFont(T.heading()); lbl_rp.setStyleSheet("background:transparent;")
+        rp_lay.addWidget(lbl_rp)
+
+        lbl_spintax = CaptionLabel(
+            "Spintax templates — one per line. Use {option1|option2} syntax.\n"
+            "Example:  {Great shot!|Love this 🔥|Amazing content|Keep it up!}",
+            rp_card,
+        )
+        lbl_spintax.setFont(T.caption()); lbl_spintax.setStyleSheet("background:transparent;"); lbl_spintax.setWordWrap(True)
+        rp_lay.addWidget(lbl_spintax)
+        self.txt_spintax = TextEdit(rp_card); self.txt_spintax.setFont(T.mono())
+        self.txt_spintax.setPlaceholderText("{Great!|Amazing 🔥|Love this!}\n{Nice shot|Beautiful}")
+        self.txt_spintax.setMinimumHeight(_px(120))
+        rp_lay.addWidget(self.txt_spintax)
+
+        _lbl_openai_key = CaptionLabel("OpenAI API Key (leave blank to use spintax only):", rp_card)
+        _lbl_openai_key.setVisible(False)   # OpenAI hidden from UI (backend retained)
+        rp_lay.addWidget(_lbl_openai_key)
+        self.inp_openai_key = LineEdit(rp_card); self.inp_openai_key.setFont(T.body())
+        self.inp_openai_key.setMinimumHeight(_px(36)); self.inp_openai_key.setPlaceholderText("sk-…")
+        self.inp_openai_key.setEchoMode(LineEdit.EchoMode.Password)
+        self.inp_openai_key.setVisible(False)   # OpenAI hidden from UI (backend retained)
+        rp_lay.addWidget(self.inp_openai_key)
+
+        _lbl_openai_ctx = CaptionLabel("OpenAI context prompt:", rp_card)
+        _lbl_openai_ctx.setVisible(False)   # OpenAI hidden from UI (backend retained)
+        rp_lay.addWidget(_lbl_openai_ctx)
+        self.inp_openai_context = LineEdit(rp_card); self.inp_openai_context.setFont(T.body())
+        self.inp_openai_context.setMinimumHeight(_px(36))
+        self.inp_openai_context.setPlaceholderText("Write a short friendly reply to this Instagram story.")
+        self.inp_openai_context.setVisible(False)   # OpenAI hidden from UI (backend retained)
+        rp_lay.addWidget(self.inp_openai_context)
+        self.add(rp_card)
+
+        # ── Start / Stop ──────────────────────────────────────────────────
+        ctrl_card = CardWidget(self); ctrl_lay = QHBoxLayout(ctrl_card)
+        ctrl_lay.setContentsMargins(_cs, _cs, _cs, _cs); ctrl_lay.setSpacing(20)
+        self.btn_ma_start = PrimaryPushButton(FIF.PLAY, "START MAIN ACCOUNT", ctrl_card)
+        self.btn_ma_start.setFont(T.button()); self.btn_ma_start.setMinimumHeight(_px(48))
+        self.btn_ma_stop  = PushButton(FIF.CLOSE, "STOP", ctrl_card)
+        self.btn_ma_stop.setFont(T.button()); self.btn_ma_stop.setMinimumHeight(_px(48))
+        self.btn_ma_stop.setObjectName("btn_stop_danger"); self.btn_ma_stop.setEnabled(False)
+        self.lbl_ma_status = StrongBodyLabel("Idle", ctrl_card)
+        self.lbl_ma_status.setFont(T.body()); self.lbl_ma_status.setStyleSheet("color:#64748b;margin-left:15px;background:transparent;")
+        ctrl_lay.addWidget(self.btn_ma_start, 2); ctrl_lay.addWidget(self.btn_ma_stop, 1)
+        ctrl_lay.addWidget(self.lbl_ma_status, 2)
+        self.add(ctrl_card)
+        self.stretch()
+
+        # ── Wire enable/disable locking for each section ──────────────────
+        self._st_lockable = [
+            self.sp_st_watch_min, self.sp_st_watch_max,
+            self.sp_st_wsec_min,  self.sp_st_wsec_max,
+            self.sp_st_rest_s_min,self.sp_st_rest_s_max,
+            self.sp_st_cycles_min,self.sp_st_cycles_max,
+            self.sp_st_rest_l_min,self.sp_st_rest_l_max,
+            self.chk_st_like,     self.sp_st_like_pct,
+            self.chk_st_react,    self.sp_st_react_pct,
+            self.chk_st_comment,  self.sp_st_comment_pct,
+        ]
+        self._fd_lockable = [
+            self.sp_fd_scroll_min, self.sp_fd_scroll_max,
+            self.sp_fd_num_scrolls,
+            self.chk_fd_like,      self.sp_fd_like_pct,
+            self.chk_fd_comment,   self.sp_fd_comment_pct,
+        ]
+        self._rl_lockable = [
+            self.sp_rl_num_reels,
+            self.sp_rl_wsec_min, self.sp_rl_wsec_max,
+            self.chk_rl_like,    self.sp_rl_like_pct,
+            self.chk_rl_comment, self.sp_rl_comment_pct,
+        ]
+        # ── Section toggle: enable/disable all widgets in section,
+        # but respect each action-checkbox's own spinbox lock state.
+        # Spinboxes are only re-enabled if their own checkbox is also checked.
+        def _apply_section(section_widgets, section_enabled: bool,
+                           chk_sp_pairs=None):
+            for w in section_widgets:
+                w.setEnabled(section_enabled)
+            # After enabling the section, re-apply per-spinbox locks
+            if section_enabled and chk_sp_pairs:
+                for chk, sp in chk_sp_pairs:
+                    sp.setEnabled(chk.isChecked())
+
+        _st_pairs = [
+            (self.chk_st_like,    self.sp_st_like_pct),
+            (self.chk_st_react,   self.sp_st_react_pct),
+            (self.chk_st_comment, self.sp_st_comment_pct),
+        ]
+        _fd_pairs = [
+            (self.chk_fd_like,    self.sp_fd_like_pct),
+            (self.chk_fd_comment, self.sp_fd_comment_pct),
+        ]
+        _rl_pairs = [
+            (self.chk_rl_like,    self.sp_rl_like_pct),
+            (self.chk_rl_comment, self.sp_rl_comment_pct),
+        ]
+
+        self.chk_st_enabled.stateChanged.connect(
+            lambda s: _apply_section(self._st_lockable, bool(s), _st_pairs))
+        self.chk_fd_enabled.stateChanged.connect(
+            lambda s: _apply_section(self._fd_lockable, bool(s), _fd_pairs))
+        self.chk_rl_enabled.stateChanged.connect(
+            lambda s: _apply_section(self._rl_lockable, bool(s), _rl_pairs))
+
+        # Per-checkbox spinbox locking — only fires when section is enabled
+        def _wire_spinbox_lock(chk, sp, section_chk):
+            def _update(state):
+                if section_chk.isChecked():
+                    sp.setEnabled(bool(state))
+            chk.stateChanged.connect(_update)
+
+        _wire_spinbox_lock(self.chk_st_like,    self.sp_st_like_pct,    self.chk_st_enabled)
+        _wire_spinbox_lock(self.chk_st_react,   self.sp_st_react_pct,   self.chk_st_enabled)
+        _wire_spinbox_lock(self.chk_st_comment, self.sp_st_comment_pct, self.chk_st_enabled)
+        _wire_spinbox_lock(self.chk_fd_like,    self.sp_fd_like_pct,    self.chk_fd_enabled)
+        _wire_spinbox_lock(self.chk_fd_comment, self.sp_fd_comment_pct, self.chk_fd_enabled)
+        _wire_spinbox_lock(self.chk_rl_like,    self.sp_rl_like_pct,    self.chk_rl_enabled)
+        _wire_spinbox_lock(self.chk_rl_comment, self.sp_rl_comment_pct, self.chk_rl_enabled)
+
+        # ── Main Account master lock — locks everything below chk_ma_enabled
+        # Collects all MA sub-widgets except chk_ma_enabled itself.
+        self._ma_all_lockable = (
+            [self.combo_ma_slot, self.chk_dl_enabled,
+             self.sp_dl_hours, self.sp_dl_minutes,
+             self._wh_card,
+             self.chk_st_enabled, self.chk_fd_enabled, self.chk_rl_enabled,
+             self.btn_ma_start] +
+            self._st_lockable + self._fd_lockable + self._rl_lockable
+        )
+
+        def _apply_ma_master(ma_enabled: bool):
+            for w in self._ma_all_lockable:
+                w.setEnabled(ma_enabled)
+            if ma_enabled:
+                # Re-apply sub-section states after master re-enables
+                _apply_section(self._st_lockable, self.chk_st_enabled.isChecked(), _st_pairs)
+                _apply_section(self._fd_lockable, self.chk_fd_enabled.isChecked(), _fd_pairs)
+                _apply_section(self._rl_lockable, self.chk_rl_enabled.isChecked(), _rl_pairs)
+                # dl spinboxes follow their own checkbox
+                self.sp_dl_hours.setEnabled(self.chk_dl_enabled.isChecked())
+                self.sp_dl_minutes.setEnabled(self.chk_dl_enabled.isChecked())
+
+        self.chk_ma_enabled.stateChanged.connect(
+            lambda s: _apply_ma_master(bool(s)))
+
+        # ── Apply all initial states ──────────────────────────────────────
+        _apply_ma_master(self.chk_ma_enabled.isChecked())
+
+    def _add_wh_window(self, start_h=9, start_m=0, end_h=19, end_m=0):
+        """Add one editable working-hour window row."""
+        row_widget = QWidget(self._wh_card)
+        row_widget.setStyleSheet("background: transparent;")
+        row_lay = QHBoxLayout(row_widget)
+        row_lay.setContentsMargins(0, 0, 0, 0); row_lay.setSpacing(10)
+
+        te_start = TimeEdit(row_widget); te_start.setDisplayFormat("hh:mm AP")
+        te_start.setTime(QTime(start_h, start_m)); te_start.setFont(T.body())
+        te_start.setMinimumHeight(_px(44))
+
+        lbl_to = CaptionLabel("→", row_widget); lbl_to.setStyleSheet("background:transparent;")
+
+        te_end = TimeEdit(row_widget); te_end.setDisplayFormat("hh:mm AP")
+        te_end.setTime(QTime(end_h, end_m)); te_end.setFont(T.body())
+        te_end.setMinimumHeight(_px(44))
+
+        row_lay.addWidget(te_start); row_lay.addWidget(lbl_to); row_lay.addWidget(te_end)
+        row_lay.addStretch()
+
+        entry = (te_start, te_end, row_widget)
+        self.ma_windows.append(entry)
+        self._wh_container.addWidget(row_widget)
+
+    def _remove_last_wh_window(self):
+        """Remove the last working-hour window row."""
+        if not self.ma_windows:
+            return
+        *keep, last = self.ma_windows
+        self.ma_windows[:] = keep
+        last[-1].setParent(None)
+        last[-1].deleteLater()
+
+    def get_windows(self) -> list:
+        """Return list of window dicts for config serialisation."""
+        result = []
+        for te_start, te_end, _ in self.ma_windows:
+            ts = te_start.time(); te = te_end.time()
+            result.append({
+                "start_hour": ts.hour(), "start_minute": ts.minute(),
+                "end_hour":   te.hour(), "end_minute":   te.minute(),
+            })
+        return result
+
+    def load_windows(self, windows: list):
+        """Rebuild window rows from a saved config list."""
+        for _, _, w in list(self.ma_windows):
+            w.setParent(None); w.deleteLater()
+        self.ma_windows.clear()
+        for win in windows:
+            self._add_wh_window(
+                start_h=int(win.get("start_hour", 9)),
+                start_m=int(win.get("start_minute", 0)),
+                end_h=int(win.get("end_hour", 19)),
+                end_m=int(win.get("end_minute", 0)),
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1456,6 +2183,19 @@ class MainWindow(FluentWindow):
             )
         # =================================================================
 
+        # Style tooltips here so it works regardless of entry point
+        QApplication.instance().setStyleSheet(
+            QApplication.instance().styleSheet() +
+            " QToolTip {"
+            "  background-color: #1e293b;"
+            "  color: #f1f5f9;"
+            "  border: 1px solid #475569;"
+            "  padding: 4px 8px;"
+            "  border-radius: 4px;"
+            "  font-size: 12px;"
+            "}"
+        )
+
         self.cfg                = load_config()
         self._workers:          List[PhoneWorker]      = []
         self._collected         = 0
@@ -1467,14 +2207,17 @@ class MainWindow(FluentWindow):
         self._sheets_client:    Optional[SheetsClient] = None
         self._detection_workers: Dict[int, AccountDetectionWorker] = {}
         self._switch_workers:    Dict[int, AccountSwitchWorker]    = {}
+        self._ma_worker         = None   # MainAccountWorker instance (or None)
+        self._cached_devices:   list = []  # last known [(serial, model), ...]
 
         self.setWindowTitle("Cansa")
         self.resize(1600, 1000)
 
-        self.dashboard_page = DashboardPage(self)
-        self.filters_page   = FiltersPage(self)
-        self.results_page   = ResultsPage(self)
-        self.settings_page  = SettingsPage(self)
+        self.dashboard_page    = DashboardPage(self)
+        self.filters_page      = FiltersPage(self)
+        self.results_page      = ResultsPage(self)
+        self.settings_page     = SettingsPage(self)
+        self.main_account_page = MainAccountPage(self)
 
         self._init_persistent_mirror()
         self._init_nav()
@@ -1482,6 +2225,8 @@ class MainWindow(FluentWindow):
         self._load_cfg_into_ui()
         self._connect_signals()
         self._refresh_devices()
+        self._sync_ma_slot_combo()     # ensure MA combo matches visible slots
+        self._sync_ma_target_lock()    # lock MA-assigned target box on startup
         self._reload_blacklist_ui()
         self._on_schedule_toggled()   # apply enabled/disabled state on load
         self._setup_network_monitor() # start internet connectivity watcher
@@ -1651,9 +2396,10 @@ class MainWindow(FluentWindow):
 
     # ── Navigation ────────────────────────────────────────────────────────
     def _init_nav(self):
-        self.addSubInterface(self.dashboard_page, FIF.HOME,      "Dashboard")
-        self.addSubInterface(self.filters_page,   FIF.FILTER,    "Filters & Blacklist")
-        self.addSubInterface(self.results_page,   FIF.COMPLETED, "Results")
+        self.addSubInterface(self.dashboard_page,    FIF.HOME,      "Dashboard")
+        self.addSubInterface(self.filters_page,      FIF.FILTER,    "Filters & Blacklist")
+        self.addSubInterface(self.results_page,      FIF.COMPLETED, "Results")
+        self.addSubInterface(self.main_account_page, FIF.HEART,     "Main Account")
         self.addSubInterface(
             self.settings_page, FIF.SETTING, "Settings",
             NavigationItemPosition.BOTTOM
@@ -1706,8 +2452,9 @@ class MainWindow(FluentWindow):
             }}
             TimeEdit{{
                 background: {bg}; border: 1px solid {border}; border-radius: 10px;
-                padding: 2px 4px; font-size: 10pt;
-                min-width: 88px; max-width: 110px;
+                padding: 2px 8px; font-size: 10pt;
+                min-width: 110px; max-width: 140px; min-height: 38px;
+                selection-background-color: transparent; selection-color: {text};
             }}
             LineEdit:focus, SpinBox:focus, ComboBox:focus, TimeEdit:focus{{ border: 2px solid #3b82f6; }}
             TextEdit:focus{{ border: 2px solid #3b82f6; }}
@@ -1770,7 +2517,8 @@ class MainWindow(FluentWindow):
         """Walk every child widget of the 4 pages and rescale fonts + heights symmetrically."""
         s = self._content_scale
         pages = [self.dashboard_page, self.filters_page,
-                 self.results_page,   self.settings_page]
+                 self.results_page,   self.settings_page,
+                 self.main_account_page]
 
         # Base pt sizes at scale 1.0 (after platform correction)
         base = {
@@ -1845,7 +2593,12 @@ class MainWindow(FluentWindow):
                     w._scale_base_h = _px(34)
 
                 elif _is_spinbox(w):
-                    w._scale_base_h = _px(34)
+                    # TimeEdit also inherits QAbstractSpinBox — give it more height
+                    from qfluentwidgets import TimeEdit as _TE
+                    if isinstance(w, _TE):
+                        w._scale_base_h = _px(44)
+                    else:
+                        w._scale_base_h = _px(34)
 
                 elif _is_real_button(w):
                     w._scale_base_h = _px(48) if w.minimumHeight() >= _px(44) else _px(36)
@@ -1895,7 +2648,10 @@ class MainWindow(FluentWindow):
                     # a large value, THEN set the real target — otherwise Qt clamps
                     # setMinimumHeight to the old maximumHeight silently.
                     w.setMaximumHeight(16777215)   # Qt QWIDGETSIZE_MAX — full unlock
-                    w.setMaximumHeight(new_h)
+                    from qfluentwidgets import TimeEdit as _TE2
+                    if not isinstance(w, _TE2):
+                        # Regular spinboxes stay fixed-height
+                        w.setMaximumHeight(new_h)
                     w.setMinimumHeight(new_h)
 
                 elif _is_combo(w) or _is_lineedit(w):
@@ -1925,20 +2681,17 @@ class MainWindow(FluentWindow):
         dp.btn_refresh.clicked.connect(self._refresh_devices)
         dp.btn_start.clicked.connect(self._start_scraping)
         dp.btn_stop.clicked.connect(self._stop_all)
+        dp.btn_download_summary.clicked.connect(self._download_summary)
         dp.chk_schedule.stateChanged.connect(self._on_schedule_toggled)
         dp.time_start.timeChanged.connect(self._update_schedule_preview)
         dp.time_end.timeChanged.connect(self._update_schedule_preview)
 
-        for i, (combo_dev, combo_acc, lbl_port, lbl_status, btn_view) in enumerate(dp.device_rows):
-            combo_dev.currentIndexChanged.connect(
-                lambda _v, idx=i: self._on_device_selected(idx)
-            )
-            combo_acc.currentIndexChanged.connect(
-                lambda _v, idx=i: self._on_account_selected(idx)
-            )
-            btn_view.clicked.connect(
-                lambda _checked=False, idx=i: self._on_view_clicked(idx)
-            )
+        # Wire already-visible slots and any future slots added via +
+        for i in range(dp.active_slot_count()):
+            self._wire_slot(i)
+        dp.slot_added.connect(self._wire_slot)
+        dp.slot_added.connect(self._sync_ma_slot_combo)
+        dp.slot_removed.connect(self._sync_ma_slot_combo)
 
         sp.btn_browse_creds.clicked.connect(self._browse_credentials)
         sp.btn_test_sheets.clicked.connect(self._test_sheets)
@@ -1946,9 +2699,122 @@ class MainWindow(FluentWindow):
         fp.btn_download_bl.clicked.connect(self._download_blacklist_txt)
         fp.btn_import_bl.clicked.connect(self._import_blacklist_txt)
         fp.btn_clear_bl.clicked.connect(self._clear_blacklist)
+        fp.btn_download_kw_bl.clicked.connect(self._download_kw_blacklist_txt)
+        fp.btn_import_kw_bl.clicked.connect(self._import_kw_blacklist_txt)
+        fp.btn_clear_kw_bl.clicked.connect(self._clear_kw_blacklist)
         rp.btn_export_csv.clicked.connect(self._export_csv)
 
+        # Main Account page
+        mp = self.main_account_page
+        mp.btn_ma_start.clicked.connect(self._start_main_account)
+        mp.btn_ma_stop.clicked.connect(self._stop_main_account)
+
+        # When the MA-enabled checkbox or the assigned phone slot changes,
+        # update which target TextEdit is disabled (can't scrape and be MA at once).
+        mp.chk_ma_enabled.stateChanged.connect(self._sync_ma_target_lock)
+        mp.combo_ma_slot.currentIndexChanged.connect(self._sync_ma_target_lock)
+
+    def _sync_ma_target_lock(self, _=None):
+        """Disable the target TextEdit for whichever slot is assigned as Main Account
+        (when MA is enabled). All other slots remain editable. Called whenever
+        chk_ma_enabled or combo_ma_slot changes — no thread concerns because both
+        are pure UI signals that always fire on the main thread."""
+        mp  = self.main_account_page
+        dp  = self.dashboard_page
+        ma_enabled = mp.chk_ma_enabled.isChecked()
+        ma_slot    = mp.combo_ma_slot.currentData()
+        if ma_slot is None:
+            ma_slot = 0
+        for i, txt in enumerate(dp.target_rows):
+            locked = ma_enabled and (i == ma_slot)
+            txt.setEnabled(not locked)
+            if locked:
+                txt.setPlaceholderText("Assigned to Main Account — scraping disabled")
+                txt.setToolTip("This phone is the Main Account; it cannot scrape targets.")
+            else:
+                txt.setPlaceholderText("username1\nusername2")
+
+    def _sync_ma_slot_combo(self, _slot_idx=None):
+        """Rebuild combo_ma_slot to match only the currently visible dashboard slots.
+        Preserves the previously selected slot index where possible. Safe to call
+        from slot_added / slot_removed signals (always main-thread Qt signals)."""
+        mp  = self.main_account_page
+        dp  = self.dashboard_page
+        prev = mp.combo_ma_slot.currentData()
+        mp.combo_ma_slot.blockSignals(True)
+        mp.combo_ma_slot.clear()
+        n = dp.active_slot_count()
+        for i in range(n):
+            mp.combo_ma_slot.addItem(self._phone_label(i), userData=i)
+        # Restore selection; fall back to 0 if the previously selected slot
+        # was removed (visible slots shrank below it).
+        idx = mp.combo_ma_slot.findData(prev)
+        mp.combo_ma_slot.setCurrentIndex(idx if idx >= 0 else 0)
+        mp.combo_ma_slot.blockSignals(False)
+        # Re-evaluate which target box to lock now that slot count may have changed
+        self._sync_ma_target_lock()
+
+    def _wire_slot(self, i: int):
+        """Connect signals for device row slot i and populate combo_dev from cache.
+
+        Guards against double-connection: each widget only gets one connection
+        per signal, tracked via a custom attribute so re-entrant calls (e.g.
+        slot_added firing during init for an already-wired slot) are safe.
+        """
+        dp = self.dashboard_page
+        if i >= len(dp.device_rows):
+            return
+        combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[i]
+
+        # Populate combo_dev with the last-known device list so the new slot
+        # is immediately usable without requiring a manual Refresh click.
+        if self._cached_devices and combo_dev.count() == 0:
+            combo_dev.blockSignals(True)
+            combo_dev.addItem("(not assigned)", userData=None)
+            for serial, model in self._cached_devices:
+                combo_dev.addItem(f"{model} [{serial}]", userData=serial)
+            combo_dev.setCurrentIndex(0)
+            combo_dev.blockSignals(False)
+
+        # Only connect once per widget — guard with a set stored on the widget itself
+        if not getattr(combo_dev, "_wired", False):
+            combo_dev.currentIndexChanged.connect(
+                lambda _v, idx=i: self._on_device_selected(idx)
+            )
+            combo_dev._wired = True
+
+        if not getattr(combo_acc, "_wired", False):
+            combo_acc.currentIndexChanged.connect(
+                lambda _v, idx=i: self._on_account_selected(idx)
+            )
+            combo_acc._wired = True
+
+        if not getattr(btn_view, "_wired", False):
+            btn_view.clicked.connect(
+                lambda _checked=False, idx=i: self._on_view_clicked(idx)
+            )
+            btn_view._wired = True
+
+        # Wire nick_edit so MA slot combo labels update in real time as the user types.
+        if i < len(dp.nick_edits):
+            nick_edit = dp.nick_edits[i]
+            if not getattr(nick_edit, "_ma_wired", False):
+                nick_edit.textChanged.connect(
+                    lambda _text, idx=i: self._on_nick_changed(idx)
+                )
+                nick_edit._ma_wired = True
+
     # ── Device helpers ────────────────────────────────────────────────────
+
+    def _on_nick_changed(self, slot_idx: int):
+        """Called when a phone nickname is edited. Updates the corresponding entry
+        in combo_ma_slot in real time without disturbing the current selection.
+        Runs on the main thread (Qt signal), so no locking needed."""
+        mp = self.main_account_page
+        item_idx = mp.combo_ma_slot.findData(slot_idx)
+        if item_idx >= 0:
+            mp.combo_ma_slot.setItemText(item_idx, self._phone_label(slot_idx))
+
     # ── Working-hours toggle ──────────────────────────────────────────────
     def _set_schedule_locked(self, locked: bool):
         """Lock/unlock the Working Hours card while scraping is active."""
@@ -2029,16 +2895,70 @@ class MainWindow(FluentWindow):
 
     def _refresh_devices(self):
         devices = get_connected_devices()
+        self._cached_devices = devices  # cache for new slots added later
         dp = self.dashboard_page
-        for i, (combo_dev, combo_acc, lbl_port, lbl_status, btn) in enumerate(dp.device_rows):
+
+        # Build a set of serials that are actively running (scraper or MA worker)
+        # so we can skip re-detection for them and avoid interrupting live sessions.
+        running_serials: set = set()
+        for w in self._workers:
+            if w.isRunning():
+                running_serials.add(w.serial)
+        if self._ma_worker and self._ma_worker.isRunning():
+            running_serials.add(self._ma_worker.serial)
+
+        # Only refresh currently visible slots
+        for i in range(dp.active_slot_count()):
+            combo_dev, combo_acc, lbl_port, lbl_status, btn = dp.device_rows[i]
+
+            # Remember which serial was previously selected so we can restore it
+            prev_serial = combo_dev.currentData()
+
+            # If this slot's device is actively running, only refresh the device
+            # list (so new devices appear) but skip re-detection entirely.
+            slot_is_running = prev_serial and prev_serial in running_serials
+
             combo_dev.blockSignals(True)
             combo_dev.clear()
             combo_dev.addItem("(not assigned)", userData=None)
             for serial, model in devices:
                 combo_dev.addItem(f"{model} [{serial}]", userData=serial)
-            combo_dev.setCurrentIndex(0)
+
+            # Restore previous selection if the device is still connected
+            restored = False
+            if prev_serial:
+                for j in range(combo_dev.count()):
+                    if combo_dev.itemData(j) == prev_serial:
+                        combo_dev.setCurrentIndex(j)
+                        restored = True
+                        break
+
+            if not restored:
+                combo_dev.setCurrentIndex(0)
+                # Device was removed or nothing was selected — reset combo_acc cleanly
+                combo_acc.blockSignals(True)
+                combo_acc.clear()
+                combo_acc.setPlaceholderText("Accounts")
+                combo_acc.setEnabled(True)
+                combo_acc.blockSignals(False)
+                lbl_status.setText("● idle")
+
             combo_dev.blockSignals(False)
-            self._on_device_selected(i)
+
+            # Skip detection for slots that are actively running — interrupting
+            # an in-progress uiautomator/ADB call on a busy device causes the
+            # automation to stall.  The slot already has correct account info.
+            if slot_is_running:
+                continue
+
+            # Always stagger detection workers across all slots — even across
+            # different devices, simultaneous uiautomator calls compete for
+            # ADB/accessibility resources and cause timeouts that fall back to
+            # "Account 1". 1500 ms per slot: phone 0 starts immediately,
+            # phone 1 after 1.5 s, phone 2 after 3 s, phone 3 after 4.5 s.
+            if combo_dev.currentData():
+                delay_ms = i * 1500
+                QTimer.singleShot(delay_ms, lambda idx=i: self._on_device_selected(idx))
 
         if devices:
             names = ", ".join(model for _, model in devices)
@@ -2061,23 +2981,66 @@ class MainWindow(FluentWindow):
 
     def _on_device_selected(self, idx: int):
         dp = self.dashboard_page
+        if idx >= len(dp.device_rows):
+            return
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[idx]
         serial = combo_dev.currentData()
 
+        combo_acc.blockSignals(True)
         combo_acc.clear()
+        combo_acc.blockSignals(False)
+
         if not serial:
+            combo_acc.setPlaceholderText("Accounts")
+            combo_acc.setEnabled(True)
+            lbl_status.setText("● idle")
+            # Cancel any in-flight detection for this slot
+            old_worker = self._detection_workers.pop(idx, None)
+            if old_worker is not None:
+                old_worker._cancelled = True
+                # Don't terminate() — ADB calls can't be interrupted safely.
+                # Setting _cancelled means the finished/error signal will be
+                # ignored when it arrives (checked in _on_accounts_detected).
+            self._update_start_button_state()
             return
 
+        # Prevent duplicate assignment — if this serial is already selected in
+        # another slot, reset the current combo back to "(not assigned)".
+        for other_i, (other_combo_dev, *_rest) in enumerate(dp.device_rows):
+            if other_i == idx:
+                continue
+            if other_combo_dev.currentData() == serial:
+                combo_dev.blockSignals(True)
+                combo_dev.setCurrentIndex(0)
+                combo_dev.blockSignals(False)
+                combo_acc.setPlaceholderText("Accounts")
+                combo_acc.setEnabled(True)
+                lbl_status.setText("● idle")
+                from qfluentwidgets import InfoBar
+                InfoBar.warning(
+                    title="Device already assigned",
+                    content=f"This device is already assigned to Phone {other_i + 1}.",
+                    orient=Qt.Orientation.Horizontal,
+                    isClosable=True, duration=4000, parent=self,
+                )
+                self._update_start_button_state()
+                return
+
+        # Cancel previous detection worker for this slot without terminate().
+        # terminate() on a thread blocked in a native ADB call is unreliable —
+        # the thread may keep running and its queued signal fires after the new
+        # worker is already stored, causing two concurrent writes to combo_acc.
         old_worker = self._detection_workers.pop(idx, None)
-        if old_worker and old_worker.isRunning():
-            old_worker.terminate()
-            old_worker.wait(500)
+        if old_worker is not None:
+            old_worker._cancelled = True  # signal handler will drop its result
 
         combo_acc.setPlaceholderText("Detecting…")
         combo_acc.setEnabled(False)
         lbl_status.setText("⏳ detecting")
 
         worker = AccountDetectionWorker(row_idx=idx, serial=serial)
+        worker._cancelled = False
+        worker._serial    = serial   # tag so stale signals can be detected
         worker.finished.connect(self._on_accounts_detected)
         worker.error.connect(self._on_accounts_error)
         self._detection_workers[idx] = worker
@@ -2085,10 +3048,27 @@ class MainWindow(FluentWindow):
         self._update_start_button_state()
 
     def _on_accounts_detected(self, row_idx: int, accounts: list):
+        # Drop result if worker was cancelled (user changed device before ADB finished)
+        worker = self._detection_workers.get(row_idx)
+        sender = self.sender()
+        if sender is not None and getattr(sender, "_cancelled", False):
+            # This is a stale result from an old worker — discard silently
+            return
+        # Also drop if the current worker for this slot isn't the one that emitted
+        if worker is not None and sender is not None and sender is not worker:
+            return
+
         dp = self.dashboard_page
         if row_idx >= len(dp.device_rows):
             return
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[row_idx]
+
+        # Verify the serial still matches what we launched detection for
+        current_serial = combo_dev.currentData()
+        if sender is not None and getattr(sender, "_serial", None) != current_serial:
+            # User changed the combo while ADB was running — result is stale
+            return
+
         combo_acc.clear()
         combo_acc.setEnabled(True)
         combo_acc.setPlaceholderText("Accounts")
@@ -2101,10 +3081,23 @@ class MainWindow(FluentWindow):
         self._update_start_button_state()
 
     def _on_accounts_error(self, row_idx: int):
+        # Drop result if worker was cancelled
+        sender = self.sender()
+        if sender is not None and getattr(sender, "_cancelled", False):
+            return
+        worker = self._detection_workers.get(row_idx)
+        if worker is not None and sender is not None and sender is not worker:
+            return
+
         dp = self.dashboard_page
         if row_idx >= len(dp.device_rows):
             return
         combo_dev, combo_acc, lbl_port, lbl_status, btn_view = dp.device_rows[row_idx]
+
+        current_serial = combo_dev.currentData()
+        if sender is not None and getattr(sender, "_serial", None) != current_serial:
+            return
+
         combo_acc.clear()
         combo_acc.setEnabled(True)
         combo_acc.setPlaceholderText("Accounts")
@@ -2116,8 +3109,10 @@ class MainWindow(FluentWindow):
         self._update_start_button_state()
 
     def _update_start_button_state(self):
-        """Enable START SCRAPING only when a device is assigned and no detection is running."""
+        """Enable START SCRAPING and START MAIN ACCOUNT only when a device is
+        assigned and no detection is running."""
         dp = self.dashboard_page
+        mp = self.main_account_page
         any_device = False
         detecting = False
         for i, (combo_dev, combo_acc, lbl_port, lbl_status, btn_view) in enumerate(dp.device_rows):
@@ -2128,6 +3123,10 @@ class MainWindow(FluentWindow):
                     break
         if not dp.btn_stop.isEnabled():  # not currently scraping
             dp.btn_start.setEnabled(any_device and not detecting)
+        # Lock MA start button during detection — it needs a clean device too
+        ma_running = self._ma_worker is not None and self._ma_worker.isRunning()
+        if not ma_running:
+            mp.btn_ma_start.setEnabled(any_device and not detecting)
 
     def _on_account_selected(self, row_idx: int):
         dp = self.dashboard_page
@@ -2248,7 +3247,7 @@ class MainWindow(FluentWindow):
         self.mirror.attach(serial)
         self._mirror_phone_idx = row_idx
         btn_view.setText("⏹ Stop")
-        self.lbl_mirror_device.setText(f"Mirroring: Phone {row_idx + 1}")
+        self.lbl_mirror_device.setText(f"Mirroring: {self._phone_label(row_idx)}")
         self.mirror.update_phone_index(row_idx)
         self._update_mirror_visibility()
 
@@ -2265,6 +3264,9 @@ class MainWindow(FluentWindow):
         cfg["targets_per_phone"] = [
             [t.strip().lstrip("@") for t in txt.toPlainText().splitlines() if t.strip()]
             for txt in dp.target_rows
+        ]
+        cfg["phone_nicknames"] = [
+            edit.text().strip() for edit in dp.nick_edits
         ]
         cfg["last_mode"]  = dp.combo_mode.currentText()
         cfg["last_count"] = dp.spin_count.value()
@@ -2308,6 +3310,74 @@ class MainWindow(FluentWindow):
             "switch_mode":            "hours" if sp.rb_switch_hours.isChecked() else "profiles",
             "switch_hours":           sp.sp_switch_hours.value(),
         }
+
+        # IP rotation
+        cfg["ip_rotation"] = {
+            "enabled":              sp.chk_ip_enabled.isChecked(),
+            "interval_min_minutes": sp.sp_ip_min.value(),
+            "interval_max_minutes": sp.sp_ip_max.value(),
+        }
+
+        # Main Account
+        mp = self.main_account_page
+        spintax_lines = [
+            line.strip() for line in mp.txt_spintax.toPlainText().splitlines()
+            if line.strip()
+        ]
+        cfg["main_account"] = {
+            "enabled":    mp.chk_ma_enabled.isChecked(),
+            "phone_slot": mp.combo_ma_slot.currentData() or 0,
+            "working_hours_windows": mp.get_windows(),
+            "daily_limit": {
+                "enabled":      mp.chk_dl_enabled.isChecked(),
+                "hours":        mp.sp_dl_hours.value(),
+                "minutes":      mp.sp_dl_minutes.value(),
+            },
+            "stories": {
+                "enabled":            mp.chk_st_enabled.isChecked(),
+                "watch_min":          mp.sp_st_watch_min.value(),
+                "watch_max":          mp.sp_st_watch_max.value(),
+                "rest_short_min":     mp.sp_st_rest_s_min.value(),
+                "rest_short_max":     mp.sp_st_rest_s_max.value(),
+                "short_cycles_min":   mp.sp_st_cycles_min.value(),
+                "short_cycles_max":   mp.sp_st_cycles_max.value(),
+                "rest_long_min":      mp.sp_st_rest_l_min.value(),
+                "rest_long_max":      mp.sp_st_rest_l_max.value(),
+                "watch_seconds_min":  mp.sp_st_wsec_min.value(),
+                "watch_seconds_max":  mp.sp_st_wsec_max.value(),
+                "like_enabled":       mp.chk_st_like.isChecked(),
+                "like_pct":           mp.sp_st_like_pct.value(),
+                "react_enabled":      mp.chk_st_react.isChecked(),
+                "react_pct":          mp.sp_st_react_pct.value(),
+                "comment_enabled":    mp.chk_st_comment.isChecked(),
+                "comment_pct":        mp.sp_st_comment_pct.value(),
+            },
+            "feed": {
+                "enabled":            mp.chk_fd_enabled.isChecked(),
+                "num_scrolls":        mp.sp_fd_num_scrolls.value(),
+                "scroll_min":         mp.sp_fd_scroll_min.value(),
+                "scroll_max":         mp.sp_fd_scroll_max.value(),
+                "like_enabled":       mp.chk_fd_like.isChecked(),
+                "like_pct":           mp.sp_fd_like_pct.value(),
+                "comment_enabled":    mp.chk_fd_comment.isChecked(),
+                "comment_pct":        mp.sp_fd_comment_pct.value(),
+            },
+            "reels": {
+                "enabled":            mp.chk_rl_enabled.isChecked(),
+                "num_reels":          mp.sp_rl_num_reels.value(),
+                "watch_seconds_min":  mp.sp_rl_wsec_min.value(),
+                "watch_seconds_max":  mp.sp_rl_wsec_max.value(),
+                "like_enabled":       mp.chk_rl_like.isChecked(),
+                "like_pct":           mp.sp_rl_like_pct.value(),
+                "comment_enabled":    mp.chk_rl_comment.isChecked(),
+                "comment_pct":        mp.sp_rl_comment_pct.value(),
+            },
+            "replies": {
+                "spintax_templates":  spintax_lines,
+                "openai_api_key":     mp.inp_openai_key.text().strip(),
+                "openai_context":     mp.inp_openai_context.text().strip(),
+            },
+        }
         return cfg
 
     def _load_cfg_into_ui(self):
@@ -2319,13 +3389,32 @@ class MainWindow(FluentWindow):
         targets_per_phone = c.get("targets_per_phone", [])
         if not targets_per_phone and "target_list" in c:
             old = c.get("target_list", [])
-            targets_per_phone = [[] for _ in range(3)]
+            targets_per_phone = [[] for _ in range(MAX_PHONES)]
             for i, t in enumerate(old):
-                targets_per_phone[i % 3].append(t)
-            while len(targets_per_phone) < 3:
+                targets_per_phone[i % MAX_PHONES].append(t)
+            while len(targets_per_phone) < MAX_PHONES:
                 targets_per_phone.append([])
-        for i, tlist in enumerate(targets_per_phone[:3]):
+
+        # Determine how many slots had saved data and expand the UI to match
+        slots_needed = 1
+        for i, tlist in enumerate(targets_per_phone[:MAX_PHONES]):
+            if tlist:
+                slots_needed = i + 1
+        # Also count saved device serials
+        saved_devices = c.get("devices", [])
+        for i, dev in enumerate(saved_devices[:MAX_PHONES]):
+            if dev.get("serial"):
+                slots_needed = max(slots_needed, i + 1)
+        dp.show_slots(slots_needed)
+
+        for i, tlist in enumerate(targets_per_phone[:MAX_PHONES]):
             dp.target_rows[i].setPlainText("\n".join(tlist))
+
+        # Restore nicknames
+        saved_nicks = c.get("phone_nicknames", [])
+        for i, nick in enumerate(saved_nicks[:MAX_PHONES]):
+            if i < len(dp.nick_edits):
+                dp.nick_edits[i].setText(nick)
 
         dp.combo_mode.setCurrentText(c.get("last_mode", "followers"))
         dp.spin_count.setValue(int(c.get("last_count", 100)))
@@ -2370,6 +3459,76 @@ class MainWindow(FluentWindow):
         # Re-apply enabled state after loading
         sp.sp_switch_every.setEnabled(switch_mode != "hours")
         sp.sp_switch_hours.setEnabled(switch_mode == "hours")
+
+        # IP rotation
+        ip = c.get("ip_rotation", {})
+        sp.chk_ip_enabled.setChecked(ip.get("enabled", False))
+        sp.sp_ip_min.setValue(float(ip.get("interval_min_minutes", 5.0)))
+        sp.sp_ip_max.setValue(float(ip.get("interval_max_minutes", 15.0)))
+        sp.sp_ip_min.setEnabled(ip.get("enabled", False))
+        sp.sp_ip_max.setEnabled(ip.get("enabled", False))
+
+        # Main Account
+        ma = c.get("main_account", {})
+        mp = self.main_account_page
+        mp.chk_ma_enabled.setChecked(ma.get("enabled", False))
+        slot = int(ma.get("phone_slot", 0))
+        idx = mp.combo_ma_slot.findData(slot)
+        if idx >= 0:
+            mp.combo_ma_slot.setCurrentIndex(idx)
+        mp.load_windows(ma.get("working_hours_windows", []))
+
+        dl = ma.get("daily_limit", {})
+        mp.chk_dl_enabled.setChecked(dl.get("enabled", False))
+        mp.sp_dl_hours.setValue(int(dl.get("hours", 4)))
+        mp.sp_dl_minutes.setValue(int(dl.get("minutes", 0)))
+        # Re-apply enabled/disabled state after loading values
+        mp.sp_dl_hours.setEnabled(dl.get("enabled", False))
+        mp.sp_dl_minutes.setEnabled(dl.get("enabled", False))
+
+        st = ma.get("stories", {})
+        mp.chk_st_enabled.setChecked(st.get("enabled", True))
+        mp.sp_st_watch_min.setValue(int(st.get("watch_min", 3)))
+        mp.sp_st_watch_max.setValue(int(st.get("watch_max", 7)))
+        mp.sp_st_wsec_min.setValue(float(st.get("watch_seconds_min", 3.0)))
+        mp.sp_st_wsec_max.setValue(float(st.get("watch_seconds_max", 8.0)))
+        mp.sp_st_rest_s_min.setValue(float(st.get("rest_short_min", 10.0)))
+        mp.sp_st_rest_s_max.setValue(float(st.get("rest_short_max", 30.0)))
+        mp.sp_st_cycles_min.setValue(int(st.get("short_cycles_min", 3)))
+        mp.sp_st_cycles_max.setValue(int(st.get("short_cycles_max", 6)))
+        mp.sp_st_rest_l_min.setValue(float(st.get("rest_long_min", 120.0)))
+        mp.sp_st_rest_l_max.setValue(float(st.get("rest_long_max", 300.0)))
+        mp.chk_st_like.setChecked(st.get("like_enabled", True))
+        mp.sp_st_like_pct.setValue(int(st.get("like_pct", 30)))
+        mp.chk_st_react.setChecked(st.get("react_enabled", True))
+        mp.sp_st_react_pct.setValue(int(st.get("react_pct", 20)))
+        mp.chk_st_comment.setChecked(st.get("comment_enabled", False))
+        mp.sp_st_comment_pct.setValue(int(st.get("comment_pct", 10)))
+
+        fd = ma.get("feed", {})
+        mp.chk_fd_enabled.setChecked(fd.get("enabled", False))
+        mp.sp_fd_scroll_min.setValue(float(fd.get("scroll_min", 1.5)))
+        mp.sp_fd_scroll_max.setValue(float(fd.get("scroll_max", 4.0)))
+        mp.sp_fd_num_scrolls.setValue(int(fd.get("num_scrolls", 10)))
+        mp.chk_fd_like.setChecked(fd.get("like_enabled", True))
+        mp.sp_fd_like_pct.setValue(int(fd.get("like_pct", 40)))
+        mp.chk_fd_comment.setChecked(fd.get("comment_enabled", False))
+        mp.sp_fd_comment_pct.setValue(int(fd.get("comment_pct", 5)))
+
+        rl = ma.get("reels", {})
+        mp.chk_rl_enabled.setChecked(rl.get("enabled", False))
+        mp.sp_rl_num_reels.setValue(int(rl.get("num_reels", 10)))
+        mp.sp_rl_wsec_min.setValue(float(rl.get("watch_seconds_min", 5.0)))
+        mp.sp_rl_wsec_max.setValue(float(rl.get("watch_seconds_max", 15.0)))
+        mp.chk_rl_like.setChecked(rl.get("like_enabled", True))
+        mp.sp_rl_like_pct.setValue(int(rl.get("like_pct", 30)))
+        mp.chk_rl_comment.setChecked(rl.get("comment_enabled", False))
+        mp.sp_rl_comment_pct.setValue(int(rl.get("comment_pct", 5)))
+
+        rp = ma.get("replies", {})
+        mp.txt_spintax.setPlainText("\n".join(rp.get("spintax_templates", [])))
+        mp.inp_openai_key.setText(rp.get("openai_api_key", ""))
+        mp.inp_openai_context.setText(rp.get("openai_context", ""))
 
     # ── Core scraping ─────────────────────────────────────────────────────
     def _start_scraping(self):
@@ -2477,12 +3636,28 @@ class MainWindow(FluentWindow):
         self._phone_meta: dict = {}   # row_idx -> {serial, port, targets, cfg}
         self._serial_to_port  = serial_to_port
 
+        # Start session summary tracking
+        phone_labels = {row_idx: self._phone_label(row_idx) for row_idx, _ in assigned}
+        start_session(phone_labels)
+        self._phone_session_counts: dict = {row_idx: 0 for row_idx, _ in assigned}
+
         rp = self.results_page
         rp.table.setRowCount(0)
         rp.progress_bar.setMaximum(max(cfg["last_count"] * total_targets, 1))
         rp.progress_bar.setValue(0)
         rp.lbl_progress.setText("Starting…")
         rp.log_area.clear()
+        rp.ma_log_area.clear()
+
+        # Show status labels only for slots that have a device assigned
+        for i, lbl in enumerate(rp.phone_status_labels):
+            has_device = (
+                i < len(self.dashboard_page.device_rows) and
+                self.dashboard_page.device_rows[i][0].currentData() is not None
+            )
+            lbl.setVisible(has_device)
+            if has_device:
+                lbl.setText(f"{self._phone_label(i)}: idle")
 
         self.dashboard_page.btn_start.setEnabled(False)
         self.dashboard_page.btn_stop.setEnabled(True)
@@ -2522,28 +3697,236 @@ class MainWindow(FluentWindow):
                 config=cfg,
                 sheets_client=self._sheets_client,
             )
-            worker.signals.log.connect(self._log)
+            worker.signals.log.connect(
+                (lambda idx: lambda msg: self._log(
+                    __import__("re").sub(r"^\[Phone \d+\]", f"[{self._phone_label(idx)}]", msg)
+                ))(row_idx)
+            )
             worker.signals.account.connect(self._on_account)
             worker.signals.progress.connect(self._on_progress)
             worker.signals.finished.connect(self._on_phone_finished)
             worker.signals.error.connect(self._on_phone_error)
             worker.signals.status.connect(self._on_phone_status)
             worker.signals.account_switched.connect(self._on_auto_switch)
+            worker.signals.target_done.connect(self._on_target_done)
+            worker.signals.scraped_count.connect(self._on_phone_scraped_count)
             self._workers.append(worker)
-            worker.start()
+
+            # Enable individual stop button for this phone
+            dp = self.dashboard_page
+            if row_idx < len(dp.stop_phone_btns):
+                btn = dp.stop_phone_btns[row_idx]
+                btn.setEnabled(True)
+                # Disconnect previous connections to avoid stacking
+                try:
+                    btn.clicked.disconnect()
+                except Exception:
+                    pass
+                btn.clicked.connect(lambda _, idx=row_idx: self._stop_single_phone(idx))
+
+            # Stagger worker starts by 5 s each so Appium bootstrap + account
+            # detection never all hit the ADB daemon at the same instant.
+            # worker_number is 0-based position in the workers list.
+            worker_number = len(self._workers) - 1
+            delay_ms = worker_number * 5000
+            if delay_ms == 0:
+                worker.start()
+            else:
+                QTimer.singleShot(delay_ms, worker.start)
+
             self._log(
-                f"📱 Phone {row_idx+1} [{serial}] started on port {port} "
+                f"📱 [{self._phone_label(row_idx)}] [{serial}] started on port {port} "
                 f"with {len(targets_for_phone)} target(s)"
             )
 
         if not self._workers:
             self._reset_ui_after_done()
 
+    # ── Main Account ──────────────────────────────────────────────────────
+    def _start_main_account(self):
+        """Start the MainAccountWorker on the designated phone slot."""
+        if self._ma_worker and self._ma_worker.isRunning():
+            InfoBar.warning("Already Running", "Main Account is already active.", isClosable=True, duration=4000, parent=self)
+            return
+
+        cfg = self._collect_cfg()
+        save_config(cfg)
+        ma = cfg.get("main_account", {})
+
+        if not ma.get("enabled", False):
+            InfoBar.warning("Not Enabled", "Enable Main Account mode first.", isClosable=True, duration=5000, parent=self)
+            return
+
+        # Guard: if any comment action is enabled, require at least one template or OpenAI key
+        replies  = ma.get("replies", {})
+        has_text = bool(replies.get("spintax_templates")) or bool(replies.get("openai_api_key", "").strip())
+        comment_anywhere = (
+            ma.get("stories", {}).get("comment_enabled", False) or
+            ma.get("feed",    {}).get("comment_enabled", False) or
+            ma.get("reels",   {}).get("comment_enabled", False)
+        )
+        if comment_anywhere and not has_text:
+            InfoBar.warning(
+                "No Comment Templates",
+                "Commenting is enabled but no spintax templates or OpenAI key configured. "
+                "Add templates or disable commenting.",
+                isClosable=True, duration=7000, parent=self,
+            )
+            return
+
+        slot = int(ma.get("phone_slot", 0))
+        dp   = self.dashboard_page
+
+        # combo_ma_slot is kept up-to-date by _sync_ma_slot_combo / _on_nick_changed;
+        # just read the already-correct labels directly.
+        mp = self.main_account_page
+
+        if slot >= len(dp.device_rows):
+            InfoBar.warning("No Device", f"Phone slot {slot+1} is out of range.", isClosable=True, duration=5000, parent=self)
+            return
+
+        serial = dp.device_rows[slot][0].currentData()
+        if not serial:
+            label = self._phone_label(slot)
+            InfoBar.warning("No Device", f"{label} has no device assigned.", isClosable=True, duration=5000, parent=self)
+            return
+
+        # Use the already-assigned port if scraping is running for this serial,
+        # otherwise fall back to slot-based assignment. This prevents two
+        # Appium servers from being started on different ports for the same device.
+        try:
+            if hasattr(self, "_serial_to_port") and serial in self._serial_to_port:
+                port = self._serial_to_port[serial]
+                self._appium_mgr._ensure_server(port, log_callback=self._log)
+            else:
+                port = self._appium_mgr.port_for_index(slot)
+                self._appium_mgr._ensure_server(port, log_callback=self._log)
+        except RuntimeError as e:
+            InfoBar.error("Appium Failed", str(e)[:300], isClosable=True, duration=8000, parent=self)
+            return
+
+        mp = self.main_account_page
+        mp.btn_ma_start.setEnabled(False)
+        mp.btn_ma_stop.setEnabled(True)
+        mp.lbl_ma_status.setText("Starting…")
+
+        from src.automation.main_account_worker import MainAccountWorker
+        self._ma_worker = MainAccountWorker(
+            phone_index=slot,
+            serial=serial,
+            appium_port=port,
+            config=cfg,
+        )
+        _ma_label = self._phone_label(slot)
+        self._ma_worker.signals.log.connect(
+            lambda msg, lbl=_ma_label: self._log_ma(
+                __import__("re").sub(
+                    r"^\[Main Acct / Phone \d+\]",
+                    f"[Main Acct / {lbl}]",
+                    msg
+                )
+            )
+        )
+        self._ma_worker.signals.status.connect(
+            lambda s: mp.lbl_ma_status.setText(s)
+        )
+        self._ma_worker.signals.finished.connect(self._on_ma_finished)
+        self._ma_worker.signals.error.connect(self._on_ma_error)
+        self._ma_worker.start()
+
+        # ── Clear MA log on every fresh start (same behaviour as scraping log) ──
+        self.results_page.ma_log_area.clear()
+
+        self._log_ma(f"🌟 Main Account started on {self._phone_label(slot)} [{serial}]")
+
+        # ── Daily limit startup notice ────────────────────────────────────────
+        dl = ma.get("daily_limit", {})
+        if dl.get("enabled", False):
+            h   = int(dl.get("hours",   4))
+            m   = int(dl.get("minutes", 0))
+            parts = []
+            if h: parts.append(f"{h}h")
+            if m: parts.append(f"{m:02d}m")
+            if not parts: parts = ["0m"]
+            self._log_ma(f"⏱ Daily time limit set to {' '.join(parts)} of active engagement. Resets at midnight.")
+        else:
+            self._log_ma("⏱ Daily time limit: disabled (running unlimited).")
+
+        # Navigate to results page so user can see the live log
+        self.stackedWidget.setCurrentWidget(self.results_page)
+
+    def _stop_main_account(self):
+        if self._ma_worker and self._ma_worker.isRunning():
+            self._ma_worker.stop()
+            self._log("⏹️ Main Account stop requested…")
+        mp = self.main_account_page
+        mp.btn_ma_stop.setEnabled(False)
+
+    def _on_ma_finished(self):
+        mp = self.main_account_page
+        mp.btn_ma_start.setEnabled(True)
+        mp.btn_ma_stop.setEnabled(False)
+        mp.lbl_ma_status.setText("Finished")
+        self._log_ma("✅ Main Account worker finished.")
+
+    def _on_ma_error(self, msg: str):
+        mp = self.main_account_page
+        mp.btn_ma_start.setEnabled(True)
+        mp.btn_ma_stop.setEnabled(False)
+        mp.lbl_ma_status.setText("Error ❌")
+        self._log_ma(f"❌ Main Account error: {msg[:200]}")
+        InfoBar.error("Main Account Error", msg[:200], isClosable=True, duration=8000, parent=self)
+
     def _stop_all(self):
+        """Stop scraping workers only. Main Account has its own Stop button."""
         for w in self._workers:
             w.stop()
-        self._log("⏹️ Stop requested for all phones…")
+        self._log("⏹️ Stop requested for all scraping phones…")
         self.dashboard_page.btn_stop.setEnabled(False)
+        # Disable all individual stop buttons
+        for btn in self.dashboard_page.stop_phone_btns:
+            btn.setEnabled(False)
+
+    def _stop_single_phone(self, phone_idx: int):
+        """Stop a single phone worker without affecting the others."""
+        for w in self._workers:
+            if w.phone_index == phone_idx:
+                w.stop()
+                self._log(f"⏹️ Stop requested for Phone {phone_idx + 1}…")
+                self._on_phone_status(phone_idx, "stopping…")
+                dp = self.dashboard_page
+                if phone_idx < len(dp.stop_phone_btns):
+                    dp.stop_phone_btns[phone_idx].setEnabled(False)
+                break
+
+    def _on_target_done(self, phone_idx: int, username: str):
+        """Called when a phone finishes scraping a target completely."""
+        dp    = self.dashboard_page
+        label = self._phone_label(phone_idx)
+        # Mark in summary file
+        mark_target_completed(username, label)
+        # Remove the target from the phone's text area so the client sees what's left
+        if phone_idx < len(dp.target_rows):
+            txt      = dp.target_rows[phone_idx]
+            existing = [t.strip() for t in txt.toPlainText().splitlines() if t.strip()]
+            updated  = [t for t in existing if t.lstrip("@").lower() != username.lower()]
+            txt.setPlainText("\n".join(updated))
+        self._log(f"✅ [{label}] completed @{username} — logged to scraping_summary.txt")
+
+    def _on_phone_scraped_count(self, phone_idx: int, session_count: int):
+        """Update the per-phone session count label and summary tracker."""
+        label = self._phone_label(phone_idx)
+        record_scraped(label, session_count)
+        if not hasattr(self, "_phone_session_counts"):
+            self._phone_session_counts = {}
+        self._phone_session_counts[phone_idx] = session_count
+        rp = self.results_page
+        if phone_idx < len(rp.phone_status_labels):
+            rp.phone_status_labels[phone_idx].setText(f"{label}: {session_count} scraped")
+        # Refresh summary card on dashboard
+        dp    = self.dashboard_page
+        parts = [f"{self._phone_label(i)}: {cnt}" for i, cnt in self._phone_session_counts.items()]
+        dp.lbl_summary_info.setText("This session — " + " | ".join(parts))
 
     # ── Worker callbacks ──────────────────────────────────────────────────
     def _on_account(self, acc: dict):
@@ -2583,7 +3966,11 @@ class MainWindow(FluentWindow):
         if phone_idx < len(dp.device_rows):
             dp.device_rows[phone_idx][3].setText(f"● {status}")
         if phone_idx < len(rp.phone_status_labels):
-            rp.phone_status_labels[phone_idx].setText(f"Phone {phone_idx+1}: {status}")
+            nick = ""
+            if phone_idx < len(dp.nick_edits):
+                nick = dp.nick_edits[phone_idx].text().strip()
+            label = nick if nick else f"Phone {phone_idx + 1}"
+            rp.phone_status_labels[phone_idx].setText(f"{label}: {status}")
 
     def _on_phone_finished(self, phone_idx: int, count: int):
         # Reset restart counter — this phone recovered and ran to completion
@@ -2706,13 +4093,19 @@ class MainWindow(FluentWindow):
                 config=cfg,
                 sheets_client=self._sheets_client,
             )
-            worker.signals.log.connect(self._log)
+            worker.signals.log.connect(
+                (lambda idx: lambda msg: self._log(
+                    __import__("re").sub(r"^\[Phone \d+\]", f"[{self._phone_label(idx)}]", msg)
+                ))(phone_idx)
+            )
             worker.signals.account.connect(self._on_account)
             worker.signals.progress.connect(self._on_progress)
             worker.signals.finished.connect(self._on_phone_finished)
             worker.signals.error.connect(self._on_phone_error)
             worker.signals.status.connect(self._on_phone_status)
             worker.signals.account_switched.connect(self._on_auto_switch)
+            worker.signals.target_done.connect(self._on_target_done)
+            worker.signals.scraped_count.connect(self._on_phone_scraped_count)
 
             # Replace the old (dead) worker entry in self._workers
             for i, w in enumerate(self._workers):
@@ -2729,7 +4122,14 @@ class MainWindow(FluentWindow):
 
     def _all_done(self):
         self._log(f"🏁 All phones done. Total collected: {self._collected} accounts.")
+        finish_session(self._collected)
         self._reload_blacklist_ui()
+        # Update summary card
+        dp = self.dashboard_page
+        dp.lbl_summary_info.setText(
+            f"Last session: {self._collected} total accounts collected. "
+            f"Summary saved to scraping_summary.txt"
+        )
         InfoBar.success(
             "Complete!",
             f"All phones finished. {self._collected} accounts collected.",
@@ -2745,11 +4145,28 @@ class MainWindow(FluentWindow):
         self._set_schedule_locked(False)
         self.dashboard_page.lbl_overall_status.setText(f"Done — {self._collected} collected")
         self.results_page.lbl_progress.setText(f"Done: {self._collected} total accounts")
+        # Disable all individual stop buttons
+        for btn in self.dashboard_page.stop_phone_btns:
+            btn.setEnabled(False)
 
     # ── Logging ───────────────────────────────────────────────────────────
+    def _phone_label(self, phone_idx: int) -> str:
+        """Return nickname if set, else 'Phone N'."""
+        dp = self.dashboard_page
+        if phone_idx < len(dp.nick_edits):
+            nick = dp.nick_edits[phone_idx].text().strip()
+            if nick:
+                return nick
+        return f"Phone {phone_idx + 1}"
+
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
         self.results_page.log_area.append(f"[{ts}] {msg}")
+
+    def _log_ma(self, msg: str):
+        """Route Main Account messages to the dedicated MA log panel."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.results_page.ma_log_area.append(f"[{ts}] {msg}")
 
     # ── Settings helpers ──────────────────────────────────────────────────
     def _browse_credentials(self):
@@ -2813,11 +4230,16 @@ class MainWindow(FluentWindow):
 
     # ── Blacklist helpers ─────────────────────────────────────────────────
     def _reload_blacklist_ui(self):
-        """Refresh the count label from the on-disk blacklist."""
+        """Refresh the count labels from the on-disk blacklists."""
         bl = load_blacklist()
         count = len(bl)
         self.filters_page.lbl_bl_count.setText(
             f"{count} entr{'y' if count == 1 else 'ies'} in blacklist"
+        )
+        kw_bl = load_keyword_blacklist()
+        kw_count = len(kw_bl)
+        self.filters_page.lbl_kw_bl_count.setText(
+            f"{kw_count} entr{'y' if kw_count == 1 else 'ies'} in keyword blacklist"
         )
 
     def _download_blacklist_txt(self):
@@ -2839,6 +4261,32 @@ class MainWindow(FluentWindow):
                 isClosable=True,
                 duration=5000,
                 parent=self,
+            )
+        except Exception as exc:
+            InfoBar.error("Export Failed", str(exc), isClosable=True, duration=8000, parent=self)
+
+    def _download_summary(self):
+        """Let the user save a copy of scraping_summary.txt to any location they choose."""
+        src = get_summary_path()
+        if not os.path.exists(src):
+            InfoBar.warning(
+                "No Summary Yet",
+                "No sessions have been run yet. Run a scraping session first.",
+                isClosable=True, duration=5000, parent=self,
+            )
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save Session Summary", "scraping_summary.txt", "Text files (*.txt)"
+        )
+        if not dest:
+            return
+        try:
+            import shutil
+            shutil.copy2(src, dest)
+            InfoBar.success(
+                "Summary Saved",
+                f"Session summary exported → {os.path.basename(dest)}",
+                isClosable=True, duration=5000, parent=self,
             )
         except Exception as exc:
             InfoBar.error("Export Failed", str(exc), isClosable=True, duration=8000, parent=self)
@@ -2879,6 +4327,64 @@ class MainWindow(FluentWindow):
             clear_blacklist()
             self._reload_blacklist_ui()
             InfoBar.success("Cleared", "Blacklist cleared.", isClosable=True, duration=5000, parent=self)
+
+    # ── Keyword blacklist handlers ─────────────────────────────────────────
+
+    def _download_kw_blacklist_txt(self):
+        """Export the keyword blacklist as a plain .txt file."""
+        bl = load_keyword_blacklist()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Keyword Blacklist", "blacklist_keyword.txt", "Text files (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(sorted(bl)))
+                if bl:
+                    f.write("\n")
+            InfoBar.success(
+                "Downloaded",
+                f"Keyword blacklist exported ({len(bl)} entries) → {os.path.basename(path)}",
+                isClosable=True, duration=5000, parent=self,
+            )
+        except Exception as exc:
+            InfoBar.error("Export Failed", str(exc), isClosable=True, duration=8000, parent=self)
+
+    def _import_kw_blacklist_txt(self):
+        """Import usernames from a .txt file into the keyword blacklist (merges)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Keyword Blacklist", "", "Text files (*.txt);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                new_entries = {line.strip().lower() for line in f if line.strip()}
+            bl = load_keyword_blacklist()
+            before = len(bl)
+            bl.update(new_entries)
+            save_keyword_blacklist(bl)
+            added = len(bl) - before
+            self._reload_blacklist_ui()
+            InfoBar.success(
+                "Imported",
+                f"Added {added} new entr{'y' if added == 1 else 'ies'} "
+                f"({len(bl)} total in keyword blacklist).",
+                isClosable=True, duration=5000, parent=self,
+            )
+        except Exception as exc:
+            InfoBar.error("Import Failed", str(exc), isClosable=True, duration=8000, parent=self)
+
+    def _clear_kw_blacklist(self):
+        if QMessageBox.question(
+            self, "Clear Keyword Blacklist",
+            "Clear the entire keyword blacklist?\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            clear_keyword_blacklist()
+            self._reload_blacklist_ui()
+            InfoBar.success("Cleared", "Keyword blacklist cleared.", isClosable=True, duration=5000, parent=self)
 
     # ── Export ────────────────────────────────────────────────────────────
     def _export_csv(self):
@@ -2929,6 +4435,9 @@ class MainWindow(FluentWindow):
             w.stop()
         for w in self._workers:
             w.wait(3000)
+        if self._ma_worker and self._ma_worker.isRunning():
+            self._ma_worker.stop()
+            self._ma_worker.wait(3000)
         self._appium_mgr.stop_all()
         if hasattr(self, "mirror"):
             self.mirror.detach()
@@ -3013,6 +4522,17 @@ if __name__ == "__main__":
     _ico = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "cansa_icon.ico"))
     if os.path.exists(_ico):
         app.setWindowIcon(QIcon(_ico))
+    from PyQt6.QtWidgets import QToolTip
+    app.setStyleSheet(
+        "QToolTip {"
+        "  background-color: #1e293b;"
+        "  color: #f1f5f9;"
+        "  border: 1px solid #334155;"
+        "  padding: 4px 8px;"
+        "  border-radius: 4px;"
+        "  font-size: 12px;"
+        "}"
+    )
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

@@ -6,6 +6,7 @@ and account switching on Instagram.
 import os
 import shutil
 import subprocess
+import threading
 import time
 import re
 from typing import List, Optional, Tuple
@@ -16,7 +17,50 @@ INSTAGRAM_PACKAGE = "com.instagram.android"
 # SCRCPY_PATH is now cross-platform - resolved by shutil.which() at runtime
 SCRCPY_PATH = "scrcpy"
 
-# ── Windows: suppress console windows for every subprocess call ───────────────
+# ── Per-device lock: prevents two threads from running uiautomator/ADB UI ops
+# on the same device simultaneously (e.g. concurrent account detection calls).
+_DEVICE_LOCKS: dict = {}  # serial -> threading.Lock
+_DEVICE_LOCKS_MUTEX = threading.Lock()
+
+def _device_lock(serial: str) -> threading.Lock:
+    """Return (creating if needed) the per-device lock for *serial*."""
+    with _DEVICE_LOCKS_MUTEX:
+        if serial not in _DEVICE_LOCKS:
+            _DEVICE_LOCKS[serial] = threading.Lock()
+        return _DEVICE_LOCKS[serial]
+
+# ── Global detection semaphore ────────────────────────────────────────────────
+# Limits concurrent get_instagram_accounts() calls to 2 at a time.
+# Different devices have separate ADB channels so they don't truly block each
+# other at the ADB level, but Appium bootstrap (uiautomator2-server install)
+# IS serialized through the ADB daemon. Limiting to 2 concurrent detections
+# prevents all N phones from bootstrapping simultaneously while still allowing
+# two phones to work in parallel (cutting total wait time roughly in half vs
+# a semaphore of 1, while avoiding the full-concurrent chaos of N phones).
+_DETECTION_SEMAPHORE = threading.Semaphore(2)
+
+# ── Active Appium session registry ───────────────────────────────────────────
+# Maps serial → AppiumController currently holding a live session.
+# Workers register/unregister here so get_instagram_accounts() can skip
+# ADB-based detection when Appium is already driving that device — preventing
+# accessibility lock fights between uiautomator dump and UiAutomator2 server.
+_ACTIVE_SESSIONS: dict = {}   # serial -> AppiumController
+_ACTIVE_SESSIONS_LOCK = threading.Lock()
+
+def register_appium_session(serial: str, controller) -> None:
+    """Register an active Appium session for a device."""
+    with _ACTIVE_SESSIONS_LOCK:
+        _ACTIVE_SESSIONS[serial] = controller
+
+def unregister_appium_session(serial: str) -> None:
+    """Unregister an Appium session when it ends."""
+    with _ACTIVE_SESSIONS_LOCK:
+        _ACTIVE_SESSIONS.pop(serial, None)
+
+def get_active_session(serial: str):
+    """Return the active AppiumController for serial, or None."""
+    with _ACTIVE_SESSIONS_LOCK:
+        return _ACTIVE_SESSIONS.get(serial)
 _WINDOWS_NO_WINDOW: dict = (
     {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 )
@@ -87,58 +131,95 @@ def get_instagram_accounts(serial: str) -> List[str]:
     """
     Detect all logged-in Instagram accounts on the device.
 
-    Opens Instagram if not already running (monkey launch), then navigates
-    to the profile tab via Back-key navigation (no restart), opens the
-    account switcher, and reads all account names.
+    Two guards ensure this never fights with live Appium sessions:
+
+    1. Active-session check: if an AppiumController is already driving this
+       device, use its driver to read accounts instead of raw ADB/uiautomator.
+       This avoids the accessibility lock fight between UiAutomator2 server
+       and uiautomator dump.
+
+    2. Global semaphore: only ONE device may run ADB-based detection at a time.
+       This prevents concurrent uiautomator calls across multiple phones from
+       competing on the ADB daemon and timing out → "Account 1".
     """
-    accounts = []
-    try:
-        # Make sure Instagram is open
-        top = _run_hidden(
-            ["adb", "-s", serial, "shell", "dumpsys", "activity", "top"],
-            capture_output=True, text=True, timeout=10
-        )
-        if INSTAGRAM_PACKAGE not in top.stdout:
-            _run_hidden(
-                ["adb", "-s", serial, "shell",
-                 "monkey", "-p", INSTAGRAM_PACKAGE,
-                 "-c", "android.intent.category.LAUNCHER", "1"],
-                capture_output=True, text=True, timeout=10
-            )
-            for _ in range(10):
-                time.sleep(1)
-                check = _run_hidden(
+    # Guard 1: if Appium is already live on this device, use the driver
+    active = get_active_session(serial)
+    if active and active.driver:
+        try:
+            from appium.webdriver.common.appiumby import AppiumBy
+            driver = active.driver
+            # Navigate to profile and read the username from the action bar
+            # This is lightweight — no uiautomator dump needed
+            accounts = []
+            try:
+                # Try to read from account switcher if already open
+                els = driver.find_elements(
+                    AppiumBy.ID,
+                    "com.instagram.android:id/row_user_textview"
+                )
+                for el in els:
+                    name = (el.text or "").strip()
+                    if name and name.lower() not in ("add account", ""):
+                        accounts.append(name)
+            except Exception:
+                pass
+            if accounts:
+                return accounts
+            # Fall through to ADB if Appium read failed
+        except Exception:
+            pass
+
+    # Guard 2: global semaphore — serialize all ADB-based detections
+    with _DETECTION_SEMAPHORE:
+        with _device_lock(serial):
+            accounts = []
+            try:
+                # Make sure Instagram is open
+                top = _run_hidden(
                     ["adb", "-s", serial, "shell", "dumpsys", "activity", "top"],
                     capture_output=True, text=True, timeout=10
                 )
-                if INSTAGRAM_PACKAGE in check.stdout:
-                    break
-            time.sleep(3)
-        else:
-            time.sleep(1)
+                if INSTAGRAM_PACKAGE not in top.stdout:
+                    _run_hidden(
+                        ["adb", "-s", serial, "shell",
+                         "monkey", "-p", INSTAGRAM_PACKAGE,
+                         "-c", "android.intent.category.LAUNCHER", "1"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    for _ in range(10):
+                        time.sleep(1)
+                        check = _run_hidden(
+                            ["adb", "-s", serial, "shell", "dumpsys", "activity", "top"],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if INSTAGRAM_PACKAGE in check.stdout:
+                            break
+                    time.sleep(3)
+                else:
+                    time.sleep(1)
 
-        # Navigate to profile tab via Back presses
-        _navigate_to_profile_tab_via_back(serial)
+                # Navigate to profile tab via Back presses
+                _navigate_to_profile_tab_via_back(serial)
 
-        # Open account switcher
-        switcher_xml = _go_to_profile_and_open_switcher(serial)
-        if not switcher_xml:
-            return ["Account 1"]
+                # Open account switcher
+                switcher_xml = _go_to_profile_and_open_switcher(serial)
+                if not switcher_xml:
+                    return ["Account 1"]
 
-        account_rows = _parse_account_rows(switcher_xml)
-        accounts = [name for name, _ in account_rows]
+                account_rows = _parse_account_rows(switcher_xml)
+                accounts = [name for name, _ in account_rows]
 
-        # Close the switcher
-        _run_hidden(
-            ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
-            capture_output=True, text=True, timeout=5
-        )
-        time.sleep(1)
+                # Close the switcher
+                _run_hidden(
+                    ["adb", "-s", serial, "shell", "input", "keyevent", "4"],
+                    capture_output=True, text=True, timeout=5
+                )
+                time.sleep(1)
 
-    except Exception:
-        pass
+            except Exception:
+                pass
 
-    return accounts if accounts else ["Account 1"]
+            return accounts if accounts else ["Account 1"]
 
 
 def _dump_ui(serial: str) -> str:
@@ -927,18 +1008,21 @@ class AppiumController:
         # long wait needed.
         time.sleep(3)
 
+        # Register this active session so get_instagram_accounts() can
+        # detect it and avoid ADB/uiautomator fights.
+        register_appium_session(self._device_serial, self)
+
         print(f"✅ Appium attached to running Instagram on {device_serial}")
         return True
 
     def stop_session(self):
         """
         Disconnect the Appium session WITHOUT killing Instagram.
-
-        force-stop was removed: killing Instagram here would cause the next
-        scraping run / account switch to cold-start the app, which crashes
-        old builds.  We only quit the WebDriver (disconnects UiAutomator2)
-        and leave Instagram running in the background.
         """
+        # Unregister before quitting so detection workers don't try to use
+        # a driver that is being torn down.
+        if self._device_serial:
+            unregister_appium_session(self._device_serial)
         if self.driver:
             try:
                 self.driver.quit()
@@ -978,6 +1062,10 @@ class AppiumController:
             except Exception:
                 pass
             self.driver = None
+        # Unregister so ADB-based operations (account switch) get clean
+        # accessibility access without the UiAutomator2 server competing.
+        if self._device_serial:
+            unregister_appium_session(self._device_serial)
         # Give the UiAutomator2 server a moment to release the accessibility lock
         time.sleep(1.0)
 

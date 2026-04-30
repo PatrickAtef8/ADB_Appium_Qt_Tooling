@@ -636,6 +636,31 @@ def should_skip(account: dict, filters: dict, blacklist: set,
             if kw_clean and re.search(r"\b" + re.escape(kw_clean) + r"\b", haystack):
                 return _reject(f"keyword match: {kw!r}")
 
+    # Only-keywords positive filter — if set, account must match at least one.
+    # NOTE: when only_keywords are set, scraping is done via the in-list search
+    # box (so only matching usernames ever reach this point). This check is a
+    # secondary safety net.
+    #
+    # IMPORTANT: Instagram usernames are single continuous strings with no
+    # spaces or word boundaries (e.g. "nikebasketball", "nikewomen").
+    # A word-boundary regex like \bni​ke\b would NEVER match those, so we use a
+    # plain substring check for the username field.  Word-boundary matching is
+    # kept for full_name and bio where the keyword should appear as a real word.
+    only_keywords = filters.get("only_keywords", [])
+    if only_keywords:
+        uname_lower = account.get("username", "").lower()
+        bio_haystack = " ".join([
+            account.get("full_name", ""),
+            account.get("bio", ""),
+        ]).lower()
+        matched = any(
+            (kw.strip().lower() in uname_lower)
+            or re.search(r"\b" + re.escape(kw.strip().lower()) + r"\b", bio_haystack)
+            for kw in only_keywords if kw.strip()
+        )
+        if not matched:
+            return _reject("does not match only_keywords")
+
     return False
 
 

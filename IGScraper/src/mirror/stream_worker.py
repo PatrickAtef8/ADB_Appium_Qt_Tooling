@@ -4,6 +4,14 @@ MirrorStreamWorker — scrcpy v2.4 protocol (fixed)
 Key fix: after reading the 64+12 byte handshake, the client must send
 a 1-byte "dummy" acknowledgement before the server starts video.
 Also: adb forward is kept alive until AFTER the decode loop exits.
+
+v2 fixes (multi-device reliability):
+  * Kill device-side app_process before starting a new session so
+    localabstract:scrcpy is never "Address already in use".
+  * Skip jar push when the jar is already present at the same size.
+  * Replace blind time.sleep(0.8) with a fast poll loop (50 ms ticks).
+  * Per-device session lock prevents two workers racing on one device.
+  * Early-exit on _stop_requested after every slow ADB operation.
 """
 
 from __future__ import annotations
@@ -23,6 +31,18 @@ from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
+
+# ── Per-device session lock ───────────────────────────────────────────────────
+# Prevents two MirrorStreamWorker threads from fighting over the same
+# localabstract:scrcpy socket when a View button is clicked in rapid succession.
+_SESSION_LOCKS: dict = {}          # serial → threading.Lock
+_SESSION_LOCKS_GUARD = threading.Lock()
+
+def _session_lock(serial: str) -> threading.Lock:
+    with _SESSION_LOCKS_GUARD:
+        if serial not in _SESSION_LOCKS:
+            _SESSION_LOCKS[serial] = threading.Lock()
+        return _SESSION_LOCKS[serial]
 
 # ── Windows: suppress console windows ────────────────────────────────────────
 _WINDOWS_NO_WINDOW: dict = (
@@ -116,6 +136,21 @@ def _check_device(serial: str) -> bool:
 
 
 def _push_server(serial: str) -> bool:
+    local_size = _SERVER_JAR.stat().st_size
+    # Check if the jar already exists on device at the correct size — skip push
+    _log.log("PUSH: checking existing jar on device")
+    rc_check, out_check, _ = _run(
+        _adb(serial, "shell", "stat", "-c", "%s", _DEVICE_SERVER_PATH), timeout=5
+    )
+    if rc_check == 0:
+        try:
+            device_size = int(out_check.strip())
+            if device_size == local_size:
+                _log.log(f"PUSH: jar already present ({device_size} B) — skipping push ✓")
+                return True
+        except ValueError:
+            pass
+
     _log.log("PUSH: pushing scrcpy-server.jar")
     rc, _, _ = _run(_adb(serial, "push", str(_SERVER_JAR), _DEVICE_SERVER_PATH), timeout=30)
     _log.log(f"PUSH: {'ok ✓' if rc == 0 else 'FAILED ✗'}")
@@ -131,6 +166,44 @@ def _forward_port(serial: str, local_port: int) -> bool:
 
 def _remove_forward(serial: str, local_port: int):
     _run(_adb(serial, "forward", "--remove", f"tcp:{local_port}"), timeout=3)
+
+
+def _kill_device_server(serial: str):
+    """Kill any leftover scrcpy server process on the device and wait until
+    the localabstract:scrcpy socket is fully released before returning.
+
+    Problem: pkill sends SIGTERM and returns immediately. Android's kernel
+    releases the abstract socket asynchronously — on emulators this takes
+    anywhere from 100 ms to 2+ seconds. Launching a new scrcpy server before
+    the socket is released always causes 'Address already in use'.
+
+    Solution: after pkill, poll /proc/net/unix in a 50 ms loop until the
+    'scrcpy' entry disappears, with a 3 s hard timeout.
+    """
+    _log.log("KILL: terminating old device-side scrcpy server (if any)")
+    _run(_adb(serial, "shell", "pkill", "-f", "scrcpy-server"), timeout=5)
+
+    # Poll /proc/net/unix until the abstract socket disappears.
+    # NOTE: we bypass _run() here to avoid flooding the log with the full
+    # /proc/net/unix contents (can be thousands of lines).
+    _log.log("KILL: waiting for localabstract:scrcpy to be released…")
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        try:
+            result = subprocess.run(
+                _adb(serial, "shell", "cat", "/proc/net/unix"),
+                capture_output=True, text=True, timeout=3,
+                **_WINDOWS_NO_WINDOW,
+            )
+            if result.returncode != 0:
+                break  # can't read proc — assume socket is gone
+            if "scrcpy" not in result.stdout:
+                _log.log("KILL: socket released ✓")
+                return
+        except Exception:
+            break
+    _log.log("KILL: timed out waiting for socket release — proceeding")
 
 
 def _find_free_port() -> int:
@@ -196,6 +269,27 @@ class MirrorStreamWorker(QThread):
 
         self.state_changed.emit("connecting")
 
+        # Acquire per-device lock so two workers never race on the same device.
+        # Try-acquire with timeout so a stale lock never blocks forever.
+        lock = _session_lock(self.serial)
+        acquired = lock.acquire(timeout=10)
+        if not acquired:
+            _log.log("LOCK: could not acquire device lock within 10 s — aborting")
+            self.state_changed.emit("error:Device busy — try again")
+            return
+
+        try:
+            self._run_locked()
+        finally:
+            lock.release()
+
+        _log.log("=== run() END ===")
+
+    def _run_locked(self):
+        """Called while holding the per-device session lock."""
+        if self._stop_requested:
+            return
+
         if not _check_device(self.serial):
             self.state_changed.emit(f"error:Device {self.serial} not found")
             return
@@ -204,8 +298,18 @@ class MirrorStreamWorker(QThread):
             self.state_changed.emit(f"error:scrcpy-server.jar missing at {_SERVER_JAR}")
             return
 
+        # Kill any leftover device-side server BEFORE pushing/forwarding so
+        # localabstract:scrcpy is free for the new session.
+        _kill_device_server(self.serial)
+
+        if self._stop_requested:
+            return
+
         if not _push_server(self.serial):
             self.state_changed.emit("error:Failed to push scrcpy-server.jar")
+            return
+
+        if self._stop_requested:
             return
 
         local_port = _find_free_port()
@@ -227,49 +331,78 @@ class MirrorStreamWorker(QThread):
             _log.log("Emitting disconnected")
             self.state_changed.emit("disconnected")
 
-        _log.log("=== run() END ===")
-
     def _run_session(self, local_port: int):
-        # Launch the scrcpy server on device
-        server_cmd = _adb(self.serial, "shell",
-            f"CLASSPATH={_DEVICE_SERVER_PATH}",
-            "app_process", "/",
-            "com.genymobile.scrcpy.Server",
-            _SCRCPY_VERSION,
-            "log_level=debug",
-            f"max_size={_MAX_SIZE}",
-            f"video_bit_rate={_BITRATE}",
-            f"max_fps={_MAX_FPS}",
-            "tunnel_forward=true",
-            "send_frame_meta=true",
-            "control=false",
-            "audio=false",
-            "show_touches=false",
-            "stay_awake=false",
-            "power_off_on_close=false",
-            "clipboard_autosync=false",
-        )
-        _log.log(f"Launching server: {' '.join(server_cmd)}")
+        # Launch the scrcpy server on device — retry up to 3 times if the
+        # abstract socket is still being released from a prior session.
+        MAX_LAUNCH_ATTEMPTS = 3
+        for attempt in range(1, MAX_LAUNCH_ATTEMPTS + 1):
+            if self._stop_requested:
+                return
 
-        try:
-            self._server_proc = subprocess.Popen(
-                server_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                **_WINDOWS_NO_WINDOW,
+            server_cmd = _adb(self.serial, "shell",
+                f"CLASSPATH={_DEVICE_SERVER_PATH}",
+                "app_process", "/",
+                "com.genymobile.scrcpy.Server",
+                _SCRCPY_VERSION,
+                "log_level=debug",
+                f"max_size={_MAX_SIZE}",
+                f"video_bit_rate={_BITRATE}",
+                f"max_fps={_MAX_FPS}",
+                "tunnel_forward=true",
+                "send_frame_meta=true",
+                "control=false",
+                "audio=false",
+                "show_touches=false",
+                "stay_awake=false",
+                "power_off_on_close=false",
+                "clipboard_autosync=false",
             )
-        except Exception as e:
-            self.state_changed.emit(f"error:Cannot launch server — {e}")
-            return
+            if attempt > 1:
+                _log.log(f"Launching server (attempt {attempt}/{MAX_LAUNCH_ATTEMPTS}): {' '.join(server_cmd)}")
+            else:
+                _log.log(f"Launching server: {' '.join(server_cmd)}")
 
-        # Give the server time to bind its socket
-        time.sleep(0.8)
+            try:
+                self._server_proc = subprocess.Popen(
+                    server_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **_WINDOWS_NO_WINDOW,
+                )
+            except Exception as e:
+                self.state_changed.emit(f"error:Cannot launch server — {e}")
+                return
 
-        if self._server_proc.poll() is not None:
-            out = self._server_proc.stdout.read(2000).decode(errors="replace")
-            err = self._server_proc.stderr.read(2000).decode(errors="replace")
-            _log.log(f"Server died immediately! stdout={out!r} stderr={err!r}")
-            self.state_changed.emit(f"error:scrcpy server crashed — {err[:200] or out[:200]}")
+            # Poll for server death (up to 1 s in 50 ms ticks).
+            # Exits early on stop request or fast crash.
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if self._stop_requested:
+                    return
+                if self._server_proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+
+            if self._server_proc.poll() is not None:
+                out = self._server_proc.stdout.read(2000).decode(errors="replace")
+                err = self._server_proc.stderr.read(2000).decode(errors="replace")
+                _log.log(f"Server died immediately! stdout={out!r} stderr={err!r}")
+
+                if "Address already in use" in err and attempt < MAX_LAUNCH_ATTEMPTS:
+                    # Socket not released yet — wait for it then retry
+                    _log.log(f"RETRY: socket still bound, waiting for release (attempt {attempt}/{MAX_LAUNCH_ATTEMPTS})…")
+                    _kill_device_server(self.serial)
+                    continue  # retry the launch loop
+
+                self.state_changed.emit(f"error:scrcpy server crashed — {err[:200] or out[:200]}")
+                return
+
+            # Server is alive — proceed to video connection
+            break
+
+        else:
+            # All attempts exhausted
+            self.state_changed.emit("error:scrcpy server failed — Address already in use (all retries failed)")
             return
 
         # Connect video socket
