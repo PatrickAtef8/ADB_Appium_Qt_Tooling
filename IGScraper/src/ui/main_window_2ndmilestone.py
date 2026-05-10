@@ -5,7 +5,7 @@ import threading
 import time
 import traceback
 import random
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from typing import Dict, List, Optional, Tuple
 
 from PyQt6.QtCore    import Qt, QThread, QTime, QTimer, pyqtSignal, QObject, QUrl
@@ -383,13 +383,7 @@ class PhoneWorker(QThread):
             filters        = cfg["filters"]
             mode           = cfg.get("last_mode", "followers")
             max_per_target = int(cfg.get("last_count", 100))
-            # Use this phone's per-device schedule from the Working Hours tab.
-            # If not set or disabled, schedule is empty → runs 24/7.
-            per_device = cfg.get("per_device_schedule", [])
-            if self.phone_index < len(per_device) and per_device[self.phone_index].get("enabled"):
-                schedule = per_device[self.phone_index]
-            else:
-                schedule = {}
+            schedule       = cfg.get("schedule", {})
 
             switch_mode    = delays.get("switch_mode", "profiles")   # "profiles" | "hours"
             switch_every   = int(delays.get("session_break_every", 100))   # used when mode=profiles
@@ -661,12 +655,13 @@ class PhoneWorker(QThread):
 
     def _in_schedule_window(self, schedule: dict) -> bool:
         """
-        Return True if we are currently inside the configured time window.
+        Return True only if we are inside a window that:
+          1. Started AFTER the schedule was saved (saved_at), and
+          2. Has not yet ended.
 
-        saved_at is used only to reject windows that had already ENDED before
-        the config was saved (stale past occurrence). If now is genuinely inside
-        the window (prev_start <= now < prev_end) we are active regardless of
-        when the config was saved — handles second runs that start mid-window.
+        Using saved_at as the anchor prevents a just-passed start from
+        being treated as "active" when the user configured it after the
+        fact.
         """
         from datetime import timedelta
         now     = datetime.now()
@@ -680,19 +675,14 @@ class PhoneWorker(QThread):
 
         prev_end = prev_start + self._schedule_duration(schedule)
 
-        # Not inside the window at all — definitely not active
-        if not (prev_start <= now < prev_end):
-            return False
-
-        # We ARE inside the window. Reject only if the entire window ended
-        # before the config was saved (truly stale past occurrence).
+        # Only active if the window started after the config was saved
         saved_at_str = schedule.get("saved_at", "")
         try:
             saved_at = datetime.fromisoformat(saved_at_str)
         except (ValueError, TypeError):
-            saved_at = datetime.min
+            saved_at = datetime.min   # no saved_at → conservative: never active
 
-        return not (prev_end <= saved_at)
+        return (prev_start >= saved_at) and (now < prev_end)
 
     def _wait_for_schedule(self, schedule: dict):
         start_t = dtime(schedule["start_hour"], schedule["start_minute"])
@@ -914,6 +904,39 @@ class DashboardPage(QWidget):
         mode_lay.addLayout(mode_form); mode_lay.addStretch(1)
         bottom_row.addWidget(mode_card, 1)
 
+        sched_card = CardWidget(self._left_inner)
+        sched_lay  = QVBoxLayout(sched_card)
+        sched_lay.setContentsMargins(self._cs, self._cs, self._cs, self._cs)
+        sched_lay.setSpacing(10)
+        self.chk_schedule = CheckBox("Working Hours", sched_card)
+        self.chk_schedule.setFont(T.heading()); self.chk_schedule.setStyleSheet("background: transparent;")
+        sched_lay.addWidget(self.chk_schedule)
+        self.lbl_sched_desc = CaptionLabel(
+            "Scraping only runs between these times. Outside this window the bot pauses and waits.",
+            sched_card,
+        )
+        self.lbl_sched_desc.setStyleSheet("background: transparent; color: grey;")
+        self.lbl_sched_desc.setWordWrap(True)
+        sched_lay.addWidget(self.lbl_sched_desc)
+        time_row = QHBoxLayout(); time_row.setSpacing(8)
+        self._lbl_sched_start = CaptionLabel("Start:", sched_card); self._lbl_sched_start.setStyleSheet("background: transparent;")
+        self.time_start = TimeEdit(sched_card); self.time_start.setFont(T.body())
+        self.time_start.setMinimumHeight(_px(44)); self.time_start.setDisplayFormat("hh:mm AP")
+        self.time_start.setToolTip("Scraping START time (e.g. 09:00 AM)")
+        self._lbl_sched_arrow = CaptionLabel("to", sched_card); self._lbl_sched_arrow.setStyleSheet("background: transparent;")
+        self._lbl_sched_end = CaptionLabel("End:", sched_card); self._lbl_sched_end.setStyleSheet("background: transparent;")
+        self.time_end = TimeEdit(sched_card); self.time_end.setFont(T.body())
+        self.time_end.setMinimumHeight(_px(44)); self.time_end.setDisplayFormat("hh:mm AP")
+        self.time_end.setToolTip("Scraping END time (e.g. 06:00 PM)")
+        time_row.addWidget(self._lbl_sched_start); time_row.addWidget(self.time_start)
+        time_row.addWidget(self._lbl_sched_arrow); time_row.addWidget(self._lbl_sched_end)
+        time_row.addWidget(self.time_end); time_row.addStretch()
+        sched_lay.addLayout(time_row)
+        self.lbl_sched_preview = CaptionLabel("", sched_card)
+        self.lbl_sched_preview.setStyleSheet("background: transparent; color: #3b82f6;")
+        self.lbl_sched_preview.setWordWrap(True)
+        sched_lay.addWidget(self.lbl_sched_preview)
+        bottom_row.addWidget(sched_card, 1)
         left_lay.addLayout(bottom_row)
 
         # Session Summary card
@@ -1397,223 +1420,6 @@ class ResultsPage(QWidget):
 # Settings page
 # ─────────────────────────────────────────────────────────────────────────────
 
-class WorkingHoursPage(PageWidget):
-    """Per-device working hours tab.
-
-    One card per phone slot, identical in structure to the dashboard's
-    Working Hours card (checkbox + description + Start/End TimeEdit + yellow
-    preview label). Cards are shown/hidden in sync with the Dashboard via
-    sync_slots(). Title labels update live when the user edits a nickname.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__("Working Hours", parent)
-        # _rows: List of (chk, te_start, te_end, lbl_preview, lbl_title)
-        self._rows:  List[Tuple]      = []
-        self._cards: List[CardWidget] = []
-        self._build()
-
-    def _build(self):
-        _cs = _px(16)
-
-        # Global description card
-        info_card = CardWidget(self)
-        info_lay  = QVBoxLayout(info_card)
-        info_lay.setContentsMargins(_cs, _cs, _cs, _cs)
-        info_lay.setSpacing(6)
-        info_lay.addWidget(StrongBodyLabel("⏰ Per-Device Working Hours", info_card))
-        info_lay.addWidget(CaptionLabel(
-            "Set working hours independently for each phone. "
-            "Applies to both scraping and Main Account modes. "
-            "Untick to let that phone run whenever the session is active.",
-            info_card,
-        ))
-        self.add(info_card)
-
-        # Pre-build all MAX_PHONES cards; only card 0 visible at start.
-        for i in range(MAX_PHONES):
-            card = CardWidget(self)
-            lay  = QVBoxLayout(card)
-            lay.setContentsMargins(_cs, _cs, _cs, _cs)
-            lay.setSpacing(10)
-
-            # ── Checkbox (acts as the card header, mirrors dashboard style) ──
-            chk = CheckBox(f"Phone {i + 1} — Working Hours", card)
-            chk.setFont(T.heading())
-            chk.setStyleSheet("background: transparent;")
-            lay.addWidget(chk)
-
-            # ── Description label (greyed, same as dashboard) ─────────────
-            lbl_desc = CaptionLabel(
-                "Bot only runs between these times. Outside this window it pauses and waits.",
-                card,
-            )
-            lbl_desc.setStyleSheet("background: transparent; color: grey;")
-            lbl_desc.setWordWrap(True)
-            lay.addWidget(lbl_desc)
-
-            # ── Time pickers row ──────────────────────────────────────────
-            time_row = QHBoxLayout()
-            time_row.setSpacing(8)
-            lbl_start = CaptionLabel("Start:", card)
-            lbl_start.setStyleSheet("background: transparent;")
-            te_start = TimeEdit(card)
-            te_start.setFont(T.body())
-            te_start.setMinimumHeight(_px(44))
-            te_start.setDisplayFormat("hh:mm AP")
-            te_start.setTime(QTime(8, 0))
-
-            lbl_arrow = CaptionLabel("to", card)
-            lbl_arrow.setStyleSheet("background: transparent;")
-            lbl_end_lbl = CaptionLabel("End:", card)
-            lbl_end_lbl.setStyleSheet("background: transparent;")
-            te_end = TimeEdit(card)
-            te_end.setFont(T.body())
-            te_end.setMinimumHeight(_px(44))
-            te_end.setDisplayFormat("hh:mm AP")
-            te_end.setTime(QTime(20, 0))
-
-            time_row.addWidget(lbl_start)
-            time_row.addWidget(te_start)
-            time_row.addWidget(lbl_arrow)
-            time_row.addWidget(lbl_end_lbl)
-            time_row.addWidget(te_end)
-            time_row.addStretch()
-            lay.addLayout(time_row)
-
-            # ── Preview label (yellow "Next window: …") ───────────────────
-            lbl_preview = CaptionLabel("", card)
-            lbl_preview.setStyleSheet("background: transparent; color: #f59e0b;")
-            lbl_preview.setWordWrap(True)
-            lay.addWidget(lbl_preview)
-
-            # ── Checkbox toggles pickers + preview ────────────────────────
-            def _make_toggle(te_s, te_e, ls, la, le, ld, lp, idx_=i):
-                def _toggle(state):
-                    on = bool(state)
-                    for w in [te_s, te_e, ls, la, le, ld, lp]:
-                        w.setEnabled(on)
-                    if on:
-                        self._update_preview(idx_)
-                    else:
-                        lp.setText("")
-                return _toggle
-
-            chk.stateChanged.connect(
-                _make_toggle(te_start, te_end, lbl_start, lbl_arrow,
-                             lbl_end_lbl, lbl_desc, lbl_preview)
-            )
-            # Wire time changes to refresh preview
-            def _make_preview_updater(idx_=i):
-                return lambda _: self._update_preview(idx_)
-            te_start.timeChanged.connect(_make_preview_updater())
-            te_end.timeChanged.connect(_make_preview_updater())
-
-            # Start disabled (checkbox unchecked)
-            for w in [te_start, te_end, lbl_start, lbl_arrow,
-                      lbl_end_lbl, lbl_desc, lbl_preview]:
-                w.setEnabled(False)
-
-            self._rows.append((chk, te_start, te_end, lbl_preview, chk))
-            self._cards.append(card)
-            self.add(card)
-            card.setVisible(i == 0)
-
-        self.stretch()
-
-    def _update_preview(self, idx: int):
-        """Recompute and show the next window for slot idx — mirrors dashboard logic."""
-        chk, te_start, te_end, lbl_preview, _ = self._rows[idx]
-        if not chk.isChecked():
-            lbl_preview.setText("")
-            return
-        ts = te_start.time()
-        te = te_end.time()
-        start_t = dtime(ts.hour(), ts.minute())
-        end_t   = dtime(te.hour(), te.minute())
-        now     = datetime.now()
-
-        if end_t > start_t:
-            duration = timedelta(hours=end_t.hour - start_t.hour,
-                                 minutes=end_t.minute - start_t.minute)
-        else:
-            duration = timedelta(days=1) - timedelta(hours=start_t.hour - end_t.hour,
-                                                      minutes=start_t.minute - end_t.minute)
-
-        prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                                 second=0, microsecond=0)
-        if prev_start > now:
-            prev_start -= timedelta(days=1)
-        prev_end = prev_start + duration
-
-        next_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                                 second=0, microsecond=0)
-        if next_start <= now:
-            next_start += timedelta(days=1)
-        next_end = next_start + duration
-
-        in_window = (prev_start <= now < prev_end) and \
-                    ((now - prev_start).total_seconds() <= 300)
-
-        if in_window:
-            lbl_preview.setText(
-                f"▶ Active now — ends {prev_end.strftime('%a %I:%M %p')}"
-            )
-            lbl_preview.setStyleSheet("background: transparent; color: #22c55e;")
-        else:
-            lbl_preview.setText(
-                f"⏳ Next window: {next_start.strftime('%a %I:%M %p')} "
-                f"→ {next_end.strftime('%a %I:%M %p')}"
-            )
-            lbl_preview.setStyleSheet("background: transparent; color: #f59e0b;")
-
-    def update_slot_label(self, idx: int, label: str):
-        """Update the checkbox text for slot idx with the given label (nickname or 'Phone N')."""
-        if idx < len(self._rows):
-            chk = self._rows[idx][0]
-            chk.setText(f"{label} — Working Hours")
-
-    def sync_slots(self, visible_count: int):
-        """Show/hide phone cards to match the number of visible dashboard slots."""
-        for i, card in enumerate(self._cards):
-            card.setVisible(i < visible_count)
-
-    def get_schedules(self) -> List[dict]:
-        """Return a schedule dict per slot (MAX_PHONES length).
-        saved_at is stamped at call time so the saved_at-aware
-        _in_schedule_window guard works correctly.
-        """
-        result = []
-        for chk, te_start, te_end, _lbl_p, _chk in self._rows:
-            ts = te_start.time()
-            te = te_end.time()
-            result.append({
-                "enabled":      chk.isChecked(),
-                "start_hour":   ts.hour(),
-                "start_minute": ts.minute(),
-                "end_hour":     te.hour(),
-                "end_minute":   te.minute(),
-                "saved_at":     datetime.now().isoformat(),
-            })
-        return result
-
-    def load_schedules(self, schedules: list):
-        """Load saved schedule dicts back into UI rows."""
-        for i, (chk, te_start, te_end, lbl_preview, _) in enumerate(self._rows):
-            if i < len(schedules):
-                s = schedules[i]
-                chk.setChecked(s.get("enabled", False))
-                te_start.setTime(QTime(s.get("start_hour", 8),  s.get("start_minute", 0)))
-                te_end.setTime(  QTime(s.get("end_hour",   20), s.get("end_minute",   0)))
-                if s.get("enabled", False):
-                    self._update_preview(i)
-            else:
-                chk.setChecked(False)
-                te_start.setTime(QTime(8,  0))
-                te_end.setTime(  QTime(20, 0))
-                lbl_preview.setText("")
-
-
 class SettingsPage(PageWidget):
     def __init__(self, parent=None):
         super().__init__("Settings", parent)
@@ -1831,7 +1637,7 @@ class SettingsPage(PageWidget):
             self.sp_ip_min.setEnabled(on); self.sp_ip_max.setEnabled(on)
         self.chk_ip_enabled.stateChanged.connect(lambda _: _on_ip_toggle())
         _on_ip_toggle()
-        ip_card.setVisible(False)  # IP Rotation hidden from UI (backend retained)
+        ip_card.setVisible(True)
         self.add(ip_card)
 
         self.stretch()
@@ -1908,6 +1714,35 @@ class MainAccountPage(PageWidget):
         slot_row.addWidget(lbl_slot); slot_row.addWidget(self.combo_ma_slot); slot_row.addStretch()
         en_lay.addLayout(slot_row)
         self.add(en_card)
+
+        # ── Working hours ─────────────────────────────────────────────────
+        wh_card = CardWidget(self); wh_lay = QVBoxLayout(wh_card)
+        wh_lay.setContentsMargins(_cs, _cs, _cs, _cs); wh_lay.setSpacing(12)
+        lbl_wh = StrongBodyLabel("⏰ Working Hours Windows", wh_card)
+        lbl_wh.setFont(T.heading()); lbl_wh.setStyleSheet("background:transparent;")
+        wh_lay.addWidget(lbl_wh)
+        wh_lay.addWidget(CaptionLabel(
+            "Bot runs during all configured windows. If started mid-window it begins immediately. "
+            "Leave empty to run 24/7.", wh_card
+        ))
+        self.ma_windows: List[Tuple] = []
+        self._wh_container = QVBoxLayout()
+        wh_lay.addLayout(self._wh_container)
+
+        # Single Add + Remove row (matches phone working hours style)
+        wh_btn_row = QHBoxLayout()
+        btn_add_window = PushButton(FIF.ADD, "Add Window", wh_card)
+        btn_add_window.setFont(T.button()); btn_add_window.setMinimumHeight(_px(36))
+        btn_add_window.clicked.connect(self._add_wh_window)
+        self._btn_rm_wh = PushButton(FIF.DELETE, "Remove Last", wh_card)
+        self._btn_rm_wh.setFont(T.button()); self._btn_rm_wh.setMinimumHeight(_px(36))
+        self._btn_rm_wh.clicked.connect(self._remove_last_wh_window)
+        wh_btn_row.addWidget(btn_add_window)
+        wh_btn_row.addWidget(self._btn_rm_wh)
+        wh_btn_row.addStretch()
+        wh_lay.addLayout(wh_btn_row)
+        self.add(wh_card)
+        self._wh_card = wh_card
 
         # ── Daily time limit ──────────────────────────────────────────────
         dl_card = CardWidget(self); dl_lay = QVBoxLayout(dl_card)
@@ -2028,11 +1863,9 @@ class MainAccountPage(PageWidget):
         fd_lay.addLayout(_row(_lbl("MIN:", fd_card), self.sp_fd_scroll_min,
                               20, _lbl("MAX:", fd_card), self.sp_fd_scroll_max))
 
-        fd_lay.addWidget(_lbl("Scrolls per cycle (MIN / MAX):", fd_card))
-        self.sp_fd_num_scrolls_min = _spin(fd_card, 1, 200, 5)
-        self.sp_fd_num_scrolls_max = _spin(fd_card, 1, 200, 10)
-        fd_lay.addLayout(_row(_lbl("MIN:", fd_card), self.sp_fd_num_scrolls_min,
-                              20, _lbl("MAX:", fd_card), self.sp_fd_num_scrolls_max))
+        fd_lay.addWidget(_lbl("Scrolls per cycle:", fd_card))
+        self.sp_fd_num_scrolls = _spin(fd_card, 1, 200, 10)
+        fd_lay.addLayout(_row(_lbl("Scrolls:", fd_card), self.sp_fd_num_scrolls))
 
         fd_lay.addWidget(_lbl("Engagement actions:", fd_card))
         fr1, self.chk_fd_like,    self.sp_fd_like_pct    = _engage_row(fd_card, "Like",    "", "", 40)
@@ -2052,11 +1885,9 @@ class MainAccountPage(PageWidget):
         self.chk_rl_enabled.setFont(T.body()); self.chk_rl_enabled.setStyleSheet("background:transparent;")
         rl_lay.addWidget(self.chk_rl_enabled)
 
-        rl_lay.addWidget(_lbl("Reels per cycle (MIN / MAX):", rl_card))
-        self.sp_rl_num_reels_min = _spin(rl_card, 1, 200, 5)
-        self.sp_rl_num_reels_max = _spin(rl_card, 1, 200, 10)
-        rl_lay.addLayout(_row(_lbl("MIN:", rl_card), self.sp_rl_num_reels_min,
-                              20, _lbl("MAX:", rl_card), self.sp_rl_num_reels_max))
+        rl_lay.addWidget(_lbl("Reels per cycle:", rl_card))
+        self.sp_rl_num_reels = _spin(rl_card, 1, 200, 10)
+        rl_lay.addLayout(_row(_lbl("Reels:", rl_card), self.sp_rl_num_reels))
 
         rl_lay.addWidget(_lbl("Watch time per reel — seconds (MIN / MAX):", rl_card))
         self.sp_rl_wsec_min = _spin(rl_card, 1.0, 60.0, 5.0, double=True)
@@ -2070,34 +1901,6 @@ class MainAccountPage(PageWidget):
         self.chk_rl_like.setChecked(True)
         rl_lay.addLayout(rr1); rl_lay.addLayout(rr3)
         self.add(rl_card)
-
-        # ── Cycle Rest config ─────────────────────────────────────────────
-        cr_card = CardWidget(self); cr_lay = QVBoxLayout(cr_card)
-        cr_lay.setContentsMargins(_cs, _cs, _cs, _cs); cr_lay.setSpacing(12)
-        lbl_cr = StrongBodyLabel("🔁 Cycle Rest", cr_card)
-        lbl_cr.setFont(T.heading()); lbl_cr.setStyleSheet("background:transparent;")
-        cr_lay.addWidget(lbl_cr)
-        cr_lay.addWidget(CaptionLabel(
-            "Rest between full engagement cycles (Stories → Feed → Reels). "
-            "If disabled, the bot runs all selected engagements once then stops.",
-            cr_card,
-        ))
-        self.chk_cr_enabled = CheckBox("Enable cycle rest (repeat continuously)", cr_card)
-        self.chk_cr_enabled.setFont(T.body()); self.chk_cr_enabled.setStyleSheet("background:transparent;")
-        self.chk_cr_enabled.setChecked(True)
-        cr_lay.addWidget(self.chk_cr_enabled)
-        cr_lay.addWidget(_lbl("Rest duration — seconds (MIN / MAX):", cr_card))
-        self.sp_cr_min = _spin(cr_card, 5.0, 3600.0, 30.0, double=True)
-        self.sp_cr_max = _spin(cr_card, 5.0, 3600.0, 90.0, double=True)
-        cr_lay.addLayout(_row(_lbl("MIN:", cr_card), self.sp_cr_min,
-                              20, _lbl("MAX:", cr_card), self.sp_cr_max))
-        def _on_cr_toggle():
-            on = self.chk_cr_enabled.isChecked()
-            self.sp_cr_min.setEnabled(on)
-            self.sp_cr_max.setEnabled(on)
-        self.chk_cr_enabled.stateChanged.connect(lambda _: _on_cr_toggle())
-        _on_cr_toggle()
-        self.add(cr_card)
 
         # ── Replies / Comments config ─────────────────────────────────────
         rp_card = CardWidget(self); rp_lay = QVBoxLayout(rp_card)
@@ -2119,21 +1922,17 @@ class MainAccountPage(PageWidget):
         rp_lay.addWidget(self.txt_spintax)
 
         _lbl_openai_key = CaptionLabel("OpenAI API Key (leave blank to use spintax only):", rp_card)
-        _lbl_openai_key.setVisible(False)   # OpenAI hidden from UI (backend retained)
         rp_lay.addWidget(_lbl_openai_key)
         self.inp_openai_key = LineEdit(rp_card); self.inp_openai_key.setFont(T.body())
         self.inp_openai_key.setMinimumHeight(_px(36)); self.inp_openai_key.setPlaceholderText("sk-…")
         self.inp_openai_key.setEchoMode(LineEdit.EchoMode.Password)
-        self.inp_openai_key.setVisible(False)   # OpenAI hidden from UI (backend retained)
         rp_lay.addWidget(self.inp_openai_key)
 
         _lbl_openai_ctx = CaptionLabel("OpenAI context prompt:", rp_card)
-        _lbl_openai_ctx.setVisible(False)   # OpenAI hidden from UI (backend retained)
         rp_lay.addWidget(_lbl_openai_ctx)
         self.inp_openai_context = LineEdit(rp_card); self.inp_openai_context.setFont(T.body())
         self.inp_openai_context.setMinimumHeight(_px(36))
         self.inp_openai_context.setPlaceholderText("Write a short friendly reply to this Instagram story.")
-        self.inp_openai_context.setVisible(False)   # OpenAI hidden from UI (backend retained)
         rp_lay.addWidget(self.inp_openai_context)
         self.add(rp_card)
 
@@ -2165,12 +1964,12 @@ class MainAccountPage(PageWidget):
         ]
         self._fd_lockable = [
             self.sp_fd_scroll_min, self.sp_fd_scroll_max,
-            self.sp_fd_num_scrolls_min, self.sp_fd_num_scrolls_max,
+            self.sp_fd_num_scrolls,
             self.chk_fd_like,      self.sp_fd_like_pct,
             self.chk_fd_comment,   self.sp_fd_comment_pct,
         ]
         self._rl_lockable = [
-            self.sp_rl_num_reels_min, self.sp_rl_num_reels_max,
+            self.sp_rl_num_reels,
             self.sp_rl_wsec_min, self.sp_rl_wsec_max,
             self.chk_rl_like,    self.sp_rl_like_pct,
             self.chk_rl_comment, self.sp_rl_comment_pct,
@@ -2225,14 +2024,13 @@ class MainAccountPage(PageWidget):
 
         # ── Main Account master lock — locks everything below chk_ma_enabled
         # Collects all MA sub-widgets except chk_ma_enabled itself.
-        self._cr_lockable = [self.sp_cr_min, self.sp_cr_max]
         self._ma_all_lockable = (
             [self.combo_ma_slot, self.chk_dl_enabled,
              self.sp_dl_hours, self.sp_dl_minutes,
+             self._wh_card,
              self.chk_st_enabled, self.chk_fd_enabled, self.chk_rl_enabled,
-             self.chk_cr_enabled, self.btn_ma_start] +
-            self._st_lockable + self._fd_lockable + self._rl_lockable +
-            self._cr_lockable
+             self.btn_ma_start] +
+            self._st_lockable + self._fd_lockable + self._rl_lockable
         )
 
         def _apply_ma_master(ma_enabled: bool):
@@ -2246,9 +2044,6 @@ class MainAccountPage(PageWidget):
                 # dl spinboxes follow their own checkbox
                 self.sp_dl_hours.setEnabled(self.chk_dl_enabled.isChecked())
                 self.sp_dl_minutes.setEnabled(self.chk_dl_enabled.isChecked())
-                # cr spinboxes follow their own checkbox
-                self.sp_cr_min.setEnabled(self.chk_cr_enabled.isChecked())
-                self.sp_cr_max.setEnabled(self.chk_cr_enabled.isChecked())
 
         self.chk_ma_enabled.stateChanged.connect(
             lambda s: _apply_ma_master(bool(s)))
@@ -2256,6 +2051,62 @@ class MainAccountPage(PageWidget):
         # ── Apply all initial states ──────────────────────────────────────
         _apply_ma_master(self.chk_ma_enabled.isChecked())
 
+    def _add_wh_window(self, start_h=9, start_m=0, end_h=19, end_m=0):
+        """Add one editable working-hour window row."""
+        row_widget = QWidget(self._wh_card)
+        row_widget.setStyleSheet("background: transparent;")
+        row_lay = QHBoxLayout(row_widget)
+        row_lay.setContentsMargins(0, 0, 0, 0); row_lay.setSpacing(10)
+
+        te_start = TimeEdit(row_widget); te_start.setDisplayFormat("hh:mm AP")
+        te_start.setTime(QTime(start_h, start_m)); te_start.setFont(T.body())
+        te_start.setMinimumHeight(_px(44))
+
+        lbl_to = CaptionLabel("→", row_widget); lbl_to.setStyleSheet("background:transparent;")
+
+        te_end = TimeEdit(row_widget); te_end.setDisplayFormat("hh:mm AP")
+        te_end.setTime(QTime(end_h, end_m)); te_end.setFont(T.body())
+        te_end.setMinimumHeight(_px(44))
+
+        row_lay.addWidget(te_start); row_lay.addWidget(lbl_to); row_lay.addWidget(te_end)
+        row_lay.addStretch()
+
+        entry = (te_start, te_end, row_widget)
+        self.ma_windows.append(entry)
+        self._wh_container.addWidget(row_widget)
+
+    def _remove_last_wh_window(self):
+        """Remove the last working-hour window row."""
+        if not self.ma_windows:
+            return
+        *keep, last = self.ma_windows
+        self.ma_windows[:] = keep
+        last[-1].setParent(None)
+        last[-1].deleteLater()
+
+    def get_windows(self) -> list:
+        """Return list of window dicts for config serialisation."""
+        result = []
+        for te_start, te_end, _ in self.ma_windows:
+            ts = te_start.time(); te = te_end.time()
+            result.append({
+                "start_hour": ts.hour(), "start_minute": ts.minute(),
+                "end_hour":   te.hour(), "end_minute":   te.minute(),
+            })
+        return result
+
+    def load_windows(self, windows: list):
+        """Rebuild window rows from a saved config list."""
+        for _, _, w in list(self.ma_windows):
+            w.setParent(None); w.deleteLater()
+        self.ma_windows.clear()
+        for win in windows:
+            self._add_wh_window(
+                start_h=int(win.get("start_hour", 9)),
+                start_m=int(win.get("start_minute", 0)),
+                end_h=int(win.get("end_hour", 19)),
+                end_m=int(win.get("end_minute", 0)),
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2358,12 +2209,11 @@ class MainWindow(FluentWindow):
         self.setWindowTitle("Cansa")
         self.resize(1600, 1000)
 
-        self.dashboard_page       = DashboardPage(self)
-        self.filters_page         = FiltersPage(self)
-        self.results_page         = ResultsPage(self)
-        self.settings_page        = SettingsPage(self)
-        self.main_account_page    = MainAccountPage(self)
-        self.working_hours_page   = WorkingHoursPage(self)
+        self.dashboard_page    = DashboardPage(self)
+        self.filters_page      = FiltersPage(self)
+        self.results_page      = ResultsPage(self)
+        self.settings_page     = SettingsPage(self)
+        self.main_account_page = MainAccountPage(self)
 
         self._init_persistent_mirror()
         self._init_nav()
@@ -2373,8 +2223,8 @@ class MainWindow(FluentWindow):
         self._refresh_devices()
         self._sync_ma_slot_combo()     # ensure MA combo matches visible slots
         self._sync_ma_target_lock()    # lock MA-assigned target box on startup
-        self._sync_wh_slots()          # ensure WH page shows correct slot count
         self._reload_blacklist_ui()
+        self._on_schedule_toggled()   # apply enabled/disabled state on load
         self._setup_network_monitor() # start internet connectivity watcher
 
     # ── Persistent mirror panel ───────────────────────────────────────────
@@ -2542,11 +2392,10 @@ class MainWindow(FluentWindow):
 
     # ── Navigation ────────────────────────────────────────────────────────
     def _init_nav(self):
-        self.addSubInterface(self.dashboard_page,      FIF.HOME,      "Dashboard")
-        self.addSubInterface(self.filters_page,        FIF.FILTER,    "Filters & Blacklist")
-        self.addSubInterface(self.results_page,        FIF.COMPLETED, "Results")
-        self.addSubInterface(self.main_account_page,   FIF.HEART,     "Main Account")
-        self.addSubInterface(self.working_hours_page,  FIF.CALENDAR,  "Working Hours")
+        self.addSubInterface(self.dashboard_page,    FIF.HOME,      "Dashboard")
+        self.addSubInterface(self.filters_page,      FIF.FILTER,    "Filters & Blacklist")
+        self.addSubInterface(self.results_page,      FIF.COMPLETED, "Results")
+        self.addSubInterface(self.main_account_page, FIF.HEART,     "Main Account")
         self.addSubInterface(
             self.settings_page, FIF.SETTING, "Settings",
             NavigationItemPosition.BOTTOM
@@ -2665,7 +2514,7 @@ class MainWindow(FluentWindow):
         s = self._content_scale
         pages = [self.dashboard_page, self.filters_page,
                  self.results_page,   self.settings_page,
-                 self.main_account_page, self.working_hours_page]
+                 self.main_account_page]
 
         # Base pt sizes at scale 1.0 (after platform correction)
         base = {
@@ -2829,7 +2678,9 @@ class MainWindow(FluentWindow):
         dp.btn_start.clicked.connect(self._start_scraping)
         dp.btn_stop.clicked.connect(self._stop_all)
         dp.btn_download_summary.clicked.connect(self._download_summary)
-        # (Working Hours signals are on WorkingHoursPage cards directly)
+        dp.chk_schedule.stateChanged.connect(self._on_schedule_toggled)
+        dp.time_start.timeChanged.connect(self._update_schedule_preview)
+        dp.time_end.timeChanged.connect(self._update_schedule_preview)
 
         # Wire already-visible slots and any future slots added via +
         for i in range(dp.active_slot_count()):
@@ -2837,8 +2688,6 @@ class MainWindow(FluentWindow):
         dp.slot_added.connect(self._wire_slot)
         dp.slot_added.connect(self._sync_ma_slot_combo)
         dp.slot_removed.connect(self._sync_ma_slot_combo)
-        dp.slot_added.connect(self._sync_wh_slots)
-        dp.slot_removed.connect(self._sync_wh_slots)
 
         sp.btn_browse_creds.clicked.connect(self._browse_credentials)
         sp.btn_test_sheets.clicked.connect(self._test_sheets)
@@ -2872,26 +2721,8 @@ class MainWindow(FluentWindow):
         ma_slot    = mp.combo_ma_slot.currentData()
         if ma_slot is None:
             ma_slot = 0
-
-        if not hasattr(self, "_ma_target_stash"):
-            self._ma_target_stash: dict = {}   # slot_idx -> saved text
-
         for i, txt in enumerate(dp.target_rows):
             locked = ma_enabled and (i == ma_slot)
-            was_locked = not txt.isEnabled()
-
-            if locked and not was_locked:
-                # Becoming locked — stash existing text and clear it so the
-                # placeholder message is visible
-                self._ma_target_stash[i] = txt.toPlainText()
-                txt.setPlainText("")
-
-            elif not locked and was_locked:
-                # Becoming unlocked — restore previously stashed text
-                saved = self._ma_target_stash.pop(i, "")
-                if saved:
-                    txt.setPlainText(saved)
-
             txt.setEnabled(not locked)
             if locked:
                 txt.setPlaceholderText("Assigned to Main Account — scraping disabled")
@@ -2938,15 +2769,6 @@ class MainWindow(FluentWindow):
         mp.combo_ma_slot.blockSignals(False)
         # Re-evaluate which target box to lock now that slot count may have changed
         self._sync_ma_target_lock()
-
-    def _sync_wh_slots(self, _slot_idx=None):
-        """Show/hide WorkingHoursPage cards to match visible dashboard slots,
-        and refresh all visible card labels from current nicknames."""
-        n  = self.dashboard_page.active_slot_count()
-        wh = self.working_hours_page
-        wh.sync_slots(n)
-        for i in range(n):
-            wh.update_slot_label(i, self._phone_label(i))
 
     def _wire_slot(self, i: int):
         """Connect signals for device row slot i and populate combo_dev from cache.
@@ -3001,17 +2823,92 @@ class MainWindow(FluentWindow):
     # ── Device helpers ────────────────────────────────────────────────────
 
     def _on_nick_changed(self, slot_idx: int):
-        """Called when a phone nickname is edited. Updates the MA slot combo label
-        and the Working Hours card title for that slot in real time."""
-        mp  = self.main_account_page
-        wh  = self.working_hours_page
-        lbl = self._phone_label(slot_idx)
+        """Called when a phone nickname is edited. Updates the corresponding entry
+        in combo_ma_slot in real time without disturbing the current selection.
+        Runs on the main thread (Qt signal), so no locking needed."""
+        mp = self.main_account_page
         item_idx = mp.combo_ma_slot.findData(slot_idx)
         if item_idx >= 0:
-            mp.combo_ma_slot.setItemText(item_idx, lbl)
-        wh.update_slot_label(slot_idx, lbl)
+            mp.combo_ma_slot.setItemText(item_idx, self._phone_label(slot_idx))
 
     # ── Working-hours toggle ──────────────────────────────────────────────
+    def _set_schedule_locked(self, locked: bool):
+        """Lock/unlock the Working Hours card while scraping is active."""
+        dp = self.dashboard_page
+        for w in [dp.chk_schedule, dp.time_start, dp.time_end,
+                  dp._lbl_sched_start, dp._lbl_sched_end, dp._lbl_sched_arrow,
+                  dp.lbl_sched_desc]:
+            w.setEnabled(False if locked else (
+                w is dp.chk_schedule or dp.chk_schedule.isChecked()
+            ))
+
+    def _update_schedule_preview(self, _=None):
+        """Recompute and show when the next window will actually run."""
+        from datetime import datetime, time as dtime, timedelta
+        dp = self.dashboard_page
+        if not dp.chk_schedule.isChecked():
+            dp.lbl_sched_preview.setText("")
+            return
+        ts = dp.time_start.time()
+        te = dp.time_end.time()
+        start_t = dtime(ts.hour(), ts.minute())
+        end_t   = dtime(te.hour(), te.minute())
+        now     = datetime.now()
+
+        if end_t > start_t:
+            duration = timedelta(hours=end_t.hour - start_t.hour,
+                                 minutes=end_t.minute - start_t.minute)
+        else:
+            duration = timedelta(days=1) - timedelta(hours=start_t.hour - end_t.hour,
+                                                      minutes=start_t.minute - end_t.minute)
+
+        # Most recent past start occurrence
+        prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                 second=0, microsecond=0)
+        if prev_start > now:
+            prev_start -= timedelta(days=1)
+        prev_end = prev_start + duration
+
+        # Active only if prev_start >= saved_at AND still inside window
+        # For preview purposes saved_at = "right now" (user is editing live)
+        # so we show active only if the window genuinely started before now
+        # AND would still be running — but since user is editing, treat as
+        # "the moment they finish and click Start" = now.
+        # We show active if prev_start is recent enough that the window is running.
+        # Since we can't know saved_at here, just show the next start always as
+        # the honest answer — user decides.
+        next_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                 second=0, microsecond=0)
+        if next_start <= now:
+            next_start += timedelta(days=1)
+        next_end = next_start + duration
+
+        # Show active only if currently inside window AND prev_start is very recent
+        # (within last 5 minutes) — meaning the window just started and user likely
+        # intended it. Otherwise show next window.
+        in_window = (prev_start <= now < prev_end) and                     ((now - prev_start).total_seconds() <= 300)
+
+        if in_window:
+            dp.lbl_sched_preview.setText(
+                f"▶ Active now — ends {prev_end.strftime('%a %I:%M %p')}"
+            )
+            dp.lbl_sched_preview.setStyleSheet("background: transparent; color: #22c55e;")
+        else:
+            dp.lbl_sched_preview.setText(
+                f"⏳ Next window: {next_start.strftime('%a %I:%M %p')} → {next_end.strftime('%a %I:%M %p')}"
+            )
+            dp.lbl_sched_preview.setStyleSheet("background: transparent; color: #f59e0b;")
+
+    def _on_schedule_toggled(self, _state=None):
+        """Enable/disable time pickers based on the Working Hours checkbox."""
+        dp = self.dashboard_page
+        enabled = dp.chk_schedule.isChecked()
+        for w in [dp.time_start, dp.time_end,
+                  dp._lbl_sched_start, dp._lbl_sched_end, dp._lbl_sched_arrow,
+                  dp.lbl_sched_desc, dp.lbl_sched_preview]:
+            w.setEnabled(enabled)
+        self._update_schedule_preview()
+
     def _refresh_devices(self):
         devices = get_connected_devices()
         self._cached_devices = devices  # cache for new slots added later
@@ -3390,7 +3287,17 @@ class MainWindow(FluentWindow):
         cfg["last_mode"]  = dp.combo_mode.currentText()
         cfg["last_count"] = dp.spin_count.value()
 
-        cfg["per_device_schedule"] = self.working_hours_page.get_schedules()
+        ts = dp.time_start.time()
+        te = dp.time_end.time()
+        cfg["schedule"] = {
+            "enabled":        dp.chk_schedule.isChecked(),
+            "start_hour":     ts.hour(),
+            "start_minute":   ts.minute(),
+            "end_hour":       te.hour(),
+            "end_minute":     te.minute(),
+            "saved_at":       datetime.now().isoformat(),
+
+        }
         cfg["filters"] = {
             "skip_no_bio":              fp.chk_skip_no_bio.isChecked(),
             "skip_private":             fp.chk_skip_private.isChecked(),
@@ -3436,6 +3343,7 @@ class MainWindow(FluentWindow):
         cfg["main_account"] = {
             "enabled":    mp.chk_ma_enabled.isChecked(),
             "phone_slot": mp.combo_ma_slot.currentData() or 0,
+            "working_hours_windows": mp.get_windows(),
             "daily_limit": {
                 "enabled":      mp.chk_dl_enabled.isChecked(),
                 "hours":        mp.sp_dl_hours.value(),
@@ -3462,8 +3370,7 @@ class MainWindow(FluentWindow):
             },
             "feed": {
                 "enabled":            mp.chk_fd_enabled.isChecked(),
-                "num_scrolls_min":    mp.sp_fd_num_scrolls_min.value(),
-                "num_scrolls_max":    mp.sp_fd_num_scrolls_max.value(),
+                "num_scrolls":        mp.sp_fd_num_scrolls.value(),
                 "scroll_min":         mp.sp_fd_scroll_min.value(),
                 "scroll_max":         mp.sp_fd_scroll_max.value(),
                 "like_enabled":       mp.chk_fd_like.isChecked(),
@@ -3473,19 +3380,13 @@ class MainWindow(FluentWindow):
             },
             "reels": {
                 "enabled":            mp.chk_rl_enabled.isChecked(),
-                "num_reels_min":      mp.sp_rl_num_reels_min.value(),
-                "num_reels_max":      mp.sp_rl_num_reels_max.value(),
+                "num_reels":          mp.sp_rl_num_reels.value(),
                 "watch_seconds_min":  mp.sp_rl_wsec_min.value(),
                 "watch_seconds_max":  mp.sp_rl_wsec_max.value(),
                 "like_enabled":       mp.chk_rl_like.isChecked(),
                 "like_pct":           mp.sp_rl_like_pct.value(),
                 "comment_enabled":    mp.chk_rl_comment.isChecked(),
                 "comment_pct":        mp.sp_rl_comment_pct.value(),
-            },
-            "cycle_rest": {
-                "enabled":  mp.chk_cr_enabled.isChecked(),
-                "min":      mp.sp_cr_min.value(),
-                "max":      mp.sp_cr_max.value(),
             },
             "replies": {
                 "spintax_templates":  spintax_lines,
@@ -3534,7 +3435,11 @@ class MainWindow(FluentWindow):
         dp.combo_mode.setCurrentText(c.get("last_mode", "followers"))
         dp.spin_count.setValue(int(c.get("last_count", 100)))
 
-        self.working_hours_page.load_schedules(c.get("per_device_schedule", []))
+        s = c.get("schedule", {})
+        dp.chk_schedule.setChecked(s.get("enabled", False))
+        dp.time_start.setTime(QTime(s.get("start_hour", 8),  s.get("start_minute", 0)))
+        dp.time_end.setTime(QTime(s.get("end_hour",   20),   s.get("end_minute",   0)))
+
 
         f = c.get("filters", {})
         fp.chk_skip_no_bio.setChecked(f.get("skip_no_bio", False))
@@ -3587,6 +3492,7 @@ class MainWindow(FluentWindow):
         idx = mp.combo_ma_slot.findData(slot)
         if idx >= 0:
             mp.combo_ma_slot.setCurrentIndex(idx)
+        mp.load_windows(ma.get("working_hours_windows", []))
 
         dl = ma.get("daily_limit", {})
         mp.chk_dl_enabled.setChecked(dl.get("enabled", False))
@@ -3619,8 +3525,7 @@ class MainWindow(FluentWindow):
         mp.chk_fd_enabled.setChecked(fd.get("enabled", False))
         mp.sp_fd_scroll_min.setValue(float(fd.get("scroll_min", 1.5)))
         mp.sp_fd_scroll_max.setValue(float(fd.get("scroll_max", 4.0)))
-        mp.sp_fd_num_scrolls_min.setValue(int(fd.get("num_scrolls_min", 5)))
-        mp.sp_fd_num_scrolls_max.setValue(int(fd.get("num_scrolls_max", 10)))
+        mp.sp_fd_num_scrolls.setValue(int(fd.get("num_scrolls", 10)))
         mp.chk_fd_like.setChecked(fd.get("like_enabled", True))
         mp.sp_fd_like_pct.setValue(int(fd.get("like_pct", 40)))
         mp.chk_fd_comment.setChecked(fd.get("comment_enabled", False))
@@ -3628,21 +3533,13 @@ class MainWindow(FluentWindow):
 
         rl = ma.get("reels", {})
         mp.chk_rl_enabled.setChecked(rl.get("enabled", False))
-        mp.sp_rl_num_reels_min.setValue(int(rl.get("num_reels_min", 5)))
-        mp.sp_rl_num_reels_max.setValue(int(rl.get("num_reels_max", 10)))
+        mp.sp_rl_num_reels.setValue(int(rl.get("num_reels", 10)))
         mp.sp_rl_wsec_min.setValue(float(rl.get("watch_seconds_min", 5.0)))
         mp.sp_rl_wsec_max.setValue(float(rl.get("watch_seconds_max", 15.0)))
         mp.chk_rl_like.setChecked(rl.get("like_enabled", True))
         mp.sp_rl_like_pct.setValue(int(rl.get("like_pct", 30)))
         mp.chk_rl_comment.setChecked(rl.get("comment_enabled", False))
         mp.sp_rl_comment_pct.setValue(int(rl.get("comment_pct", 5)))
-
-        cr = ma.get("cycle_rest", {})
-        mp.chk_cr_enabled.setChecked(cr.get("enabled", True))
-        mp.sp_cr_min.setValue(float(cr.get("min", 30.0)))
-        mp.sp_cr_max.setValue(float(cr.get("max", 90.0)))
-        mp.sp_cr_min.setEnabled(cr.get("enabled", True))
-        mp.sp_cr_max.setEnabled(cr.get("enabled", True))
 
         rp = ma.get("replies", {})
         mp.txt_spintax.setPlainText("\n".join(rp.get("spintax_templates", [])))
@@ -3754,32 +3651,14 @@ class MainWindow(FluentWindow):
         # Store metadata needed to restart a single phone after error
         self._phone_meta: dict = {}   # row_idx -> {serial, port, targets, cfg}
         self._serial_to_port  = serial_to_port
-
-        # Determine MA slot upfront so we can exclude it from scraping tracking
-        mp = self.main_account_page
-        ma_slot = (mp.combo_ma_slot.currentData() or 0) if mp.chk_ma_enabled.isChecked() else None
-
         # Track which phone slots are actively scraping so the MA slot combo
         # can gray them out immediately (before worker threads actually exit).
-        # Explicitly exclude the MA slot — it is not a scraping phone.
-        self._active_scraping_slots: set = {
-            row_idx for row_idx, _ in assigned if row_idx != ma_slot
-        }
+        self._active_scraping_slots: set = {row_idx for row_idx, _ in assigned}
 
         # Start session summary tracking
-        phone_labels = {row_idx: self._phone_label(row_idx) for row_idx, _ in assigned if row_idx != ma_slot}
+        phone_labels = {row_idx: self._phone_label(row_idx) for row_idx, _ in assigned}
         start_session(phone_labels)
-        # Init scraping counts for scraping phones only; MA phone handled separately
-        self._phone_session_counts: dict = {row_idx: 0 for row_idx, _ in assigned if row_idx != ma_slot}
-
-        # If Main Account is active, include it in the summary with a distinct label
-        if mp.chk_ma_enabled.isChecked():
-            self._ma_slot_for_summary = ma_slot
-        else:
-            self._ma_slot_for_summary = None
-
-        # Render initial summary label
-        self._refresh_summary_label()
+        self._phone_session_counts: dict = {row_idx: 0 for row_idx, _ in assigned}
 
         rp = self.results_page
         rp.table.setRowCount(0)
@@ -3801,6 +3680,7 @@ class MainWindow(FluentWindow):
 
         self.dashboard_page.btn_start.setEnabled(False)
         self.dashboard_page.btn_stop.setEnabled(True)
+        self._set_schedule_locked(True)
         self.dashboard_page.lbl_overall_status.setText(f"Running ({len(assigned)} phones)…")
         self.stackedWidget.setCurrentWidget(self.results_page)
 
@@ -3910,7 +3790,7 @@ class MainWindow(FluentWindow):
         if comment_anywhere and not has_text:
             InfoBar.warning(
                 "No Comment Templates",
-                "Commenting is enabled but no spintax templates. "
+                "Commenting is enabled but no spintax templates or OpenAI key configured. "
                 "Add templates or disable commenting.",
                 isClosable=True, duration=7000, parent=self,
             )
@@ -4014,7 +3894,7 @@ class MainWindow(FluentWindow):
     def _stop_main_account(self):
         if self._ma_worker and self._ma_worker.isRunning():
             self._ma_worker.stop()
-            self._log_ma("⏹️ Main Account stop requested…")
+            self._log("⏹️ Main Account stop requested…")
         mp = self.main_account_page
         mp.btn_ma_stop.setEnabled(False)
 
@@ -4085,28 +3965,10 @@ class MainWindow(FluentWindow):
         rp = self.results_page
         if phone_idx < len(rp.phone_status_labels):
             rp.phone_status_labels[phone_idx].setText(f"{label}: {session_count} scraped")
-        self._refresh_summary_label()
-
-    def _refresh_summary_label(self):
-        """Rebuild the 'This session — …' summary label on the dashboard.
-        Scraping phones show their count; the MA phone shows 'Main Account'."""
-        dp     = self.dashboard_page
-        parts  = []
-        counts = getattr(self, "_phone_session_counts", {})
-        ma_slot = getattr(self, "_ma_slot_for_summary", None)
-
-        # All scraping phones
-        for i, cnt in counts.items():
-            parts.append(f"{self._phone_label(i)}: {cnt}")
-
-        # MA phone (if active) — shown separately with a clear label
-        if ma_slot is not None and ma_slot not in counts:
-            parts.append(f"{self._phone_label(ma_slot)}: Main Account")
-
-        if parts:
-            dp.lbl_summary_info.setText("This session — " + " | ".join(parts))
-        else:
-            dp.lbl_summary_info.setText("No sessions run yet.")
+        # Refresh summary card on dashboard
+        dp    = self.dashboard_page
+        parts = [f"{self._phone_label(i)}: {cnt}" for i, cnt in self._phone_session_counts.items()]
+        dp.lbl_summary_info.setText("This session — " + " | ".join(parts))
 
     # ── Worker callbacks ──────────────────────────────────────────────────
     def _on_account(self, acc: dict):
@@ -4325,6 +4187,7 @@ class MainWindow(FluentWindow):
     def _reset_ui_after_done(self):
         self.dashboard_page.btn_start.setEnabled(True)
         self.dashboard_page.btn_stop.setEnabled(False)
+        self._set_schedule_locked(False)
         self.dashboard_page.lbl_overall_status.setText(f"Done — {self._collected} collected")
         self.results_page.lbl_progress.setText(f"Done: {self._collected} total accounts")
         # Disable all individual stop buttons

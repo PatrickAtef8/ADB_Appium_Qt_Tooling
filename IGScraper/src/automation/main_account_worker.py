@@ -127,6 +127,61 @@ def _seconds_until_next_window(windows: List[dict]) -> float:
     return min(candidates) if candidates else 3600.0
 
 
+def _schedule_duration(schedule: dict):
+    """Return timedelta duration of the single schedule window."""
+    start_t = dtime(int(schedule["start_hour"]), int(schedule["start_minute"]))
+    end_t   = dtime(int(schedule["end_hour"]),   int(schedule["end_minute"]))
+    if end_t > start_t:
+        return timedelta(hours=end_t.hour - start_t.hour,
+                         minutes=end_t.minute - start_t.minute)
+    return timedelta(days=1) - timedelta(hours=start_t.hour - end_t.hour,
+                                         minutes=start_t.minute - end_t.minute)
+
+
+def _in_schedule_window(schedule: dict) -> bool:
+    """Return True if now is inside the configured time window.
+
+    saved_at is used only to reject windows that had already ENDED before
+    the config was saved (stale past occurrence). If now is genuinely inside
+    the window (prev_start <= now < prev_end) we are active regardless of
+    when the config was saved — handles second runs that start mid-window.
+    Mirrors PhoneWorker._in_schedule_window exactly.
+    """
+    now     = datetime.now()
+    start_t = dtime(int(schedule["start_hour"]), int(schedule["start_minute"]))
+
+    prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                              second=0, microsecond=0)
+    if prev_start > now:
+        prev_start -= timedelta(days=1)
+
+    prev_end = prev_start + _schedule_duration(schedule)
+
+    # Not inside the window at all
+    if not (prev_start <= now < prev_end):
+        return False
+
+    # Inside the window — reject only if the window ended before config was saved
+    saved_at_str = schedule.get("saved_at", "")
+    try:
+        saved_at = datetime.fromisoformat(saved_at_str)
+    except (ValueError, TypeError):
+        saved_at = datetime.min
+
+    return not (prev_end <= saved_at)
+
+
+def _next_schedule_window(schedule: dict) -> datetime:
+    """Return the next future window start datetime."""
+    now     = datetime.now()
+    start_t = dtime(int(schedule["start_hour"]), int(schedule["start_minute"]))
+    win_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                             second=0, microsecond=0)
+    if win_start <= now:
+        win_start += timedelta(days=1)
+    return win_start
+
+
 # ── Signals ────────────────────────────────────────────────────────────────────
 
 class MainAccountSignals(QObject):
@@ -212,6 +267,19 @@ class MainAccountWorker(QThread):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and not self._stop_flag:
             time.sleep(min(0.5, deadline - time.monotonic()))
+            # Check working hours mid-sleep — stop ONLY if we were inside the
+            # window and it has now ended. _entered_window is set to True by the
+            # outer loop when it detects we are inside the window and proceeds
+            # with activities. This prevents firing when we're still waiting for
+            # the window to start (outside-before-start).
+            sched = getattr(self, "_active_schedule", None)
+            if (sched and sched.get("enabled")
+                    and getattr(self, "_entered_window", False)
+                    and not _in_schedule_window(sched)):
+                end_t = dtime(int(sched["end_hour"]), int(sched["end_minute"]))
+                self._log(f"⏰ Working hours ended ({end_t:%H:%M}). Stopping.")
+                self._stop_flag = True
+                break
 
     # ── Main thread entry ──────────────────────────────────────────────────────
 
@@ -228,7 +296,16 @@ class MainAccountWorker(QThread):
         feed_cfg   = ma.get("feed",    {})
         reels_cfg  = ma.get("reels",   {})
         reply_cfg  = ma.get("replies", {})
-        windows    = ma.get("working_hours_windows", [])
+
+        # Per-device schedule from Working Hours tab (same format as scraper schedule).
+        # Falls back to the legacy working_hours_windows list if the new key is absent.
+        per_device = cfg.get("per_device_schedule", [])
+        if self.phone_index < len(per_device) and per_device[self.phone_index].get("enabled"):
+            _schedule = per_device[self.phone_index]
+        else:
+            _schedule = {}   # no schedule → run 24/7
+        self._active_schedule = _schedule   # expose to _sleep for mid-sleep enforcement
+        self._entered_window  = False        # set True once we first run inside the window
 
         dl_cfg      = ma.get("daily_limit", {})
         dl_enabled  = dl_cfg.get("enabled", False)
@@ -266,18 +343,31 @@ class MainAccountWorker(QThread):
 
             while not self._stop_flag:
                 # ── Working hours check ──────────────────────────────────────
-                if windows:
-                    if not _in_any_window(windows):
-                        secs = _seconds_until_next_window(windows)
+                if _schedule.get("enabled"):
+                    if not _in_schedule_window(_schedule):
+                        start_t = dtime(int(_schedule["start_hour"]),
+                                        int(_schedule["start_minute"]))
+                        end_t   = dtime(int(_schedule["end_hour"]),
+                                        int(_schedule["end_minute"]))
+                        win_start = _next_schedule_window(_schedule)
                         self._log(
-                            f"⏰ Outside working hours. "
-                            f"Next window in {secs/60:.1f} min. Sleeping…"
+                            f"⏰ Outside working hours "
+                            f"({start_t:%H:%M}–{end_t:%H:%M}). "
+                            f"Next window: {win_start.strftime('%a %I:%M %p')}. Waiting…"
                         )
                         self._status("waiting for window")
-                        self._sleep(min(secs, 60))
+                        try:
+                            driver.press_keycode(3)
+                        except Exception:
+                            pass
+                        self._sleep(60)
                         continue
 
                 # ── Midnight reset + daily limit check ───────────────────────
+                # We passed the working hours check — mark that we entered the window
+                # so _sleep knows to stop if the window ends mid-activity.
+                if _schedule.get("enabled"):
+                    self._entered_window = True
                 _today = datetime.now().date()
                 if _today != _last_date:
                     # New day — reset counter
@@ -323,6 +413,13 @@ class MainAccountWorker(QThread):
                 if self._stop_flag:
                     break
 
+                # ── Bring Instagram to foreground before each activity ────
+                try:
+                    driver.activate_app("com.instagram.android")
+                    self._sleep(2)
+                except Exception:
+                    pass
+
                 # ── Stories ──────────────────────────────────────────────────
                 if story_cfg.get("enabled", True):
                     self._status("watching stories")
@@ -331,7 +428,7 @@ class MainAccountWorker(QThread):
                         self._do_stories(driver, story_cfg, reply_cfg, openai_key, spintax_pool)
                     except Exception as e:
                         if self._is_connection_error(e):
-                            self._log(f"⚠️ Appium connection lost during stories: {e}")
+                            self._log(f"⚠️ Appium connection lost during stories: {str(e).splitlines()[0]}")
                             if self._reconnect_appium():
                                 driver = self._controller.driver
                                 continue
@@ -361,7 +458,7 @@ class MainAccountWorker(QThread):
                         self._do_feed(driver, feed_cfg, reply_cfg, openai_key, spintax_pool)
                     except Exception as e:
                         if self._is_connection_error(e):
-                            self._log(f"⚠️ Appium connection lost during feed: {e}")
+                            self._log(f"⚠️ Appium connection lost during feed: {str(e).splitlines()[0]}")
                             if self._reconnect_appium():
                                 driver = self._controller.driver
                                 continue
@@ -391,7 +488,7 @@ class MainAccountWorker(QThread):
                         self._do_reels(driver, reels_cfg, reply_cfg, openai_key, spintax_pool)
                     except Exception as e:
                         if self._is_connection_error(e):
-                            self._log(f"⚠️ Appium connection lost during reels: {e}")
+                            self._log(f"⚠️ Appium connection lost during reels: {str(e).splitlines()[0]}")
                             if self._reconnect_appium():
                                 driver = self._controller.driver
                                 continue
@@ -413,11 +510,36 @@ class MainAccountWorker(QThread):
                         f"Remaining: {h_rem}h {m_rem:02d}m"
                     )
 
-                # ── Short rest before next cycle ─────────────────────────────
-                cycle_rest = random.uniform(30, 90)
+                # ── Cycle rest (or stop if disabled) ──────────────────────────
+                cr_cfg     = ma.get("cycle_rest", {})
+                cr_enabled = cr_cfg.get("enabled", True)
+                if not cr_enabled:
+                    self._log("✅ All engagements done — cycle rest disabled, stopping.")
+                    break
+                cr_min     = float(cr_cfg.get("min", 30))
+                cr_max     = float(cr_cfg.get("max", 90))
+                cycle_rest = random.uniform(cr_min, cr_max)
                 self._log(f"😴 Cycle rest {cycle_rest:.0f}s…")
+                # Press Home to background Instagram during rest — same as long rest in stories
+                try:
+                    driver.press_keycode(3)
+                except Exception:
+                    pass
                 self._sleep(cycle_rest)
+                # Bring Instagram back to foreground before next cycle
+                try:
+                    driver.activate_app("com.instagram.android")
+                    self._sleep(2.0)
+                except Exception:
+                    pass
+                # Wait for UiAutomator2 to be responsive after long background —
+                # Android may have killed the instrumentation process during the rest.
+                self._wait_for_uiautomator(driver)
 
+            try:
+                driver.press_keycode(3)
+            except Exception:
+                pass
             self.signals.finished.emit()
 
         except Exception as exc:
@@ -426,6 +548,12 @@ class MainAccountWorker(QThread):
             )
         finally:
             if self._controller:
+                try:
+                    # Press Home to leave Instagram before closing the session
+                    # (mimics a real user minimising the app)
+                    self._controller.driver.press_keycode(3)
+                except Exception:
+                    pass
                 try:
                     self._controller.stop_session()
                 except Exception:
@@ -470,9 +598,25 @@ class MainAccountWorker(QThread):
         seen_usernames: set = set()  # kept only for logging clarity, not for blocking
 
         try:
-            # ── Go home and pull-to-refresh the feed ──────────────────────────
+            # ── Go home, scroll to top, then pull-to-refresh ─────────────────
             self._go_home(driver)
             self._sleep(1.5)
+            # Scroll to top first — feed may be scrolled down from a previous
+            # session, pushing the story tray off-screen so the tray scan
+            # finds nothing even though stories are available.
+            try:
+                size = driver.get_window_size()
+                # Tap the Home tab again to jump to top (Instagram scrolls to
+                # top when you tap the active Home tab, same as most apps)
+                home_btn = driver.find_elements(
+                    __import__('appium').webdriver.common.appiumby.AppiumBy.XPATH,
+                    '//*[contains(@resource-id,"feed_tab")]',
+                )
+                if home_btn:
+                    home_btn[0].click()
+                    self._sleep(1.0)
+            except Exception:
+                pass
             # Pull-to-refresh: swipe down from top of feed to force tray reload
             try:
                 size = driver.get_window_size()
@@ -485,7 +629,7 @@ class MainAccountWorker(QThread):
                 pass
             self._sleep(2.0)
 
-            refreshed_once = True  # already refreshed at start
+            refreshed_once = False  # will be set True only after a retry-refresh
 
             for cycle_idx in range(num_cycles):
                 if self._stop_flag:
@@ -522,6 +666,26 @@ class MainAccountWorker(QThread):
 
                     watch_s       = random.uniform(watch_s_min, watch_s_max)
                     auto_advanced = False
+
+                    # ── Classify current screen (one page_source round-trip) ────
+                    screen = self._classify_story_screen(driver)
+
+                    if screen == "sponsored":
+                        self._log("    ⏭️ Sponsored story — skipping")
+                        self._advance_story(driver)
+                        self._sleep(random.uniform(0.4, 0.8))
+                        continue   # re-classify on next iteration
+
+                    if screen == "suggestions":
+                        self._log("    ⏭️ Suggestions page — skipping")
+                        self._dismiss_suggestions(driver)
+                        self._sleep(random.uniform(0.6, 1.0))
+                        continue   # re-classify on next iteration
+
+                    if screen != "story":
+                        # Not on any story screen — tray ended or drifted
+                        break
+
                     self._log(f"    👁️ Story {stories_watched+1}/{num_stories} — watching {watch_s:.1f}s")
 
                     # ── Engage immediately on story open ────────────────────────
@@ -533,8 +697,6 @@ class MainAccountWorker(QThread):
                         self._story_reply(driver, spintax_pool, openai_key, reply_cfg)
 
                     stories_watched += 1
-                    # Engagement done — no post-engage polling needed.
-                    # Composer dismisses automatically. Proceed to watch loop.
 
                     # ── Watch polling loop ──────────────────────────────────────
                     elapsed = 0.0
@@ -543,40 +705,53 @@ class MainAccountWorker(QThread):
                         self._sleep(poll)
                         elapsed += poll
 
-                        if self._is_suggestions_page(driver):
-                            self._log("⚠️ Suggestions page — pressing back")
-                            try:
-                                driver.back()
-                            except Exception:
-                                pass
-                            # Wait up to 2s for story screen to return
-                            for _ in range(4):
-                                self._sleep(0.5)
-                                if self._is_on_story_screen(driver):
-                                    break
-                            else:
-                                auto_advanced = True
+                        screen_mid = self._classify_story_screen(driver)
+
+                        if screen_mid == "sponsored":
+                            self._log("    ⏭️ Sponsored story appeared mid-watch — skipping")
+                            self._advance_story(driver)
+                            self._sleep(random.uniform(0.4, 0.8))
+                            auto_advanced = True
                             break
 
-                        if not self._is_on_story_screen(driver):
-                            # Instagram auto-advanced to next story
+                        if screen_mid == "suggestions":
+                            self._log("    ⏭️ Suggestions page appeared mid-watch — skipping")
+                            self._dismiss_suggestions(driver)
+                            self._sleep(random.uniform(0.6, 1.0))
+                            auto_advanced = True
+                            break
+
+                        if screen_mid != "story":
+                            # Instagram auto-advanced to next story or tray ended
                             auto_advanced = True
                             break
 
                     if auto_advanced:
-                        # Instagram moved on by itself — the next story is already
-                        # showing. Don't force-advance; loop continues naturally
-                        # and will engage+watch the new current story.
-                        continue
+                        # Re-classify after any advance — catches sponsored/suggestions
+                        # that appeared AFTER we advanced, or after Instagram auto-advanced.
+                        screen_after = self._classify_story_screen(driver)
+                        if screen_after == "sponsored":
+                            self._log("    ⏭️ Sponsored story — skipping")
+                            self._advance_story(driver)
+                            self._sleep(random.uniform(0.4, 0.8))
+                            continue
+                        if screen_after == "suggestions":
+                            self._log("    ⏭️ Suggestions page — skipping")
+                            self._dismiss_suggestions(driver)
+                            self._sleep(random.uniform(0.6, 1.0))
+                            continue
+                        if screen_after != "story":
+                            break   # tray ended
+                        continue    # normal story — outer loop re-classifies
 
                     # Force-advance to next story
-                    if self._is_on_story_screen(driver):
+                    if self._classify_story_screen(driver) == "story":
                         self._advance_story(driver)
                         self._sleep(random.uniform(0.4, 0.9))
 
-                    # Check if we're still on a story after advancing
-                    if not self._is_on_story_screen(driver):
-                        # End of this person's stories or drifted
+                    # After force-advance — only break if fully off story viewer
+                    # (sponsored/suggestions handled on next iteration)
+                    if self._classify_story_screen(driver) not in ("story", "sponsored", "suggestions"):
                         break
 
                 # Return to home feed correctly depending on exit reason
@@ -599,10 +774,25 @@ class MainAccountWorker(QThread):
 
             rest_long = random.uniform(rest_l_min, rest_l_max)
             self._log(f"😴 Long rest {rest_long:.0f}s after story session…")
+            # Press Home to background Instagram during the long rest — human behaviour.
+            try:
+                driver.press_keycode(3)
+            except Exception:
+                pass
             self._sleep(rest_long)
+            # Bring Instagram back to foreground before the next phase.
+            try:
+                driver.activate_app("com.instagram.android")
+                self._sleep(2.0)
+            except Exception:
+                pass
+            # Wait for UiAutomator2 to be responsive after long background.
+            self._wait_for_uiautomator(driver)
             self._log("✅ Stories session complete.")
 
         except Exception as exc:
+            if self._is_connection_error(exc):
+                raise  # let outer loop handle reconnect
             self._log(f"⚠️ Stories error: {exc}")
             try:
                 driver.back()
@@ -648,37 +838,109 @@ class MainAccountWorker(QThread):
         except Exception:
             return False
 
-    def _is_suggestions_page(self, driver) -> bool:
+    def _classify_story_screen(self, driver) -> str:
         """
-        Detect the 'Suggested accounts' interstitial that appears mid-story tray.
-        ⚠️ STUB — replace IDs once story_suggestions.xml is provided.
+        Fetch page_source ONCE and classify the current screen.
+        Returns one of: 'story', 'sponsored', 'suggestions', 'other'
+        Using page_source is one round-trip instead of 3 × find_elements.
+        Confirmed markers from client-provided XMLs:
+          sponsored  → reel_viewer_subtitle text="Sponsored"
+                       OR reel_viewer_header content-desc contains "sponsored story"
+          suggestions→ netego_su_title  (resource-id)
+                       OR netego_toolbar (resource-id)
+                       OR text "Suggested for you"
+          story      → message_composer_container OR toolbar_like_button
+                       OR reel_viewer_progress (excludes sponsored/suggestions)
+        """
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            return "other"
+
+        # Sponsored — check subtitle text and header content-desc
+        if (
+            'resource-id="com.instagram.android:id/reel_viewer_subtitle"' in src
+            and 'text="Sponsored"' in src
+        ) or "sponsored story" in src.lower():
+            return "sponsored"
+
+        # Suggestions — unique resource-ids only present on suggestions card
+        if (
+            "com.instagram.android:id/netego_su_title" in src
+            or "com.instagram.android:id/netego_toolbar" in src
+            or 'text="Suggested for you"' in src
+        ):
+            return "suggestions"
+
+        # Normal story screen
+        if (
+            "com.instagram.android:id/message_composer_container" in src
+            or "com.instagram.android:id/toolbar_like_button" in src
+            or "com.instagram.android:id/reel_viewer_progress" in src
+        ):
+            return "story"
+
+        return "other"
+
+    def _is_sponsored_story(self, driver) -> bool:
+        """
+        Detect if the current story is Sponsored.
+        Confirmed from XML: reel_viewer_subtitle text="Sponsored"
         """
         from appium.webdriver.common.appiumby import AppiumBy
-        SUGGESTION_MARKERS = [
-            "com.instagram.android:id/follow_list_container",
-            "com.instagram.android:id/suggested_users_container",
-            "com.instagram.android:id/end_of_feed_demarcator",
-        ]
-        SUGGESTION_DESCS = ["Suggested for you", "See All"]
         try:
-            for rid in SUGGESTION_MARKERS:
-                if driver.find_elements(AppiumBy.ID, rid):
-                    return True
-            for desc in SUGGESTION_DESCS:
-                if driver.find_elements(AppiumBy.XPATH, f'//*[@content-desc="{desc}"]'):
-                    return True
+            if driver.find_elements(
+                AppiumBy.XPATH,
+                '//*[@resource-id="com.instagram.android:id/reel_viewer_subtitle" '
+                'and @text="Sponsored"]'
+            ):
+                return True
+            if driver.find_elements(
+                AppiumBy.XPATH,
+                '//*[@resource-id="com.instagram.android:id/reel_viewer_header" '
+                'and contains(@content-desc, "sponsored story")]'
+            ):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _is_suggestions_page(self, driver) -> bool:
+        """
+        Detect the 'Suggested for you' interstitial that appears mid-story tray.
+        Confirmed from XML: netego_su_title text="Suggested for you"
+        """
+        from appium.webdriver.common.appiumby import AppiumBy
+        try:
+            if driver.find_elements(AppiumBy.ID, "com.instagram.android:id/netego_su_title"):
+                return True
+            if driver.find_elements(AppiumBy.ID, "com.instagram.android:id/netego_toolbar"):
+                return True
         except Exception:
             pass
         return False
 
     def _is_connection_error(self, exc: Exception) -> bool:
-        """Return True if exception indicates Appium server is unreachable."""
+        """Return True if exception indicates Appium server is unreachable
+        or the UiAutomator2 instrumentation process has crashed on the device."""
         msg = str(exc).lower()
-        return any(k in msg for k in (
+        cls = type(exc).__name__.lower()
+        keywords = (
             "connection refused", "max retries exceeded",
             "failed to establish", "remotedisconnected",
             "session not found", "no such session",
-        ))
+            "session is either terminated",
+            "nosuchdrivererror", "invalidsessionid",
+            # UiAutomator2 instrumentation crash (device-side crash)
+            "instrumentation process is not running",
+            "cannot be proxied to uiautomator2",
+        )
+        return (
+            any(k in msg for k in keywords)
+            or "nosuchdriver" in cls
+            or "invalidsession" in cls
+            or "invalidcontext" in cls
+        )
 
     def _reconnect_appium(self) -> bool:
         """
@@ -699,16 +961,28 @@ class MainAccountWorker(QThread):
             return False
 
     def _recover_to_home(self, driver):
-        """Press Back up to 5 times until reels_tray_container is visible."""
+        """Press Back up to 5 times until home feed is confirmed."""
         from appium.webdriver.common.appiumby import AppiumBy
-        for _ in range(5):
+
+        def _on_home() -> bool:
             try:
                 if driver.find_elements(
                     AppiumBy.XPATH, '//*[@content-desc="reels_tray_container"]'
                 ):
-                    return
+                    return True
+                # Feed scrolled down — tray off-screen but Home tab still selected
+                if driver.find_elements(
+                    AppiumBy.XPATH,
+                    '//*[contains(@resource-id,"feed_tab") and @selected="true"]',
+                ):
+                    return True
+                return False
             except Exception:
-                pass
+                return False
+
+        for _ in range(5):
+            if _on_home():
+                return
             try:
                 driver.back()
                 self._sleep(1.0)
@@ -980,7 +1254,33 @@ class MainAccountWorker(QThread):
             return spin(random.choice(spintax_pool))
         return ""
 
+    def _dismiss_suggestions(self, driver):
+        """
+        Advance past the 'Suggested for you' interstitial card.
+
+        From suggestion.xml the story viewer (reel_viewer_root) is still fully
+        active behind the card — same structure as a sponsored story.  The card
+        occupies x: 200-1240 on a 1440-wide screen; everything outside that
+        band is the bare reel_viewer_root background.
+
+        Tapping at x~94% (right of the card edge at 1240, clear of all
+        clickable children) registers on reel_viewer_root and advances to the
+        next story — identical behaviour to _advance_story() on sponsored.
+
+        driver.back() must NOT be used: it exits the story viewer entirely.
+        """
+        try:
+            size = driver.get_window_size()
+            # x=94% => ~1354px on a 1440 device — right of card right-edge (1240)
+            # y=50% is mid-screen, clear of the netego_toolbar at the bottom
+            x = int(size["width"] * 0.94)
+            y = size["height"] // 2
+            driver.tap([(x, y)])
+        except Exception:
+            pass
+
     def _advance_story(self, driver):
+        """Tap the right side of the screen to advance to the next story."""
         try:
             size = driver.get_window_size()
             x = int(size["width"] * 0.85)
@@ -1122,12 +1422,13 @@ class MainAccountWorker(QThread):
         React removed — only Like and Comment supported for feed.
         """
         from appium.webdriver.common.appiumby import AppiumBy
-        self._log("📰 Browsing feed…")
         try:
             self._go_home(driver)
             self._sleep(2)
 
-            num_scrolls = int(feed_cfg.get("num_scrolls", 10))
+            num_scrolls_min = int(feed_cfg.get("num_scrolls_min", 5))
+            num_scrolls_max = int(feed_cfg.get("num_scrolls_max", 10))
+            num_scrolls = random.randint(num_scrolls_min, num_scrolls_max)
             scroll_min  = float(feed_cfg.get("scroll_min", 1.5))
             scroll_max  = float(feed_cfg.get("scroll_max", 4.0))
             like_on     = feed_cfg.get("like_enabled", True)
@@ -1135,10 +1436,17 @@ class MainAccountWorker(QThread):
             comment_on  = feed_cfg.get("comment_enabled", False)
             comment_pct = float(feed_cfg.get("comment_pct", 5)) / 100.0
 
+            self._log(f"📰 Browsing feed ({num_scrolls} scrolls)…")
+
             engaged_posts: set = set()
             scrolls_done  = 0
 
             while scrolls_done < num_scrolls and not self._stop_flag:
+                if not self._is_on_feed(driver):
+                    self._log("⚠️ Drifted from home feed — returning home and resuming…")
+                    self._go_home(driver)
+                    self._sleep(1.5)
+
                 post_id = self._get_current_post_id(driver)
 
                 if post_id and post_id in engaged_posts:
@@ -1163,7 +1471,59 @@ class MainAccountWorker(QThread):
 
             self._log(f"✅ Feed session done ({scrolls_done} scrolls).")
         except Exception as exc:
+            if self._is_connection_error(exc):
+                raise
             self._log(f"⚠️ Feed error: {exc}")
+
+    def _is_on_feed(self, driver) -> bool:
+        """
+        Return True if the home feed is currently active.
+        Uses feed_tab selected="true" — always in the nav bar hierarchy
+        regardless of how far the feed is scrolled, so it correctly detects
+        the feed even when the story tray is off-screen.
+        Also returns True when the comment sheet is open (it sits on top of
+        the feed — feed_tab may not be selected while the sheet is visible).
+        """
+        from appium.webdriver.common.appiumby import AppiumBy
+        try:
+            # Comment sheet open — we are still on the feed
+            if driver.find_elements(
+                AppiumBy.ID,
+                "com.instagram.android:id/layout_comment_thread_parent",
+            ):
+                return True
+            feed_tab_els = driver.find_elements(
+                AppiumBy.XPATH,
+                '//*[contains(@resource-id,"feed_tab")]',
+            )
+            if feed_tab_els:
+                return feed_tab_els[0].get_attribute("selected") == "true"
+            return False
+        except Exception:
+            return True  # assume still on feed on error — don't interrupt unnecessarily
+
+    def _is_on_reels(self, driver) -> bool:
+        """
+        Return True if the Reels tab is currently active.
+        Uses clips_tab selected="true" — always in the nav bar hierarchy
+        regardless of what reel is playing.
+        Also returns True when the comment sheet is open (it sits on top of
+        the reel — clips_tab may not be selected while the sheet is visible).
+        """
+        from appium.webdriver.common.appiumby import AppiumBy
+        try:
+            # Comment sheet open — we are still on reels
+            if driver.find_elements(
+                AppiumBy.ID,
+                "com.instagram.android:id/layout_comment_thread_parent",
+            ):
+                return True
+            return bool(driver.find_elements(
+                AppiumBy.XPATH,
+                '//*[contains(@resource-id,"clips_tab") and @selected="true"]',
+            ))
+        except Exception:
+            return True  # assume still on reels on error — don't interrupt unnecessarily
 
     def _feed_like_visible(self, driver):
         """
@@ -1228,6 +1588,12 @@ class MainAccountWorker(QThread):
                 self._close_comment_sheet(driver)
                 return
 
+            # Check enabled before doing anything — disabled means comments are
+            # limited on this post (confirmed from XML: enabled="false" on edittext)
+            if edittext_els[0].get_attribute("enabled") == "false":
+                self._close_comment_sheet(driver)
+                return  # silent skip — not an error, post just has comments limited
+
             # Click to focus — this invalidates the element reference (DOM re-renders)
             edittext_els[0].click()
             self._sleep(0.5)
@@ -1258,6 +1624,8 @@ class MainAccountWorker(QThread):
             self._log(f"  💬 Feed comment posted: {text[:40]}")
 
         except Exception as e:
+            if self._is_connection_error(e):
+                raise   # let outer loop handle reconnect
             self._log(f"  ⚠️ Comment error: {e}")
 
         finally:
@@ -1271,6 +1639,7 @@ class MainAccountWorker(QThread):
         Polls layout_comment_thread_parent disappearance (max 3 attempts).
         """
         from appium.webdriver.common.appiumby import AppiumBy
+
         for _ in range(3):
             try:
                 sheet = driver.find_elements(
@@ -1377,6 +1746,11 @@ class MainAccountWorker(QThread):
                 self._close_comment_sheet(driver)
                 return
 
+            # Comments limited on this reel — edittext disabled, skip silently
+            if edittext_els[0].get_attribute("enabled") == "false":
+                self._close_comment_sheet(driver)
+                return
+
             edittext_els[0].click()
             self._sleep(0.5)
 
@@ -1406,6 +1780,8 @@ class MainAccountWorker(QThread):
             self._log(f"  💬 Reel comment posted: {text[:40]}")
 
         except Exception as e:
+            if self._is_connection_error(e):
+                raise   # let outer loop handle reconnect
             self._log(f"  ⚠️ Reel comment error: {e}")
         finally:
             if comment_sheet_opened:
@@ -1415,12 +1791,13 @@ class MainAccountWorker(QThread):
 
     def _do_reels(self, driver, reels_cfg: dict, reply_cfg: dict,
                   openai_key: str, spintax_pool: list):
-        self._log("🎬 Watching Reels…")
         try:
             self._go_reels(driver)
             self._sleep(2)
 
-            num_reels   = int(reels_cfg.get("num_reels", 10))
+            num_reels_min = int(reels_cfg.get("num_reels_min", 5))
+            num_reels_max = int(reels_cfg.get("num_reels_max", 10))
+            num_reels     = random.randint(num_reels_min, num_reels_max)
             watch_min   = float(reels_cfg.get("watch_seconds_min", 5))
             watch_max   = float(reels_cfg.get("watch_seconds_max", 15))
             like_on     = reels_cfg.get("like_enabled", True)
@@ -1428,9 +1805,15 @@ class MainAccountWorker(QThread):
             comment_on  = reels_cfg.get("comment_enabled", False)
             comment_pct = float(reels_cfg.get("comment_pct", 5)) / 100.0
 
+            reels_watched = 0
             for i in range(num_reels):
                 if self._stop_flag:
                     break
+                # Verify we are still on the Reels tab every iteration.
+                if not self._is_on_reels(driver):
+                    self._log("⚠️ Drifted from Reels — returning to Reels and resuming…")
+                    self._go_reels(driver)
+                    self._sleep(1.5)
                 watch_s = random.uniform(watch_min, watch_max)
                 self._log(f"  🎬 Reel {i+1}/{num_reels} — watching {watch_s:.1f}s")
                 self._sleep(watch_s)
@@ -1441,17 +1824,42 @@ class MainAccountWorker(QThread):
                 # Swipe up to next reel
                 self._feed_scroll(driver)
                 self._sleep(random.uniform(0.5, 1.5))
+                reels_watched += 1
 
             # Back to home
             try:
                 driver.back()
             except Exception:
                 pass
-            self._log(f"✅ Reels session done ({num_reels} reels).")
+            self._log(f"✅ Reels session done ({reels_watched} reels).")
         except Exception as exc:
+            if self._is_connection_error(exc):
+                raise
             self._log(f"⚠️ Reels error: {exc}")
 
     # ── Navigation ─────────────────────────────────────────────────────────────
+
+    def _wait_for_uiautomator(self, driver, max_wait: float = 15.0):
+        """
+        After backgrounding Instagram for a long rest, Android may kill the
+        UiAutomator2 instrumentation process to reclaim memory. This helper
+        probes the session with a lightweight current_activity call (no
+        page_source — much cheaper) and waits up to max_wait seconds for
+        UiAutomator2 to become responsive again before proceeding.
+        If it doesn't recover in time, we let the normal _is_connection_error
+        / reconnect path handle it.
+        """
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline and not self._stop_flag:
+            try:
+                driver.current_activity   # lightweight probe — no page_source
+                return  # responsive — good to go
+            except Exception as e:
+                if self._is_connection_error(e):
+                    self._sleep(2.0)  # give UiAutomator2 time to restart
+                else:
+                    return  # unexpected error — don't block indefinitely
+        # Timed out — proceed anyway; reconnect logic will catch it if needed
 
     def _go_home(self, driver):
         """
@@ -1464,11 +1872,21 @@ class MainAccountWorker(QThread):
 
         def _on_home() -> bool:
             try:
-                els = driver.find_elements(
+                # Primary: story tray visible (feed not scrolled down)
+                if driver.find_elements(
                     AppiumBy.XPATH,
                     '//*[@content-desc="reels_tray_container"]',
-                )
-                return bool(els)
+                ):
+                    return True
+                # Secondary: Home tab is the selected/active tab in the bottom nav.
+                # This is always in the hierarchy regardless of scroll position,
+                # so it catches the case where the feed is scrolled past the tray.
+                if driver.find_elements(
+                    AppiumBy.XPATH,
+                    '//*[contains(@resource-id,"feed_tab") and @selected="true"]',
+                ):
+                    return True
+                return False
             except Exception:
                 return False
 
@@ -1514,6 +1932,22 @@ class MainAccountWorker(QThread):
 
     def _go_reels(self, driver):
         from appium.webdriver.common.appiumby import AppiumBy
+
+        def _on_reels() -> bool:
+            try:
+                # Reels tab selected in bottom nav — always in hierarchy
+                if driver.find_elements(
+                    AppiumBy.XPATH,
+                    '//*[contains(@resource-id,"clips_tab") and @selected="true"]',
+                ):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        if _on_reels():
+            return
+
         try:
             reels_btn = driver.find_element(
                 AppiumBy.XPATH,
@@ -1522,5 +1956,7 @@ class MainAccountWorker(QThread):
             )
             reels_btn.click()
             self._sleep(2)
+            if not _on_reels():
+                self._log("⚠️ Could not confirm Reels tab — proceeding anyway")
         except Exception:
             self._log("⚠️ Could not navigate to Reels tab.")

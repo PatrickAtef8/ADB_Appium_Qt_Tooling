@@ -27,11 +27,11 @@
   },
   "schedule": {
     "enabled": false,
-    "start_hour": 9,
+    "start_hour": 16,
     "start_minute": 0,
-    "end_hour": 19,
+    "end_hour": 18,
     "end_minute": 0,
-    "saved_at": "2026-04-30T08:13:40.062171"
+    "saved_at": "2026-05-09T01:09:47.927787"
   },
   "appium": {
     "host": "127.0.0.1",
@@ -97,50 +97,56 @@
   "main_account": {
     "enabled": false,
     "phone_slot": 0,
-    "working_hours_windows": [],
     "daily_limit": {
-      "enabled": false,
+      "enabled": true,
       "hours": 4,
       "minutes": 0
     },
     "stories": {
-      "enabled": false,
-      "watch_min": 3,
-      "watch_max": 7,
+      "enabled": true,
+      "watch_min": 1,
+      "watch_max": 4,
       "rest_short_min": 10.0,
       "rest_short_max": 30.0,
-      "short_cycles_min": 3,
-      "short_cycles_max": 6,
-      "rest_long_min": 80.0,
-      "rest_long_max": 100.0,
-      "watch_seconds_min": 3.0,
+      "short_cycles_min": 1,
+      "short_cycles_max": 2,
+      "rest_long_min": 30.0,
+      "rest_long_max": 60.0,
+      "watch_seconds_min": 1.0,
       "watch_seconds_max": 8.0,
-      "like_enabled": false,
+      "like_enabled": true,
       "like_pct": 30,
-      "react_enabled": false,
-      "react_pct": 10,
-      "comment_enabled": false,
+      "react_enabled": true,
+      "react_pct": 100,
+      "comment_enabled": true,
       "comment_pct": 5
     },
     "feed": {
-      "enabled": false,
-      "num_scrolls": 2,
+      "enabled": true,
+      "num_scrolls_min": 5,
+      "num_scrolls_max": 6,
       "scroll_min": 2.0,
       "scroll_max": 4.0,
-      "like_enabled": false,
-      "like_pct": 20,
-      "comment_enabled": false,
-      "comment_pct": 10
+      "like_enabled": true,
+      "like_pct": 100,
+      "comment_enabled": true,
+      "comment_pct": 100
     },
     "reels": {
-      "enabled": false,
-      "num_reels": 10,
+      "enabled": true,
+      "num_reels_min": 1,
+      "num_reels_max": 3,
       "watch_seconds_min": 5.0,
-      "watch_seconds_max": 15.0,
-      "like_enabled": false,
+      "watch_seconds_max": 7.0,
+      "like_enabled": true,
       "like_pct": 30,
-      "comment_enabled": false,
-      "comment_pct": 5
+      "comment_enabled": true,
+      "comment_pct": 100
+    },
+    "cycle_rest": {
+      "enabled": false,
+      "min": 100.0,
+      "max": 1000.0
     },
     "replies": {
       "spintax_templates": [],
@@ -159,5 +165,87 @@
     "",
     "",
     ""
+  ],
+  "per_device_schedule": [
+    {
+      "enabled": false,
+      "start_hour": 6,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470835"
+    },
+    {
+      "enabled": false,
+      "start_hour": 6,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470861"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470868"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470875"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470880"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470887"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470893"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470898"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470904"
+    },
+    {
+      "enabled": false,
+      "start_hour": 8,
+      "start_minute": 0,
+      "end_hour": 20,
+      "end_minute": 0,
+      "saved_at": "2026-05-10T19:33:34.470910"
+    }
   ]
 }

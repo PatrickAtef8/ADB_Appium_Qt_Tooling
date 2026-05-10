@@ -983,7 +983,7 @@ class AppiumController:
         options.app_activity = "com.instagram.mainactivity.InstagramMainActivity"
         options.no_reset     = True
         options.auto_grant_permissions = True
-        options.new_command_timeout    = 600
+        options.new_command_timeout    = 3600  # 1 hour — prevents session timeout during long rests
         options.uiautomator2_server_launch_timeout = 120000
 
         # ── Do NOT relaunch the app ─────────────────────────────────────
