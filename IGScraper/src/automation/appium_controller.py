@@ -623,6 +623,18 @@ def switch_instagram_account(
     try:
         _log(f"Switching from @{current_account} to @{account_name}...")
 
+        # ── Ensure Instagram is in the foreground before anything else ────
+        # If the daily limit fired mid-rest the screen may be locked / IG
+        # backgrounded. Launch it now so Step 0 sees a real IG XML dump.
+        _log("Ensuring Instagram is open...")
+        _run_hidden(
+            ["adb", "-s", serial, "shell", "monkey", "-p",
+             "com.instagram.android", "-c",
+             "android.intent.category.LAUNCHER", "1"],
+            capture_output=True, text=True, timeout=10,
+        )
+        time.sleep(3.0)   # let the app reach the foreground
+
         # ── Step 0: dismiss list, reach own profile page ───────────────────
         #
         # CRITICAL: We do this in two strict phases to avoid phantom taps.

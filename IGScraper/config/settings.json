@@ -88,7 +88,7 @@
     []
   ],
   "sheets_enabled": false,
-  "mirror_width": 600,
+  "mirror_width": 643,
   "ip_rotation": {
     "enabled": false,
     "interval_min_minutes": 5.0,
@@ -97,56 +97,60 @@
   "main_account": {
     "enabled": false,
     "phone_slot": 0,
+    "target_account": [],
     "daily_limit": {
       "enabled": true,
-      "hours": 4,
+      "hours": 1,
       "minutes": 0
     },
     "stories": {
       "enabled": true,
-      "watch_min": 1,
-      "watch_max": 4,
+      "watch_min": 10,
+      "watch_max": 15,
       "rest_short_min": 10.0,
       "rest_short_max": 30.0,
       "short_cycles_min": 1,
       "short_cycles_max": 2,
       "rest_long_min": 30.0,
       "rest_long_max": 60.0,
-      "watch_seconds_min": 1.0,
-      "watch_seconds_max": 8.0,
+      "watch_seconds_min": 6.0,
+      "watch_seconds_max": 10.0,
       "like_enabled": true,
       "like_pct": 30,
       "react_enabled": true,
-      "react_pct": 100,
-      "comment_enabled": true,
+      "react_pct": 50,
+      "comment_enabled": false,
       "comment_pct": 5
     },
     "feed": {
       "enabled": true,
-      "num_scrolls_min": 5,
-      "num_scrolls_max": 6,
+      "num_scrolls_min": 15,
+      "num_scrolls_max": 22,
       "scroll_min": 2.0,
       "scroll_max": 4.0,
-      "like_enabled": true,
+      "like_enabled": false,
       "like_pct": 100,
-      "comment_enabled": true,
+      "comment_enabled": false,
       "comment_pct": 100
     },
     "reels": {
       "enabled": true,
-      "num_reels_min": 1,
-      "num_reels_max": 3,
+      "num_reels_min": 10,
+      "num_reels_max": 15,
       "watch_seconds_min": 5.0,
       "watch_seconds_max": 7.0,
-      "like_enabled": true,
+      "like_enabled": false,
       "like_pct": 30,
       "comment_enabled": true,
-      "comment_pct": 100
+      "comment_pct": 5
     },
     "cycle_rest": {
-      "enabled": false,
-      "min": 100.0,
-      "max": 1000.0
+      "enabled": true,
+      "min": 60.0,
+      "max": 120.0
+    },
+    "account_switching": {
+      "enabled": true
     },
     "replies": {
       "spintax_templates": [],
@@ -169,83 +173,123 @@
   "per_device_schedule": [
     {
       "enabled": false,
-      "start_hour": 6,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470835"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111573"
     },
     {
       "enabled": false,
-      "start_hour": 6,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470861"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 8,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111599"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470868"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111608"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470875"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111616"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470880"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111624"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470887"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111632"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470893"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111639"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470898"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111647"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470904"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111655"
     },
     {
       "enabled": false,
-      "start_hour": 8,
-      "start_minute": 0,
-      "end_hour": 20,
-      "end_minute": 0,
-      "saved_at": "2026-05-10T19:33:34.470910"
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-20T09:41:31.111662"
     }
   ]
 }

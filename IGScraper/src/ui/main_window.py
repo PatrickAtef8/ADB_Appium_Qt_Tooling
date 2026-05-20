@@ -391,6 +391,21 @@ class PhoneWorker(QThread):
             else:
                 schedule = {}
 
+            # ── Log resolved working-hours windows (mirrors MainAccountWorker) ──
+            if schedule.get("enabled"):
+                _sched_wins = schedule.get("windows") or [schedule]
+                _win_strs = [
+                    f"{int(w.get('start_hour', 0)):02d}:{int(w.get('start_minute', 0)):02d}"
+                    f" → {int(w.get('end_hour', 23)):02d}:{int(w.get('end_minute', 59)):02d}"
+                    for w in _sched_wins
+                ]
+                self._log(
+                    f"🕐 Working hours ENABLED — {len(_sched_wins)} window(s): "
+                    + "  |  ".join(_win_strs)
+                )
+            else:
+                self._log("🕐 Working hours DISABLED — running 24/7")
+
             switch_mode    = delays.get("switch_mode", "profiles")   # "profiles" | "hours"
             switch_every   = int(delays.get("session_break_every", 100))   # used when mode=profiles
             switch_hours   = float(delays.get("switch_hours", 1))          # used when mode=hours
@@ -426,11 +441,33 @@ class PhoneWorker(QThread):
                 # that flag is already True and must stay True so the outer loop
                 # exits rather than resuming scraping.
                 if schedule.get("enabled") and self._is_past_schedule_end(schedule):
-                    end = dtime(schedule["end_hour"], schedule["end_minute"])
-                    self._log(f"⏰ Working hours ended ({end:%H:%M}). Stopping.")
+                    # Derive a display end-time from the windows list (multi-window format).
+                    # We show the end of the soonest upcoming window as a proxy, since we
+                    # just exited whichever window was active.
+                    _wins = schedule.get("windows") or [schedule]
+                    _now_t = datetime.now().time()
+                    # Pick the window whose end is closest to now (just passed)
+                    _end_w = _wins[0]
+                    for _w in _wins:
+                        _et = dtime(_w.get("end_hour", 0), _w.get("end_minute", 0))
+                        _et0 = dtime(_end_w.get("end_hour", 0), _end_w.get("end_minute", 0))
+                        if abs((_et.hour * 60 + _et.minute) - (_now_t.hour * 60 + _now_t.minute)) < \
+                           abs((_et0.hour * 60 + _et0.minute) - (_now_t.hour * 60 + _now_t.minute)):
+                            _end_w = _w
+                    end = dtime(_end_w.get("end_hour", 0), _end_w.get("end_minute", 0))
+                    win_start, _ = PhoneWorker._next_window(schedule)
+                    secs_away = max(0, (win_start - datetime.now()).total_seconds())
+                    self._log(
+                        f"⏰ Working hours ended ({end:%H:%M}). "
+                        f"Next window: {win_start.strftime('%a %I:%M %p')} "
+                        f"({max(0, int(secs_away // 60))}m away). Pausing…"
+                    )
                     if self._scraper:
+                        self._scraper._hours_interrupted = True
                         self._scraper.stop()
-                    self._stop_flag = True
+                    # Do NOT set self._stop_flag — the outer target loop must stay
+                    # alive so _wait_for_schedule() can block until the next window
+                    # opens and resume scraping automatically.
                     return
 
                 if len(device_accounts) <= 1 or self._stop_flag:
@@ -633,7 +670,7 @@ class PhoneWorker(QThread):
 
     @staticmethod
     def _schedule_duration(schedule: dict):
-        """Return the timedelta duration of the configured window."""
+        """Return the timedelta duration of a single window dict."""
         from datetime import timedelta
         start_t = dtime(schedule["start_hour"], schedule["start_minute"])
         end_t   = dtime(schedule["end_hour"],   schedule["end_minute"])
@@ -645,65 +682,86 @@ class PhoneWorker(QThread):
 
     @staticmethod
     def _next_window(schedule: dict):
-        """
-        Return the next FUTURE (win_start, win_end) datetimes.
-        start_t has already passed today → win_start is tomorrow.
-        """
+        """Return the next FUTURE (win_start, win_end) for the soonest window."""
         from datetime import timedelta
-        now     = datetime.now()
-        start_t = dtime(schedule["start_hour"], schedule["start_minute"])
-        win_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                                second=0, microsecond=0)
-        if win_start <= now:
-            win_start += timedelta(days=1)
-        duration = PhoneWorker._schedule_duration(schedule)
-        return win_start, win_start + duration
+        now = datetime.now()
+        # Support multi-window format
+        windows = schedule.get("windows")
+        if not windows:
+            windows = [schedule]
+        best_start = None
+        best_end   = None
+        for w in windows:
+            start_t = dtime(w["start_hour"], w["start_minute"])
+            win_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                    second=0, microsecond=0)
+            if win_start <= now:
+                win_start += timedelta(days=1)
+            win_end = win_start + PhoneWorker._schedule_duration(w)
+            if best_start is None or win_start < best_start:
+                best_start = win_start
+                best_end   = win_end
+        return best_start, best_end
 
     def _in_schedule_window(self, schedule: dict) -> bool:
-        """
-        Return True if we are currently inside the configured time window.
-
-        saved_at is used only to reject windows that had already ENDED before
-        the config was saved (stale past occurrence). If now is genuinely inside
-        the window (prev_start <= now < prev_end) we are active regardless of
-        when the config was saved — handles second runs that start mid-window.
+        """Return True if we are currently inside ANY configured time window.
+        Supports both multi-window {windows: [...]} and legacy single-window formats.
+        saved_at guard removed — always checks real current time for correct
+        auto-start behaviour when clicking Start mid-window.
         """
         from datetime import timedelta
-        now     = datetime.now()
-        start_t = dtime(schedule["start_hour"], schedule["start_minute"])
-
-        # Most recent past occurrence of start_t
-        prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                                 second=0, microsecond=0)
-        if prev_start > now:
-            prev_start -= timedelta(days=1)
-
-        prev_end = prev_start + self._schedule_duration(schedule)
-
-        # Not inside the window at all — definitely not active
-        if not (prev_start <= now < prev_end):
-            return False
-
-        # We ARE inside the window. Reject only if the entire window ended
-        # before the config was saved (truly stale past occurrence).
-        saved_at_str = schedule.get("saved_at", "")
-        try:
-            saved_at = datetime.fromisoformat(saved_at_str)
-        except (ValueError, TypeError):
-            saved_at = datetime.min
-
-        return not (prev_end <= saved_at)
+        now   = datetime.now()
+        now_t = now.time()
+        windows = schedule.get("windows")
+        if not windows:
+            windows = [schedule]
+        for w in windows:
+            start_t = dtime(w["start_hour"], w["start_minute"])
+            end_t   = dtime(w["end_hour"],   w["end_minute"])
+            if end_t > start_t:
+                if start_t <= now_t < end_t:
+                    return True
+            else:  # spans midnight
+                if now_t >= start_t or now_t < end_t:
+                    return True
+        return False
 
     def _wait_for_schedule(self, schedule: dict):
-        start_t = dtime(schedule["start_hour"], schedule["start_minute"])
-        end_t   = dtime(schedule["end_hour"],   schedule["end_minute"])
+        logged = False
+        ig_closed = False
         while not self._stop_flag:
             if self._in_schedule_window(schedule):
+                # Re-open Instagram now that a window is active
+                if ig_closed:
+                    self._log("⏰ Working hours window started — opening Instagram…")
+                    try:
+                        if self._controller and self._controller.driver:
+                            self._controller.driver.activate_app("com.instagram.android")
+                            time.sleep(3)
+                    except Exception:
+                        pass
                 return
             win_start, _ = self._next_window(schedule)
-            self._log(f"⏰ Outside hours ({start_t:%H:%M}–{end_t:%H:%M}). "
-                      f"Next window: {win_start.strftime('%a %I:%M %p')}. Waiting…")
+            secs_to_wait = max(0, (win_start - datetime.now()).total_seconds())
+            if not logged:
+                self._log(
+                    f"⏰ Outside working hours. "
+                    f"Next window: {win_start.strftime('%a %I:%M %p')} "
+                    f"({max(0, int(secs_to_wait // 60))}m away). Waiting…"
+                )
+                logged = True
+                # Background Instagram while waiting — Home key keeps session intact
+                try:
+                    if self._controller and self._controller.driver:
+                        self._controller.driver.press_keycode(3)   # Home (graceful)
+                        ig_closed = True
+                except Exception:
+                    pass
             self._sleep(60)
+            # Re-enable logging if the next window shifted (e.g. crossed midnight)
+            new_start, _ = self._next_window(schedule)
+            if new_start != win_start:
+                logged = False
 
     def _is_past_schedule_end(self, schedule: dict) -> bool:
         """Return True if the current time is outside the active schedule window."""
@@ -1400,218 +1458,362 @@ class ResultsPage(QWidget):
 class WorkingHoursPage(PageWidget):
     """Per-device working hours tab.
 
-    One card per phone slot, identical in structure to the dashboard's
-    Working Hours card (checkbox + description + Start/End TimeEdit + yellow
-    preview label). Cards are shown/hidden in sync with the Dashboard via
-    sync_slots(). Title labels update live when the user edits a nickname.
+    Each phone card now supports MULTIPLE time windows (add/remove buttons).
+    Each window is a (start, end) time pair that repeats daily.
+    The bot runs whenever the current time falls inside ANY of the windows.
     """
 
     def __init__(self, parent=None):
         super().__init__("Working Hours", parent)
-        # _rows: List of (chk, te_start, te_end, lbl_preview, lbl_title)
-        self._rows:  List[Tuple]      = []
-        self._cards: List[CardWidget] = []
+        # _phone_cards[i] = {"card": CardWidget, "chk": CheckBox,
+        #                     "windows_lay": QVBoxLayout, "windows": [row_widgets...]}
+        self._phone_cards: List[dict] = []
+        self._cards_widgets: List[CardWidget] = []
         self._build()
 
     def _build(self):
         _cs = _px(16)
 
-        # Global description card
         info_card = CardWidget(self)
         info_lay  = QVBoxLayout(info_card)
         info_lay.setContentsMargins(_cs, _cs, _cs, _cs)
         info_lay.setSpacing(6)
         info_lay.addWidget(StrongBodyLabel("⏰ Per-Device Working Hours", info_card))
         info_lay.addWidget(CaptionLabel(
-            "Set working hours independently for each phone. "
-            "Applies to both scraping and Main Account modes. "
-            "Untick to let that phone run whenever the session is active.",
+            "Set one or more daily time windows per phone. The bot runs whenever the "
+            "current time falls inside ANY window — windows repeat every day. "
+            "Untick to let that phone run 24/7 whenever the session is active. "
+            "Each window shows which days it is active (all days — windows repeat daily).",
             info_card,
         ))
         self.add(info_card)
 
-        # Pre-build all MAX_PHONES cards; only card 0 visible at start.
         for i in range(MAX_PHONES):
             card = CardWidget(self)
-            lay  = QVBoxLayout(card)
-            lay.setContentsMargins(_cs, _cs, _cs, _cs)
-            lay.setSpacing(10)
+            outer_lay = QVBoxLayout(card)
+            outer_lay.setContentsMargins(_cs, _cs, _cs, _cs)
+            outer_lay.setSpacing(10)
 
-            # ── Checkbox (acts as the card header, mirrors dashboard style) ──
+            # Header checkbox
             chk = CheckBox(f"Phone {i + 1} — Working Hours", card)
             chk.setFont(T.heading())
             chk.setStyleSheet("background: transparent;")
-            lay.addWidget(chk)
+            outer_lay.addWidget(chk)
 
-            # ── Description label (greyed, same as dashboard) ─────────────
-            lbl_desc = CaptionLabel(
-                "Bot only runs between these times. Outside this window it pauses and waits.",
+            outer_lay.addWidget(CaptionLabel(
+                "Bot only runs inside these time windows. Outside them it pauses and waits.",
                 card,
-            )
-            lbl_desc.setStyleSheet("background: transparent; color: grey;")
-            lbl_desc.setWordWrap(True)
-            lay.addWidget(lbl_desc)
+            ))
 
-            # ── Time pickers row ──────────────────────────────────────────
-            time_row = QHBoxLayout()
-            time_row.setSpacing(8)
-            lbl_start = CaptionLabel("Start:", card)
-            lbl_start.setStyleSheet("background: transparent;")
-            te_start = TimeEdit(card)
-            te_start.setFont(T.body())
-            te_start.setMinimumHeight(_px(44))
-            te_start.setDisplayFormat("hh:mm AP")
-            te_start.setTime(QTime(8, 0))
+            # Container for the list of time windows
+            windows_container = QWidget(card)
+            windows_container.setStyleSheet("background: transparent;")
+            windows_lay = QVBoxLayout(windows_container)
+            windows_lay.setContentsMargins(0, 0, 0, 0)
+            windows_lay.setSpacing(6)
+            outer_lay.addWidget(windows_container)
 
-            lbl_arrow = CaptionLabel("to", card)
-            lbl_arrow.setStyleSheet("background: transparent;")
-            lbl_end_lbl = CaptionLabel("End:", card)
-            lbl_end_lbl.setStyleSheet("background: transparent;")
-            te_end = TimeEdit(card)
-            te_end.setFont(T.body())
-            te_end.setMinimumHeight(_px(44))
-            te_end.setDisplayFormat("hh:mm AP")
-            te_end.setTime(QTime(20, 0))
+            # "Add window" button
+            btn_add = PushButton("＋ Add time window", card)
+            btn_add.setFont(T.body())
+            btn_add.setFixedHeight(_px(34))
+            outer_lay.addWidget(btn_add)
 
-            time_row.addWidget(lbl_start)
-            time_row.addWidget(te_start)
-            time_row.addWidget(lbl_arrow)
-            time_row.addWidget(lbl_end_lbl)
-            time_row.addWidget(te_end)
-            time_row.addStretch()
-            lay.addLayout(time_row)
+            phone_data = {
+                "card": card,
+                "chk": chk,
+                "windows_lay": windows_lay,
+                "windows_container": windows_container,
+                "windows": [],
+                "btn_add": btn_add,
+                "idx": i,
+            }
+            self._phone_cards.append(phone_data)
+            self._cards_widgets.append(card)
 
-            # ── Preview label (yellow "Next window: …") ───────────────────
-            lbl_preview = CaptionLabel("", card)
-            lbl_preview.setStyleSheet("background: transparent; color: #f59e0b;")
-            lbl_preview.setWordWrap(True)
-            lay.addWidget(lbl_preview)
+            # Add one default window
+            self._add_window_row(phone_data, QTime(8, 0), QTime(20, 0))
 
-            # ── Checkbox toggles pickers + preview ────────────────────────
-            def _make_toggle(te_s, te_e, ls, la, le, ld, lp, idx_=i):
+            # Wire checkbox to enable/disable everything below it
+            def _make_toggle(pd=phone_data):
                 def _toggle(state):
                     on = bool(state)
-                    for w in [te_s, te_e, ls, la, le, ld, lp]:
-                        w.setEnabled(on)
+                    pd["windows_container"].setEnabled(on)
+                    pd["btn_add"].setEnabled(on)
                     if on:
-                        self._update_preview(idx_)
-                    else:
-                        lp.setText("")
+                        self._refresh_all_previews(pd)
                 return _toggle
+            chk.stateChanged.connect(_make_toggle())
 
-            chk.stateChanged.connect(
-                _make_toggle(te_start, te_end, lbl_start, lbl_arrow,
-                             lbl_end_lbl, lbl_desc, lbl_preview)
-            )
-            # Wire time changes to refresh preview
-            def _make_preview_updater(idx_=i):
-                return lambda _: self._update_preview(idx_)
-            te_start.timeChanged.connect(_make_preview_updater())
-            te_end.timeChanged.connect(_make_preview_updater())
+            # Wire add button
+            def _make_add(pd=phone_data):
+                return lambda: self._add_window_row(pd)
+            btn_add.clicked.connect(_make_add())
 
-            # Start disabled (checkbox unchecked)
-            for w in [te_start, te_end, lbl_start, lbl_arrow,
-                      lbl_end_lbl, lbl_desc, lbl_preview]:
-                w.setEnabled(False)
+            # Start disabled
+            windows_container.setEnabled(False)
+            btn_add.setEnabled(False)
 
-            self._rows.append((chk, te_start, te_end, lbl_preview, chk))
-            self._cards.append(card)
             self.add(card)
             card.setVisible(i == 0)
 
         self.stretch()
 
-    def _update_preview(self, idx: int):
-        """Recompute and show the next window for slot idx — mirrors dashboard logic."""
-        chk, te_start, te_end, lbl_preview, _ = self._rows[idx]
-        if not chk.isChecked():
-            lbl_preview.setText("")
-            return
-        ts = te_start.time()
-        te = te_end.time()
-        start_t = dtime(ts.hour(), ts.minute())
-        end_t   = dtime(te.hour(), te.minute())
-        now     = datetime.now()
+    def _add_window_row(self, phone_data: dict,
+                        start: QTime = None, end: QTime = None):
+        """Add one time-window row (start TimeEdit, end TimeEdit, remove button)."""
+        if start is None:
+            start = QTime(8, 0)
+        if end is None:
+            end = QTime(20, 0)
 
-        if end_t > start_t:
-            duration = timedelta(hours=end_t.hour - start_t.hour,
-                                 minutes=end_t.minute - start_t.minute)
-        else:
-            duration = timedelta(days=1) - timedelta(hours=start_t.hour - end_t.hour,
-                                                      minutes=start_t.minute - end_t.minute)
+        row_w = QWidget()
+        row_w.setStyleSheet("background: transparent;")
+        row_lay = QHBoxLayout(row_w)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.setSpacing(8)
 
-        prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                                 second=0, microsecond=0)
-        if prev_start > now:
-            prev_start -= timedelta(days=1)
-        prev_end = prev_start + duration
+        idx = len(phone_data["windows"]) + 1
+        lbl_n = CaptionLabel(f"Window {idx}:", row_w)
+        lbl_n.setStyleSheet("background:transparent;")
+        lbl_n.setFixedWidth(_px(72))
 
-        next_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                                 second=0, microsecond=0)
-        if next_start <= now:
-            next_start += timedelta(days=1)
-        next_end = next_start + duration
+        te_start = TimeEdit(row_w)
+        te_start.setFont(T.body())
+        te_start.setMinimumHeight(_px(36))
+        te_start.setDisplayFormat("hh:mm AP")
+        te_start.setTime(start)
 
-        in_window = (prev_start <= now < prev_end) and \
-                    ((now - prev_start).total_seconds() <= 300)
+        lbl_to = CaptionLabel("→", row_w)
+        lbl_to.setStyleSheet("background:transparent;")
 
-        if in_window:
-            lbl_preview.setText(
-                f"▶ Active now — ends {prev_end.strftime('%a %I:%M %p')}"
+        te_end = TimeEdit(row_w)
+        te_end.setFont(T.body())
+        te_end.setMinimumHeight(_px(36))
+        te_end.setDisplayFormat("hh:mm AP")
+        te_end.setTime(end)
+
+        lbl_preview = CaptionLabel("", row_w)
+        lbl_preview.setStyleSheet("background:transparent; color:#f59e0b;")
+        lbl_preview.setFixedWidth(_px(380))
+
+        btn_remove = PushButton("✕", row_w)
+        btn_remove.setFont(T.body())
+        btn_remove.setFixedSize(_px(34), _px(34))
+
+        row_lay.addWidget(lbl_n)
+        row_lay.addWidget(te_start)
+        row_lay.addWidget(lbl_to)
+        row_lay.addWidget(te_end)
+        row_lay.addWidget(lbl_preview)
+        row_lay.addWidget(btn_remove)
+        row_lay.addStretch()
+
+        phone_data["windows_lay"].addWidget(row_w)
+
+        row_data = {
+            "widget": row_w,
+            "te_start": te_start,
+            "te_end": te_end,
+            "lbl_preview": lbl_preview,
+            "lbl_n": lbl_n,
+        }
+        phone_data["windows"].append(row_data)
+
+        # Wire preview refresh
+        def _upd(pd=phone_data):
+            return lambda _: self._refresh_all_previews(pd)
+        te_start.timeChanged.connect(_upd())
+        te_end.timeChanged.connect(_upd())
+
+        # Wire remove button
+        def _make_remove(pd=phone_data, rd=row_data):
+            def _remove():
+                rd["widget"].setParent(None)
+                rd["widget"].deleteLater()
+                pd["windows"].remove(rd)
+                self._relabel_windows(pd)
+                self._refresh_all_previews(pd)
+            return _remove
+        btn_remove.clicked.connect(_make_remove())
+
+        # First window is always locked — only windows 2+ can be removed
+        def _update_remove_btns(pd=phone_data):
+            for i, wd in enumerate(pd["windows"]):
+                for child in wd["widget"].findChildren(PushButton):
+                    if child.text() == "✕":
+                        child.setEnabled(i > 0)
+        # Connect after appending so count is accurate
+        te_start.timeChanged.connect(lambda _, pd=phone_data: _update_remove_btns(pd))
+        _update_remove_btns(phone_data)
+
+        if phone_data["chk"].isChecked():
+            self._refresh_all_previews(phone_data)
+
+    def _relabel_windows(self, phone_data: dict):
+        """Re-number window labels after a removal."""
+        for i, wd in enumerate(phone_data["windows"]):
+            wd["lbl_n"].setText(f"Window {i + 1}:")
+
+    def _refresh_all_previews(self, phone_data: dict):
+        """Update preview labels for all windows of one phone.
+
+        Shows day names so it is unambiguous which day the window is active or
+        ending on.  Also detects overlapping windows and shows a warning.
+        """
+        from datetime import datetime as _dt, timedelta as _td
+
+        now = _dt.now()
+
+        # ── Build window intervals for overlap detection ─────────────────────
+        # Each entry: (prev_start, prev_end, next_start, next_end, wd)
+        intervals: list = []
+        for wd in phone_data["windows"]:
+            ts = wd["te_start"].time()
+            te = wd["te_end"].time()
+            start_t = dtime(ts.hour(), ts.minute())
+            end_t   = dtime(te.hour(), te.minute())
+
+            if end_t > start_t:
+                duration = _td(hours=end_t.hour - start_t.hour,
+                               minutes=end_t.minute - start_t.minute)
+            else:
+                duration = _td(days=1) - _td(
+                    hours=start_t.hour - end_t.hour,
+                    minutes=start_t.minute - end_t.minute,
+                )
+
+            prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                     second=0, microsecond=0)
+            if prev_start > now:
+                prev_start -= _td(days=1)
+            prev_end = prev_start + duration
+
+            next_start = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                     second=0, microsecond=0)
+            if next_start <= now:
+                next_start += _td(days=1)
+            next_end = next_start + duration
+
+            intervals.append((prev_start, prev_end, next_start, next_end, wd))
+
+        # ── Detect overlaps (daily repeat — compare over a 48-hour horizon) ──
+        # Two daily-repeating windows A and B overlap if, within any 48-hour
+        # sliding view, any copy of A intersects any copy of B.
+        # Simpler approach: for each pair compare all four shifted copies.
+        overlap_indices: set = set()
+        for i in range(len(intervals)):
+            for j in range(i + 1, len(intervals)):
+                a_start, a_end = intervals[i][0], intervals[i][1]
+                b_start, b_end = intervals[j][0], intervals[j][1]
+                # Check current-day copies and one shifted by 1 day
+                for da in (0, 1):
+                    for db in (0, 1):
+                        as_ = a_start + _td(days=da)
+                        ae_ = a_end   + _td(days=da)
+                        bs_ = b_start + _td(days=db)
+                        be_ = b_end   + _td(days=db)
+                        if as_ < be_ and ae_ > bs_:
+                            overlap_indices.add(i)
+                            overlap_indices.add(j)
+
+        # ── Update each window's preview label ───────────────────────────────
+        for idx, (prev_start, prev_end, next_start, next_end, wd) in enumerate(intervals):
+            in_window = prev_start <= now < prev_end
+
+            if in_window:
+                # Show both start day and end day — end may be the next calendar day
+                start_str = prev_start.strftime("%a %I:%M %p")
+                end_str   = prev_end.strftime("%a %I:%M %p")
+                label = f"▶ Active since {start_str} — ends {end_str}"
+                color = "#22c55e"
+            else:
+                start_str = next_start.strftime("%a %I:%M %p")
+                end_str   = next_end.strftime("%a %I:%M %p")
+                label = f"⏳ Next: {start_str} → {end_str}"
+                color = "#f59e0b"
+
+            if idx in overlap_indices:
+                label += "  ⚠️ OVERLAPS another window"
+                color  = "#ef4444"
+
+            wd["lbl_preview"].setText(label)
+            wd["lbl_preview"].setStyleSheet(
+                f"background:transparent; color:{color};"
             )
-            lbl_preview.setStyleSheet("background: transparent; color: #22c55e;")
-        else:
-            lbl_preview.setText(
-                f"⏳ Next window: {next_start.strftime('%a %I:%M %p')} "
-                f"→ {next_end.strftime('%a %I:%M %p')}"
-            )
-            lbl_preview.setStyleSheet("background: transparent; color: #f59e0b;")
+            # Widen the preview label so the full text is visible
+            wd["lbl_preview"].setFixedWidth(_px(500))
 
     def update_slot_label(self, idx: int, label: str):
-        """Update the checkbox text for slot idx with the given label (nickname or 'Phone N')."""
-        if idx < len(self._rows):
-            chk = self._rows[idx][0]
-            chk.setText(f"{label} — Working Hours")
+        if idx < len(self._phone_cards):
+            self._phone_cards[idx]["chk"].setText(f"{label} — Working Hours")
 
     def sync_slots(self, visible_count: int):
-        """Show/hide phone cards to match the number of visible dashboard slots."""
-        for i, card in enumerate(self._cards):
+        for i, card in enumerate(self._cards_widgets):
             card.setVisible(i < visible_count)
 
     def get_schedules(self) -> List[dict]:
-        """Return a schedule dict per slot (MAX_PHONES length).
-        saved_at is stamped at call time so the saved_at-aware
-        _in_schedule_window guard works correctly.
-        """
+        """Return one schedule dict per phone slot. Each dict has a 'windows' list."""
         result = []
-        for chk, te_start, te_end, _lbl_p, _chk in self._rows:
-            ts = te_start.time()
-            te = te_end.time()
+        for pd in self._phone_cards:
+            windows = []
+            for wd in pd["windows"]:
+                ts = wd["te_start"].time()
+                te = wd["te_end"].time()
+                windows.append({
+                    "start_hour":   ts.hour(),
+                    "start_minute": ts.minute(),
+                    "end_hour":     te.hour(),
+                    "end_minute":   te.minute(),
+                })
             result.append({
-                "enabled":      chk.isChecked(),
-                "start_hour":   ts.hour(),
-                "start_minute": ts.minute(),
-                "end_hour":     te.hour(),
-                "end_minute":   te.minute(),
-                "saved_at":     datetime.now().isoformat(),
+                "enabled": pd["chk"].isChecked(),
+                "windows": windows,
+                "saved_at": datetime.now().isoformat(),
             })
         return result
 
     def load_schedules(self, schedules: list):
-        """Load saved schedule dicts back into UI rows."""
-        for i, (chk, te_start, te_end, lbl_preview, _) in enumerate(self._rows):
-            if i < len(schedules):
-                s = schedules[i]
-                chk.setChecked(s.get("enabled", False))
-                te_start.setTime(QTime(s.get("start_hour", 8),  s.get("start_minute", 0)))
-                te_end.setTime(  QTime(s.get("end_hour",   20), s.get("end_minute",   0)))
-                if s.get("enabled", False):
-                    self._update_preview(i)
-            else:
-                chk.setChecked(False)
-                te_start.setTime(QTime(8,  0))
-                te_end.setTime(  QTime(20, 0))
-                lbl_preview.setText("")
+        """Load saved schedule dicts back into UI. Supports both old single-window
+        and new multi-window formats."""
+        for i, pd in enumerate(self._phone_cards):
+            if i >= len(schedules):
+                pd["chk"].setChecked(False)
+                continue
+
+            s = schedules[i]
+            pd["chk"].setChecked(s.get("enabled", False))
+
+            # Clear existing windows
+            for wd in list(pd["windows"]):
+                wd["widget"].setParent(None)
+                wd["widget"].deleteLater()
+            pd["windows"].clear()
+
+            # Load windows — support old format (single start/end keys)
+            windows = s.get("windows", None)
+            if not windows:
+                # Legacy single-window format
+                windows = [{
+                    "start_hour":   s.get("start_hour", 8),
+                    "start_minute": s.get("start_minute", 0),
+                    "end_hour":     s.get("end_hour", 20),
+                    "end_minute":   s.get("end_minute", 0),
+                }]
+
+            for w in windows:
+                self._add_window_row(
+                    pd,
+                    QTime(w.get("start_hour", 8),  w.get("start_minute", 0)),
+                    QTime(w.get("end_hour",   20), w.get("end_minute",   0)),
+                )
+
+            # Enable/disable container
+            pd["windows_container"].setEnabled(s.get("enabled", False))
+            pd["btn_add"].setEnabled(s.get("enabled", False))
+
+            if s.get("enabled", False):
+                self._refresh_all_previews(pd)
 
 
 class SettingsPage(PageWidget):
@@ -1909,7 +2111,29 @@ class MainAccountPage(PageWidget):
         en_lay.addLayout(slot_row)
         self.add(en_card)
 
-        # ── Daily time limit ──────────────────────────────────────────────
+        # ── Target Account ────────────────────────────────────────────────
+        ta_card = CardWidget(self); ta_lay = QVBoxLayout(ta_card)
+        ta_lay.setContentsMargins(_cs, _cs, _cs, _cs); ta_lay.setSpacing(12)
+        lbl_ta = StrongBodyLabel("🎯 Target Accounts", ta_card)
+        lbl_ta.setFont(T.heading()); lbl_ta.setStyleSheet("background:transparent;")
+        ta_lay.addWidget(lbl_ta)
+        ta_lay.addWidget(CaptionLabel(
+            "One username per line (@ optional). Content from these accounts always gets "
+            "full engagement regardless of % settings — stories: like+react+comment / "
+            "feed: like+comment / reels: like+comment. Leave blank to disable.",
+            ta_card,
+        ))
+        self.inp_target_account = TextEdit(ta_card)
+        self.inp_target_account.setFont(T.body())
+        self.inp_target_account.setPlaceholderText("account1\naccount2\naccount3")
+        self.inp_target_account.setMinimumHeight(_px(100))
+        self.inp_target_account.setMaximumHeight(_px(160))
+        self.inp_target_account.setStyleSheet(
+            "TextEdit { background: transparent; border: 1px solid #334155; "
+            "border-radius: 10px; padding: 6px 10px; }"
+        )
+        ta_lay.addWidget(self.inp_target_account)
+        self.add(ta_card)
         dl_card = CardWidget(self); dl_lay = QVBoxLayout(dl_card)
         dl_lay.setContentsMargins(_cs, _cs, _cs, _cs); dl_lay.setSpacing(12)
         lbl_dl = StrongBodyLabel("⏱ Daily Time Limit", dl_card)
@@ -1926,7 +2150,11 @@ class MainAccountPage(PageWidget):
         self.chk_dl_enabled.setStyleSheet("background:transparent;")
         dl_lay.addWidget(self.chk_dl_enabled)
 
-        dl_row = QHBoxLayout()
+        # ── Hours + Minutes row ───────────────────────────────────────────────
+        self._dl_normal_row_w = QWidget(dl_card)
+        self._dl_normal_row_w.setStyleSheet("background:transparent;")
+        dl_row = QHBoxLayout(self._dl_normal_row_w)
+        dl_row.setContentsMargins(0, 0, 0, 0)
         lbl_dl_h = CaptionLabel("Hours:", dl_card); lbl_dl_h.setFont(T.body())
         lbl_dl_h.setStyleSheet("background:transparent;")
         self.sp_dl_hours = SpinBox(dl_card)
@@ -1945,17 +2173,35 @@ class MainAccountPage(PageWidget):
         dl_row.addSpacing(24)
         dl_row.addWidget(lbl_dl_m); dl_row.addWidget(self.sp_dl_minutes)
         dl_row.addStretch()
-        dl_lay.addLayout(dl_row)
+        dl_lay.addWidget(self._dl_normal_row_w)
 
         def _on_dl_toggle():
             on = self.chk_dl_enabled.isChecked()
             self.sp_dl_hours.setEnabled(on)
             self.sp_dl_minutes.setEnabled(on)
+
         self.chk_dl_enabled.stateChanged.connect(lambda _: _on_dl_toggle())
         _on_dl_toggle()
         self.add(dl_card)
 
-        # ── Stories config ────────────────────────────────────────────────
+        # ── Account Switching ─────────────────────────────────────────────
+        sw_card = CardWidget(self); sw_lay = QVBoxLayout(sw_card)
+        sw_lay.setContentsMargins(_cs, _cs, _cs, _cs); sw_lay.setSpacing(10)
+        lbl_sw = StrongBodyLabel("🔄 Account Switching", sw_card)
+        lbl_sw.setFont(T.heading()); lbl_sw.setStyleSheet("background:transparent;")
+        sw_lay.addWidget(lbl_sw)
+        sw_lay.addWidget(CaptionLabel(
+            "When the daily engagement limit is reached, automatically switch to the next "
+            "Instagram account on this device and continue. Cycles through all accounts "
+            "round-robin. Requires multiple accounts logged in on the device.",
+            sw_card,
+        ))
+        self.chk_sw_enabled = CheckBox("Enable account switching after daily limit", sw_card)
+        self.chk_sw_enabled.setFont(T.body())
+        self.chk_sw_enabled.setStyleSheet("background:transparent;")
+        sw_lay.addWidget(self.chk_sw_enabled)
+
+        self.add(sw_card)
         st_card = CardWidget(self); st_lay = QVBoxLayout(st_card)
         st_lay.setContentsMargins(_cs, _cs, _cs, _cs); st_lay.setSpacing(10)
         lbl_st = StrongBodyLabel("📖 Stories Engagement", st_card)
@@ -2086,9 +2332,9 @@ class MainAccountPage(PageWidget):
         self.chk_cr_enabled.setFont(T.body()); self.chk_cr_enabled.setStyleSheet("background:transparent;")
         self.chk_cr_enabled.setChecked(True)
         cr_lay.addWidget(self.chk_cr_enabled)
-        cr_lay.addWidget(_lbl("Rest duration — seconds (MIN / MAX):", cr_card))
-        self.sp_cr_min = _spin(cr_card, 5.0, 3600.0, 30.0, double=True)
-        self.sp_cr_max = _spin(cr_card, 5.0, 3600.0, 90.0, double=True)
+        cr_lay.addWidget(_lbl("Rest duration — minutes (MIN / MAX):", cr_card))
+        self.sp_cr_min = _spin(cr_card, 1.0, 1440.0, 1.0, double=True)
+        self.sp_cr_max = _spin(cr_card, 1.0, 1440.0, 5.0, double=True)
         cr_lay.addLayout(_row(_lbl("MIN:", cr_card), self.sp_cr_min,
                               20, _lbl("MAX:", cr_card), self.sp_cr_max))
         def _on_cr_toggle():
@@ -2229,6 +2475,7 @@ class MainAccountPage(PageWidget):
         self._ma_all_lockable = (
             [self.combo_ma_slot, self.chk_dl_enabled,
              self.sp_dl_hours, self.sp_dl_minutes,
+             self.chk_sw_enabled,
              self.chk_st_enabled, self.chk_fd_enabled, self.chk_rl_enabled,
              self.chk_cr_enabled, self.btn_ma_start] +
             self._st_lockable + self._fd_lockable + self._rl_lockable +
@@ -3436,10 +3683,15 @@ class MainWindow(FluentWindow):
         cfg["main_account"] = {
             "enabled":    mp.chk_ma_enabled.isChecked(),
             "phone_slot": mp.combo_ma_slot.currentData() or 0,
+            "target_account": [
+                t.strip().lower().lstrip("@")
+                for t in mp.inp_target_account.toPlainText().splitlines()
+                if t.strip()
+            ],
             "daily_limit": {
-                "enabled":      mp.chk_dl_enabled.isChecked(),
-                "hours":        mp.sp_dl_hours.value(),
-                "minutes":      mp.sp_dl_minutes.value(),
+                "enabled":       mp.chk_dl_enabled.isChecked(),
+                "hours":         mp.sp_dl_hours.value(),
+                "minutes":       mp.sp_dl_minutes.value(),
             },
             "stories": {
                 "enabled":            mp.chk_st_enabled.isChecked(),
@@ -3484,8 +3736,11 @@ class MainWindow(FluentWindow):
             },
             "cycle_rest": {
                 "enabled":  mp.chk_cr_enabled.isChecked(),
-                "min":      mp.sp_cr_min.value(),
-                "max":      mp.sp_cr_max.value(),
+                "min":      mp.sp_cr_min.value() * 60.0,
+                "max":      mp.sp_cr_max.value() * 60.0,
+            },
+            "account_switching": {
+                "enabled": mp.chk_sw_enabled.isChecked(),
             },
             "replies": {
                 "spintax_templates":  spintax_lines,
@@ -3587,6 +3842,11 @@ class MainWindow(FluentWindow):
         idx = mp.combo_ma_slot.findData(slot)
         if idx >= 0:
             mp.combo_ma_slot.setCurrentIndex(idx)
+        # target_account may be an old single string or new list
+        _ta_raw = ma.get("target_account", [])
+        if isinstance(_ta_raw, str):
+            _ta_raw = [_ta_raw] if _ta_raw.strip() else []
+        mp.inp_target_account.setPlainText("\n".join(_ta_raw))
 
         dl = ma.get("daily_limit", {})
         mp.chk_dl_enabled.setChecked(dl.get("enabled", False))
@@ -3639,10 +3899,16 @@ class MainWindow(FluentWindow):
 
         cr = ma.get("cycle_rest", {})
         mp.chk_cr_enabled.setChecked(cr.get("enabled", True))
-        mp.sp_cr_min.setValue(float(cr.get("min", 30.0)))
-        mp.sp_cr_max.setValue(float(cr.get("max", 90.0)))
+        # Stored as seconds; display as minutes. Legacy configs stored seconds directly.
+        _cr_min_s = float(cr.get("min", 60.0))
+        _cr_max_s = float(cr.get("max", 300.0))
+        mp.sp_cr_min.setValue(_cr_min_s / 60.0)
+        mp.sp_cr_max.setValue(_cr_max_s / 60.0)
         mp.sp_cr_min.setEnabled(cr.get("enabled", True))
         mp.sp_cr_max.setEnabled(cr.get("enabled", True))
+
+        sw = ma.get("account_switching", {})
+        mp.chk_sw_enabled.setChecked(sw.get("enabled", False))
 
         rp = ma.get("replies", {})
         mp.txt_spintax.setPlainText("\n".join(rp.get("spintax_templates", [])))
@@ -4682,7 +4948,10 @@ class MainWindow(FluentWindow):
         elif is_up and not self._net_was_up:
             # Connection restored — close the yellow bar immediately
             if self._net_bar is not None:
-                self._net_bar.close()
+                try:
+                    self._net_bar.close()
+                except RuntimeError:
+                    pass  # C++ object already deleted (InfoBar auto-closed its timer)
                 self._net_bar = None
             self._net_was_up     = True
             self._net_bar_shown  = False

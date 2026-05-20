@@ -128,7 +128,7 @@ def _seconds_until_next_window(windows: List[dict]) -> float:
 
 
 def _schedule_duration(schedule: dict):
-    """Return timedelta duration of the single schedule window."""
+    """Return timedelta duration of a single schedule window dict."""
     start_t = dtime(int(schedule["start_hour"]), int(schedule["start_minute"]))
     end_t   = dtime(int(schedule["end_hour"]),   int(schedule["end_minute"]))
     if end_t > start_t:
@@ -139,47 +139,66 @@ def _schedule_duration(schedule: dict):
 
 
 def _in_schedule_window(schedule: dict) -> bool:
-    """Return True if now is inside the configured time window.
+    """Return True if now is inside ANY configured time window.
 
-    saved_at is used only to reject windows that had already ENDED before
-    the config was saved (stale past occurrence). If now is genuinely inside
-    the window (prev_start <= now < prev_end) we are active regardless of
-    when the config was saved — handles second runs that start mid-window.
-    Mirrors PhoneWorker._in_schedule_window exactly.
+    Supports both the new multi-window format {enabled, windows: [...]}
+    and the legacy single-window format {enabled, start_hour, end_hour, ...}.
+    The saved_at guard has been removed — we always check the real current
+    time so clicking Start mid-window works correctly and the bot auto-resumes
+    the next day without needing to be restarted.
     """
-    now     = datetime.now()
-    start_t = dtime(int(schedule["start_hour"]), int(schedule["start_minute"]))
+    if not schedule.get("enabled"):
+        return True   # no schedule = always in window
 
-    prev_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                              second=0, microsecond=0)
-    if prev_start > now:
-        prev_start -= timedelta(days=1)
+    # Build list of windows
+    windows = schedule.get("windows")
+    if not windows:
+        # Legacy single-window format
+        windows = [{
+            "start_hour":   schedule.get("start_hour", 0),
+            "start_minute": schedule.get("start_minute", 0),
+            "end_hour":     schedule.get("end_hour", 23),
+            "end_minute":   schedule.get("end_minute", 59),
+        }]
 
-    prev_end = prev_start + _schedule_duration(schedule)
-
-    # Not inside the window at all
-    if not (prev_start <= now < prev_end):
-        return False
-
-    # Inside the window — reject only if the window ended before config was saved
-    saved_at_str = schedule.get("saved_at", "")
-    try:
-        saved_at = datetime.fromisoformat(saved_at_str)
-    except (ValueError, TypeError):
-        saved_at = datetime.min
-
-    return not (prev_end <= saved_at)
+    now   = datetime.now()
+    now_t = now.time()
+    for w in windows:
+        start_t, end_t = _parse_time_window(w)
+        if end_t > start_t:
+            if start_t <= now_t < end_t:
+                return True
+        else:  # spans midnight
+            if now_t >= start_t or now_t < end_t:
+                return True
+    return False
 
 
 def _next_schedule_window(schedule: dict) -> datetime:
-    """Return the next future window start datetime."""
-    now     = datetime.now()
-    start_t = dtime(int(schedule["start_hour"]), int(schedule["start_minute"]))
-    win_start = now.replace(hour=start_t.hour, minute=start_t.minute,
-                             second=0, microsecond=0)
-    if win_start <= now:
-        win_start += timedelta(days=1)
-    return win_start
+    """Return the soonest next window-start datetime (always in the future).
+
+    Supports both multi-window and legacy single-window formats.
+    """
+    windows = schedule.get("windows")
+    if not windows:
+        windows = [{
+            "start_hour":   schedule.get("start_hour", 0),
+            "start_minute": schedule.get("start_minute", 0),
+            "end_hour":     schedule.get("end_hour", 23),
+            "end_minute":   schedule.get("end_minute", 59),
+        }]
+
+    now = datetime.now()
+    best = None
+    for w in windows:
+        start_t, _ = _parse_time_window(w)
+        candidate = now.replace(hour=start_t.hour, minute=start_t.minute,
+                                 second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        if best is None or candidate < best:
+            best = candidate
+    return best or (now + timedelta(hours=1))
 
 
 # ── Signals ────────────────────────────────────────────────────────────────────
@@ -251,8 +270,11 @@ class MainAccountWorker(QThread):
         self.appium_port = appium_port
         self.config      = config
         self.signals     = MainAccountSignals()
-        self._stop_flag  = False
-        self._controller = None
+        self._stop_flag       = False
+        self._window_ended    = False  # set by _sleep when working-hours window closes; cleared by outer loop
+        self._daily_limit_hit = False  # set mid-section when daily limit reached; cleared by outer loop
+        self._controller      = None
+        self._screen_locked   = False  # tracks whether we locked the screen
 
     def stop(self):
         self._stop_flag = True
@@ -265,20 +287,16 @@ class MainAccountWorker(QThread):
 
     def _sleep(self, seconds: float):
         deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline and not self._stop_flag:
+        while time.monotonic() < deadline and not self._stop_flag and not self._window_ended:
             time.sleep(min(0.5, deadline - time.monotonic()))
-            # Check working hours mid-sleep — stop ONLY if we were inside the
-            # window and it has now ended. _entered_window is set to True by the
-            # outer loop when it detects we are inside the window and proceeds
-            # with activities. This prevents firing when we're still waiting for
-            # the window to start (outside-before-start).
+            # Check working hours mid-sleep — interrupt if window ends during activity.
+            # NOTE: sets _window_ended (NOT _stop_flag) so the worker pauses and
+            # resumes at the next window instead of terminating permanently.
             sched = getattr(self, "_active_schedule", None)
             if (sched and sched.get("enabled")
-                    and getattr(self, "_entered_window", False)
                     and not _in_schedule_window(sched)):
-                end_t = dtime(int(sched["end_hour"]), int(sched["end_minute"]))
-                self._log(f"⏰ Working hours ended ({end_t:%H:%M}). Stopping.")
-                self._stop_flag = True
+                self._log("⏰ Working hours ended. Pausing until next window…")
+                self._window_ended = True
                 break
 
     # ── Main thread entry ──────────────────────────────────────────────────────
@@ -297,6 +315,12 @@ class MainAccountWorker(QThread):
         reels_cfg  = ma.get("reels",   {})
         reply_cfg  = ma.get("replies", {})
 
+        # Target accounts: list of usernames that always get full engagement.
+        _ta_raw = ma.get("target_account", [])
+        if isinstance(_ta_raw, str):
+            _ta_raw = [_ta_raw] if _ta_raw.strip() else []
+        target_acct = {t.strip().lower().lstrip("@") for t in _ta_raw if t.strip()}
+
         # Per-device schedule from Working Hours tab (same format as scraper schedule).
         # Falls back to the legacy working_hours_windows list if the new key is absent.
         per_device = cfg.get("per_device_schedule", [])
@@ -305,12 +329,30 @@ class MainAccountWorker(QThread):
         else:
             _schedule = {}   # no schedule → run 24/7
         self._active_schedule = _schedule   # expose to _sleep for mid-sleep enforcement
-        self._entered_window  = False        # set True once we first run inside the window
+
+        # ── Log working hours config at startup ──────────────────────────────
+        if _schedule.get("enabled"):
+            _windows = _schedule.get("windows", [])
+            if not _windows:
+                # Legacy single-window format
+                _windows = [_schedule]
+            _win_strs = [
+                f"{int(w.get('start_hour',0)):02d}:{int(w.get('start_minute',0)):02d}"
+                f" → {int(w.get('end_hour',23)):02d}:{int(w.get('end_minute',59)):02d}"
+                for w in _windows
+            ]
+            self._log(
+                f"🕐 Working hours ENABLED — {len(_windows)} window(s): "
+                + "  |  ".join(_win_strs)
+            )
+        else:
+            self._log("🕐 Working hours DISABLED — running 24/7")
 
         dl_cfg      = ma.get("daily_limit", {})
         dl_enabled  = dl_cfg.get("enabled", False)
-        dl_seconds  = (int(dl_cfg.get("hours", 4)) * 3600
-                       + int(dl_cfg.get("minutes", 0)) * 60)
+        # ── Daily limit seconds ──────────────────────────────────────────────
+        dl_seconds = (int(dl_cfg.get("hours", 4)) * 3600
+                      + int(dl_cfg.get("minutes", 0)) * 60)
 
         # Accumulated active engagement seconds today (resets at midnight)
         _active_today   = 0.0          # seconds counted today
@@ -319,10 +361,28 @@ class MainAccountWorker(QThread):
         openai_key   = reply_cfg.get("openai_api_key", "").strip()
         spintax_pool = reply_cfg.get("spintax_templates", [])
 
+        # Account switching config
+        sw_cfg      = ma.get("account_switching", {})
+        sw_enabled  = sw_cfg.get("enabled", False)
+
+        # Device accounts for switching (fetched once at start; refreshed after each switch)
+        device_accounts: List[str] = []
+        acc_idx         = 0
+        current_account = ""
+
         try:
             ip_rotator = None
+            if sw_enabled:
+                try:
+                    from src.automation.appium_controller import get_instagram_accounts
+                    device_accounts = get_instagram_accounts(self.serial)
+                    current_account = device_accounts[0] if device_accounts else ""
+                    self._log(f"📋 Found {len(device_accounts)} account(s): {device_accounts}")
+                except Exception as _sw_e:
+                    self._log(f"⚠️ Could not fetch device accounts: {_sw_e}")
+                    sw_enabled = False
+
             if ip_enabled:
-                from src.automation.ip_rotator import IPRotator
                 ip_rotator = IPRotator(
                     serial=self.serial,
                     interval_min=ip_min,
@@ -342,32 +402,54 @@ class MainAccountWorker(QThread):
             driver = self._controller.driver
 
             while not self._stop_flag:
+                # Clear interrupt flags at top of each outer iteration.
+                self._window_ended    = False
+                self._daily_limit_hit = False
+
+                # ── Ensure screen is unlocked before any activity ────────────
+                # The screen may have been locked during a rest (stories long
+                # rest or cycle rest) and left locked when _window_ended fired
+                # mid-sleep. Unlock here so no window or cycle ever starts with
+                # a locked screen.
+                if self._screen_locked:
+                    self._unlock_screen(driver)
+
                 # ── Working hours check ──────────────────────────────────────
                 if _schedule.get("enabled"):
                     if not _in_schedule_window(_schedule):
-                        start_t = dtime(int(_schedule["start_hour"]),
-                                        int(_schedule["start_minute"]))
-                        end_t   = dtime(int(_schedule["end_hour"]),
-                                        int(_schedule["end_minute"]))
                         win_start = _next_schedule_window(_schedule)
+                        secs_to_wait = (win_start - datetime.now()).total_seconds()
                         self._log(
-                            f"⏰ Outside working hours "
-                            f"({start_t:%H:%M}–{end_t:%H:%M}). "
-                            f"Next window: {win_start.strftime('%a %I:%M %p')}. Waiting…"
+                            f"⏰ Outside working hours. "
+                            f"Next window: {win_start.strftime('%a %I:%M %p')} "
+                            f"({max(0, int(secs_to_wait // 60))}m away). Waiting…"
                         )
                         self._status("waiting for window")
+                        # Background Instagram while waiting — Home key keeps session intact
                         try:
-                            driver.press_keycode(3)
+                            driver.press_keycode(3)   # Home (graceful)
                         except Exception:
                             pass
-                        self._sleep(60)
+                        # Sleep in 60s chunks, re-checking every minute
+                        while not self._stop_flag and not _in_schedule_window(_schedule):
+                            time.sleep(min(60, max(1,
+                                ((_next_schedule_window(_schedule) - datetime.now())
+                                 .total_seconds()))))
+                        if self._stop_flag:
+                            break
+                        # Clear window-ended flag now that we're back in a live window
+                        self._window_ended = False
+                        # Re-open Instagram now that window is active
+                        self._log("⏰ Working hours window started — opening Instagram…")
+                        self._status("starting session")
+                        try:
+                            driver.activate_app("com.instagram.android")
+                            time.sleep(3)
+                        except Exception:
+                            pass
                         continue
 
                 # ── Midnight reset + daily limit check ───────────────────────
-                # We passed the working hours check — mark that we entered the window
-                # so _sleep knows to stop if the window ends mid-activity.
-                if _schedule.get("enabled"):
-                    self._entered_window = True
                 _today = datetime.now().date()
                 if _today != _last_date:
                     # New day — reset counter
@@ -379,12 +461,60 @@ class MainAccountWorker(QThread):
                     h, m = divmod(int(_active_today), 3600)
                     m //= 60
                     self._log(
-                        f"⏹ Daily time limit reached ({h}h {m:02d}m). "
-                        f"Stopping until midnight."
+                        f"⏹ Daily time limit reached ({h}h {m:02d}m active)."
                     )
+
+                    # ── Account switching ─────────────────────────────────────
+                    if sw_enabled and len(device_accounts) > 1:
+                        next_idx        = (acc_idx + 1) % len(device_accounts)
+                        next_account    = device_accounts[next_idx]
+                        self._log(
+                            f"🔄 Switching account: [{current_account}] → [{next_account}]…"
+                        )
+                        self._status("switching account")
+                        # Press Home to leave Instagram cleanly
+                        try:
+                            driver.press_keycode(3)
+                            self._sleep(1.0)
+                        except Exception:
+                            pass
+                        # Release Appium so ADB can switch
+                        self._log("🔓 Releasing Appium for ADB switch…")
+                        self._controller.release_for_adb()
+                        try:
+                            from src.automation.appium_controller import switch_instagram_account
+                            success = switch_instagram_account(
+                                self.serial, next_account, current_account
+                            )
+                        except Exception as _se:
+                            self._log(f"⚠️ Account switch failed: {_se}")
+                            success = False
+                        # Reconnect Appium
+                        self._log("🔗 Reconnecting Appium after switch…")
+                        self._controller.reattach_after_adb()
+                        driver = self._controller.driver
+                        if success:
+                            acc_idx         = next_idx
+                            current_account = next_account
+                            self._log(f"✅ Now on [{current_account}] — resetting daily counter.")
+                        else:
+                            self._log(f"⚠️ Switch failed — staying on [{current_account}].")
+                        # Reset daily counter for this account
+                        _active_today = 0.0
+                        _last_date    = datetime.now().date()
+                        # Re-launch Instagram — it was closed before the switch
+                        self._log("📱 Re-launching Instagram for new account…")
+                        try:
+                            driver.activate_app("com.instagram.android")
+                            self._sleep(4.0)
+                        except Exception as _ae:
+                            self._log(f"⚠️ Could not re-launch Instagram: {_ae}")
+                        continue
+
+                    # No switching — wait until midnight then resume
+                    self._log("Waiting until midnight to resume…")
                     self._status("daily limit reached")
-                    # Sleep in short chunks until midnight so we can respond to stop()
-                    while not self._stop_flag:
+                    while not self._stop_flag and not self._window_ended:
                         now = datetime.now()
                         midnight = (now + timedelta(days=1)).replace(
                             hour=0, minute=0, second=0, microsecond=0
@@ -393,7 +523,6 @@ class MainAccountWorker(QThread):
                         if secs_left <= 0:
                             break
                         self._sleep(min(secs_left, 60))
-                        # Check if date has rolled over (reset happened)
                         if datetime.now().date() != _last_date:
                             _active_today = 0.0
                             _last_date    = datetime.now().date()
@@ -410,7 +539,7 @@ class MainAccountWorker(QThread):
                     except Exception as e:
                         self._log(f"⚠️ Reattach after rotation failed: {e}")
 
-                if self._stop_flag:
+                if self._stop_flag or self._window_ended or self._daily_limit_hit:
                     break
 
                 # ── Bring Instagram to foreground before each activity ────
@@ -420,83 +549,120 @@ class MainAccountWorker(QThread):
                 except Exception:
                     pass
 
-                # ── Stories ──────────────────────────────────────────────────
+                # ── Build engagement order — randomised each cycle ────────────
+                # Only include enabled sections. Shuffle to avoid always starting
+                # with the same content type, making the pattern less predictable.
+                _enabled_sections = []
                 if story_cfg.get("enabled", True):
-                    self._status("watching stories")
-                    _t0 = time.monotonic()
-                    try:
-                        self._do_stories(driver, story_cfg, reply_cfg, openai_key, spintax_pool)
-                    except Exception as e:
-                        if self._is_connection_error(e):
-                            self._log(f"⚠️ Appium connection lost during stories: {str(e).splitlines()[0]}")
-                            if self._reconnect_appium():
-                                driver = self._controller.driver
-                                continue
-                            else:
-                                break
-                        raise
-                    finally:
-                        _active_today += time.monotonic() - _t0
-
-                if self._stop_flag:
-                    break
-
-                # ── Transition rest: Stories → Feed ──────────────────────
-                if story_cfg.get("enabled", True) and feed_cfg.get("enabled", False):
-                    _tr = random.uniform(5, 15)
-                    self._log(f"⏸ Transition rest {_tr:.0f}s (stories→feed)…")
-                    self._sleep(_tr)
-
-                if self._stop_flag:
-                    break
-
-                # ── Feed ─────────────────────────────────────────────────────
+                    _enabled_sections.append("stories")
                 if feed_cfg.get("enabled", False):
-                    self._status("browsing feed")
-                    _t0 = time.monotonic()
-                    try:
-                        self._do_feed(driver, feed_cfg, reply_cfg, openai_key, spintax_pool)
-                    except Exception as e:
-                        if self._is_connection_error(e):
-                            self._log(f"⚠️ Appium connection lost during feed: {str(e).splitlines()[0]}")
-                            if self._reconnect_appium():
-                                driver = self._controller.driver
-                                continue
-                            else:
-                                break
-                        raise
-                    finally:
-                        _active_today += time.monotonic() - _t0
-
-                if self._stop_flag:
-                    break
-
-                # ── Transition rest: Feed → Reels ─────────────────────────
-                if feed_cfg.get("enabled", False) and reels_cfg.get("enabled", False):
-                    _tr = random.uniform(5, 15)
-                    self._log(f"⏸ Transition rest {_tr:.0f}s (feed→reels)…")
-                    self._sleep(_tr)
-
-                if self._stop_flag:
-                    break
-
-                # ── Reels ────────────────────────────────────────────────────
+                    _enabled_sections.append("feed")
                 if reels_cfg.get("enabled", False):
-                    self._status("watching reels")
-                    _t0 = time.monotonic()
-                    try:
-                        self._do_reels(driver, reels_cfg, reply_cfg, openai_key, spintax_pool)
-                    except Exception as e:
-                        if self._is_connection_error(e):
-                            self._log(f"⚠️ Appium connection lost during reels: {str(e).splitlines()[0]}")
-                            if self._reconnect_appium():
-                                driver = self._controller.driver
-                                continue
-                            else:
-                                break
-                        raise
-                    finally:
-                        _active_today += time.monotonic() - _t0
+                    _enabled_sections.append("reels")
+                random.shuffle(_enabled_sections)
+                self._log(f"🔀 Engagement order this cycle: {' → '.join(_enabled_sections)}")
+
+                _prev_section = None
+                for _section in _enabled_sections:
+                    if self._stop_flag or self._window_ended or self._daily_limit_hit:
+                        break
+
+                    # ── Pre-section daily limit check ─────────────────────────
+                    # Guard against the case where the previous section pushed
+                    # _active_today over the limit and set _daily_limit_hit, but
+                    # the inner-loop break hasn't propagated yet (e.g. transition
+                    # rest runs before we reach this check). Also catches the
+                    # scenario where _active_today >= dl_seconds but
+                    # _daily_limit_hit was not set (e.g. time accrued during
+                    # transition rest after a limit-adjacent section).
+                    if dl_enabled and dl_seconds > 0 and _active_today >= dl_seconds:
+                        self._daily_limit_hit = True
+                        break
+
+                    # ── Transition rest between sections ──────────────────────
+                    if _prev_section is not None:
+                        _tr = random.uniform(5, 15)
+                        self._log(f"⏸ Transition rest {_tr:.0f}s ({_prev_section}→{_section})…")
+                        self._sleep(_tr)
+                    if self._stop_flag or self._window_ended or self._daily_limit_hit:
+                        break
+
+                    if _section == "stories":
+                        # ── Stories ──────────────────────────────────────────
+                        self._status("watching stories")
+                        _t0 = time.monotonic()
+                        try:
+                            _is_last = (_section == _enabled_sections[-1])
+                            self._do_stories(driver, story_cfg, reply_cfg, openai_key, spintax_pool, target_acct, is_last_section=_is_last)
+                        except Exception as e:
+                            if self._is_connection_error(e):
+                                self._log(f"⚠️ Appium connection lost during stories: {str(e).splitlines()[0]}")
+                                if self._reconnect_appium():
+                                    driver = self._controller.driver
+                                    break   # restart cycle with new driver
+                                else:
+                                    self._stop_flag = True
+                                    break
+                            raise
+                        finally:
+                            _active_today += time.monotonic() - _t0
+
+                        # ── Mid-cycle daily limit check ──────────────────
+                        if dl_enabled and dl_seconds > 0 and _active_today >= dl_seconds:
+                            self._daily_limit_hit = True
+                            break
+
+                    elif _section == "feed":
+                        # ── Feed ─────────────────────────────────────────────
+                        self._status("browsing feed")
+                        _t0 = time.monotonic()
+                        try:
+                            self._do_feed(driver, feed_cfg, reply_cfg, openai_key, spintax_pool, target_acct,
+                                          dl_active_today=_active_today, dl_seconds=dl_seconds if dl_enabled else 0, dl_t0=_t0)
+                        except Exception as e:
+                            if self._is_connection_error(e):
+                                self._log(f"⚠️ Appium connection lost during feed: {str(e).splitlines()[0]}")
+                                if self._reconnect_appium():
+                                    driver = self._controller.driver
+                                    break
+                                else:
+                                    self._stop_flag = True
+                                    break
+                            raise
+                        finally:
+                            _active_today += time.monotonic() - _t0
+
+                        # ── Mid-cycle daily limit check ──────────────────
+                        if dl_enabled and dl_seconds > 0 and _active_today >= dl_seconds:
+                            self._daily_limit_hit = True
+                            break
+
+                    elif _section == "reels":
+                        # ── Reels ─────────────────────────────────────────────
+                        self._status("watching reels")
+                        _t0 = time.monotonic()
+                        try:
+                            self._do_reels(driver, reels_cfg, reply_cfg, openai_key, spintax_pool, target_acct,
+                                           dl_active_today=_active_today, dl_seconds=dl_seconds if dl_enabled else 0, dl_t0=_t0)
+                        except Exception as e:
+                            if self._is_connection_error(e):
+                                self._log(f"⚠️ Appium connection lost during reels: {str(e).splitlines()[0]}")
+                                if self._reconnect_appium():
+                                    driver = self._controller.driver
+                                    break
+                                else:
+                                    self._stop_flag = True
+                                    break
+                            raise
+                        finally:
+                            _active_today += time.monotonic() - _t0
+
+                        # ── Mid-cycle daily limit check ──────────────────
+                        if dl_enabled and dl_seconds > 0 and _active_today >= dl_seconds:
+                            self._daily_limit_hit = True
+                            break
+
+                    _prev_section = _section
 
                 # ── Daily limit progress log ──────────────────────────────────
                 if dl_enabled and dl_seconds > 0:
@@ -511,6 +677,9 @@ class MainAccountWorker(QThread):
                     )
 
                 # ── Cycle rest (or stop if disabled) ──────────────────────────
+                # Skip rest entirely if a limit/window interrupt is already pending
+                if self._stop_flag or self._window_ended or self._daily_limit_hit:
+                    continue   # go straight to top of outer loop (switch/wait fires there)
                 cr_cfg     = ma.get("cycle_rest", {})
                 cr_enabled = cr_cfg.get("enabled", True)
                 if not cr_enabled:
@@ -525,13 +694,19 @@ class MainAccountWorker(QThread):
                     driver.press_keycode(3)
                 except Exception:
                     pass
+                # Lock screen during cycle rest so the screen can rest
+                if not self._stop_flag and not self._window_ended and not self._daily_limit_hit:
+                    self._lock_screen(driver)
                 self._sleep(cycle_rest)
+                if not self._stop_flag and not self._window_ended and not self._daily_limit_hit:
+                    self._unlock_screen(driver)
                 # Bring Instagram back to foreground before next cycle
-                try:
-                    driver.activate_app("com.instagram.android")
-                    self._sleep(2.0)
-                except Exception:
-                    pass
+                if not self._stop_flag and not self._window_ended and not self._daily_limit_hit:
+                    try:
+                        driver.activate_app("com.instagram.android")
+                        self._sleep(2.0)
+                    except Exception:
+                        pass
                 # Wait for UiAutomator2 to be responsive after long background —
                 # Android may have killed the instrumentation process during the rest.
                 self._wait_for_uiautomator(driver)
@@ -562,7 +737,10 @@ class MainAccountWorker(QThread):
     # ── Stories ────────────────────────────────────────────────────────────────
 
     def _do_stories(self, driver, story_cfg: dict, reply_cfg: dict,
-                    openai_key: str, spintax_pool: list):
+                    openai_key: str, spintax_pool: list, target_acct: set = None,
+                    is_last_section: bool = False):
+        if target_acct is None:
+            target_acct = set()
         """
         Micro-cycle story watching pattern:
           1. Go home once, open the first unseen story
@@ -598,51 +776,70 @@ class MainAccountWorker(QThread):
         seen_usernames: set = set()  # kept only for logging clarity, not for blocking
 
         try:
-            # ── Go home, scroll to top, then pull-to-refresh ─────────────────
+            # ── Go home, tap Home tab to scroll to top, then pull-to-refresh ──
+            # _go_home navigates to the home feed. If already on home, tapping the
+            # Home tab a second time makes Instagram auto-scroll to the very top —
+            # this is the native behaviour (no manual swipes needed).
             self._go_home(driver)
             self._sleep(1.5)
-            # Scroll to top first — feed may be scrolled down from a previous
-            # session, pushing the story tray off-screen so the tray scan
-            # finds nothing even though stories are available.
             try:
-                size = driver.get_window_size()
-                # Tap the Home tab again to jump to top (Instagram scrolls to
-                # top when you tap the active Home tab, same as most apps)
-                home_btn = driver.find_elements(
-                    __import__('appium').webdriver.common.appiumby.AppiumBy.XPATH,
-                    '//*[contains(@resource-id,"feed_tab")]',
+                from appium.webdriver.common.appiumby import AppiumBy
+                # Tap Home tab — if already on home this auto-scrolls to top.
+                home_tab = driver.find_elements(
+                    AppiumBy.XPATH,
+                    '//*[contains(@resource-id,"feed_tab") or '
+                    '@content-desc="Home" or @content-desc="Feed"]',
                 )
-                if home_btn:
-                    home_btn[0].click()
-                    self._sleep(1.0)
+                if home_tab:
+                    home_tab[0].click()
+                    self._sleep(1.5)
+                # Pull-to-refresh — drag from near top downward to load new stories
+                size = driver.get_window_size()
+                w, h = size["width"], size["height"]
+                driver.swipe(w // 2, int(h * 0.25), w // 2, int(h * 0.70), duration=800)
             except Exception:
                 pass
-            # Pull-to-refresh: swipe down from top of feed to force tray reload
-            try:
-                size = driver.get_window_size()
-                driver.swipe(
-                    size["width"] // 2, int(size["height"] * 0.30),
-                    size["width"] // 2, int(size["height"] * 0.75),
-                    duration=600,
-                )
-            except Exception:
-                pass
-            self._sleep(2.0)
+            self._sleep(3.0)
 
             refreshed_once = False  # will be set True only after a retry-refresh
 
             for cycle_idx in range(num_cycles):
-                if self._stop_flag:
+                if self._stop_flag or self._window_ended:
                     break
 
                 num_stories = random.randint(watch_min, watch_max)
                 self._log(f"  Cycle {cycle_idx+1}/{num_cycles}: watching {num_stories} stories…")
 
                 if cycle_idx > 0:
+                    # Re-open Instagram and navigate home after the short rest Home press
+                    try:
+                        driver.activate_app("com.instagram.android")
+                        self._sleep(2.0)
+                    except Exception:
+                        pass
+                    self._go_home(driver)
+                    self._sleep(0.8)
                     self._scroll_story_tray(driver)
                     self._sleep(0.8)
 
                 opened_username = self._open_next_unseen_story(driver, seen_usernames)
+
+                # ── Recovery: wrong tap drifted to another screen ─────────────
+                # _open_next_unseen_story returns None both when there are no
+                # unseen stories AND when the tap landed on the wrong element.
+                # We attempt a home-recovery + retry (up to 2 times) before
+                # falling through to the "no stories" refresh logic below.
+                _drift_retries = 0
+                while opened_username is None and _drift_retries < 2:
+                    # Check whether we are actually off the home screen (drift)
+                    if not self._is_on_home_feed(driver):
+                        self._log("⚠️ Story tap drift detected — recovering to home feed and retrying…")
+                        self._recover_to_home(driver)
+                        self._sleep(1.5)
+                        opened_username = self._open_next_unseen_story(driver, seen_usernames)
+                        _drift_retries += 1
+                    else:
+                        break   # on home feed — truly no unseen stories visible
 
                 if opened_username is None:
                     if not refreshed_once:
@@ -661,7 +858,7 @@ class MainAccountWorker(QThread):
                 drifted = False
                 stories_watched = 0
                 while stories_watched < num_stories:
-                    if self._stop_flag:
+                    if self._stop_flag or self._window_ended:
                         break
 
                     watch_s       = random.uniform(watch_s_min, watch_s_max)
@@ -683,18 +880,47 @@ class MainAccountWorker(QThread):
                         continue   # re-classify on next iteration
 
                     if screen != "story":
-                        # Not on any story screen — tray ended or drifted
+                        if screen == "other":
+                            try:
+                                src_check = driver.page_source or ""
+                                still_in_viewer = "com.instagram.android:id/reel_viewer" in src_check
+                            except Exception:
+                                still_in_viewer = False
+
+                            if still_in_viewer:
+                                self._log("    ⚠️ Drifted out of story (profile/link tap) — pressing Back to resume…")
+                                try:
+                                    driver.back()
+                                    self._sleep(1.0)
+                                except Exception:
+                                    pass
+                                if self._classify_story_screen(driver) == "story":
+                                    continue  # back in story — re-enter loop
                         break
 
                     self._log(f"    👁️ Story {stories_watched+1}/{num_stories} — watching {watch_s:.1f}s")
 
                     # ── Engage immediately on story open ────────────────────────
-                    if like_on and random.random() < like_pct:
+                    # Read current username from screen — opened_username only reflects
+                    # the first account opened; Instagram auto-advances to other accounts.
+                    _current_story_user = self._get_current_story_username(driver) or opened_username
+                    _is_target = (
+                        bool(target_acct)
+                        and _current_story_user
+                        and _current_story_user.strip().lower().lstrip("@") in target_acct
+                    )
+                    if _is_target:
+                        self._log(f"    🎯 Target account '{_current_story_user}' — forcing full engagement")
                         self._story_like(driver)
-                    if react_on and random.random() < react_pct:
                         self._story_react(driver)
-                    if comment_on and random.random() < comment_pct:
                         self._story_reply(driver, spintax_pool, openai_key, reply_cfg)
+                    else:
+                        if like_on and random.random() < like_pct:
+                            self._story_like(driver)
+                        if react_on and random.random() < react_pct:
+                            self._story_react(driver)
+                        if comment_on and random.random() < comment_pct:
+                            self._story_reply(driver, spintax_pool, openai_key, reply_cfg)
 
                     stories_watched += 1
 
@@ -704,6 +930,9 @@ class MainAccountWorker(QThread):
                     while elapsed < watch_s:
                         self._sleep(poll)
                         elapsed += poll
+
+                        if self._window_ended or self._stop_flag:
+                            break
 
                         screen_mid = self._classify_story_screen(driver)
 
@@ -722,7 +951,29 @@ class MainAccountWorker(QThread):
                             break
 
                         if screen_mid != "story":
-                            # Instagram auto-advanced to next story or tray ended
+                            # Check if this is a drift (tapped profile/link) vs
+                            # Instagram auto-advancing past the last story.
+                            if screen_mid == "other":
+                                # Only press Back if we're still inside a story-like
+                                # context (reel_viewer still in hierarchy). If the
+                                # story already closed and we're on home, Back would
+                                # exit Instagram entirely — don't do it.
+                                try:
+                                    src_check = driver.page_source or ""
+                                    still_in_viewer = "com.instagram.android:id/reel_viewer" in src_check
+                                except Exception:
+                                    still_in_viewer = False
+
+                                if still_in_viewer:
+                                    self._log("    ⚠️ Drifted out of story (profile/link tap) — pressing Back to resume…")
+                                    try:
+                                        driver.back()
+                                        self._sleep(1.0)
+                                    except Exception:
+                                        pass
+                                    if self._classify_story_screen(driver) == "story":
+                                        elapsed = watch_s  # end watch timer, continue outer loop
+                                        break
                             auto_advanced = True
                             break
 
@@ -770,16 +1021,28 @@ class MainAccountWorker(QThread):
                 if cycle_idx < num_cycles - 1:
                     rest = random.uniform(rest_s_min, rest_s_max)
                     self._log(f"  😴 Short rest {rest:.0f}s before next cycle…")
+                    # Press Home to background Instagram during the short rest
+                    try:
+                        driver.press_keycode(3)
+                    except Exception:
+                        pass
                     self._sleep(rest)
 
-            rest_long = random.uniform(rest_l_min, rest_l_max)
-            self._log(f"😴 Long rest {rest_long:.0f}s after story session…")
-            # Press Home to background Instagram during the long rest — human behaviour.
+            # ── Session complete — close Instagram, then take the long rest ──────
+            self._log("✅ Stories session complete.")
             try:
-                driver.press_keycode(3)
+                driver.press_keycode(3)   # Home — close Instagram before resting
             except Exception:
                 pass
+            rest_long = random.uniform(rest_l_min, rest_l_max)
+            self._log(f"😴 Long rest {rest_long:.0f}s…")
+            if not self._stop_flag:
+                self._lock_screen(driver)
             self._sleep(rest_long)
+            # Unlock now only if more sections follow in this cycle.
+            # If stories is the last section, stay locked — the cycle rest will unlock.
+            if not self._stop_flag and not is_last_section:
+                self._unlock_screen(driver)
             # Bring Instagram back to foreground before the next phase.
             try:
                 driver.activate_app("com.instagram.android")
@@ -788,7 +1051,6 @@ class MainAccountWorker(QThread):
                 pass
             # Wait for UiAutomator2 to be responsive after long background.
             self._wait_for_uiautomator(driver)
-            self._log("✅ Stories session complete.")
 
         except Exception as exc:
             if self._is_connection_error(exc):
@@ -798,6 +1060,96 @@ class MainAccountWorker(QThread):
                 driver.back()
             except Exception:
                 pass
+
+    def _is_on_home_feed(self, driver) -> bool:
+        """
+        Return True if we are currently on the Instagram home feed
+        (story tray visible OR home/feed_tab selected in nav bar).
+        Does NOT navigate — purely a presence check.
+        """
+        from appium.webdriver.common.appiumby import AppiumBy
+        try:
+            if driver.find_elements(
+                AppiumBy.XPATH, '//*[@content-desc="reels_tray_container"]'
+            ):
+                return True
+            if driver.find_elements(
+                AppiumBy.XPATH,
+                '//*[contains(@resource-id,"feed_tab") and @selected="true"]',
+            ):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _lock_screen(self, driver):
+        """
+        Lock the device screen using the power key (keycode 26).
+        Skips silently if the screen is already locked by us.
+        """
+        if self._screen_locked:
+            return
+        try:
+            driver.press_keycode(26)
+            self._screen_locked = True
+            self._log("🔒 Screen locked.")
+        except Exception:
+            pass
+
+    def _unlock_screen(self, driver):
+        """
+        Wake the device screen after a lock.
+        1. Press power key (keycode 26) to turn the screen back on.
+        2. Press the Menu key (keycode 82) — on most Android lock screens this
+           dismisses the keyguard without triggering any home-screen gesture.
+        No touch events — any tap/swipe on the home screen risks triggering
+        the wallpaper/widget long-press menu.
+        """
+        try:
+            driver.press_keycode(26)
+            self._sleep(1.0)
+            driver.press_keycode(82)
+            self._sleep(1.0)
+            self._screen_locked = False
+            self._log("🔓 Screen unlocked.")
+        except Exception:
+            pass
+
+    def _get_current_story_username(self, driver) -> str:
+        """
+        Read the username of the story currently on screen from
+        reel_viewer_title TextView — confirmed from stories_open.xml.
+        Falls back to reel_viewer_text_container content-desc parsing.
+        Returns lowercase username or "" on failure.
+        """
+        from appium.webdriver.common.appiumby import AppiumBy
+        import re as _re
+        try:
+            els = driver.find_elements(
+                AppiumBy.ID,
+                "com.instagram.android:id/reel_viewer_title",
+            )
+            if els:
+                txt = (els[0].get_attribute("text") or "").strip().lower()
+                if txt:
+                    return txt
+        except Exception:
+            pass
+        # Fallback: parse reel_viewer_text_container content-desc
+        # e.g. "1toddthagodd updated their story 19 hours ago, with a photo, story 2 of 4"
+        try:
+            els = driver.find_elements(
+                AppiumBy.ID,
+                "com.instagram.android:id/reel_viewer_text_container",
+            )
+            if els:
+                desc = (els[0].get_attribute("content-desc") or "").strip()
+                m = _re.match(r'^([\w.\-_]+)\s+updated', desc)
+                if m:
+                    return m.group(1).lower()
+        except Exception:
+            pass
+        return ""
 
     def _scroll_story_tray(self, driver):
         """Swipe the story tray left to reveal the next batch of unseen rings."""
@@ -1411,7 +1763,10 @@ class MainAccountWorker(QThread):
             return False
 
     def _do_feed(self, driver, feed_cfg: dict, reply_cfg: dict,
-                 openai_key: str, spintax_pool: list):
+                 openai_key: str, spintax_pool: list, target_acct: set = None,
+                 dl_active_today: float = 0.0, dl_seconds: float = 0, dl_t0: float = None):
+        if target_acct is None:
+            target_acct = set()
         """
         Browse the feed, engaging with each post at most ONCE per session.
 
@@ -1440,8 +1795,15 @@ class MainAccountWorker(QThread):
 
             engaged_posts: set = set()
             scrolls_done  = 0
+            _dl_t0 = dl_t0 if dl_t0 is not None else time.monotonic()
 
-            while scrolls_done < num_scrolls and not self._stop_flag:
+            def _feed_limit_hit() -> bool:
+                """True if daily limit exceeded using live elapsed time."""
+                if not dl_seconds:
+                    return False
+                return (dl_active_today + (time.monotonic() - _dl_t0)) >= dl_seconds
+
+            while scrolls_done < num_scrolls and not self._stop_flag and not self._window_ended and not self._daily_limit_hit and not _feed_limit_hit():
                 if not self._is_on_feed(driver):
                     self._log("⚠️ Drifted from home feed — returning home and resuming…")
                     self._go_home(driver)
@@ -1460,10 +1822,87 @@ class MainAccountWorker(QThread):
                     # Mark BEFORE actions — liking changes DOM/desc
                     if post_id:
                         engaged_posts.add(post_id)
-                    if like_on and random.random() < like_pct:
-                        self._feed_like_visible(driver)
-                    if comment_on and random.random() < comment_pct:
+                    # Target account: always like AND comment regardless of settings/%.
+                    _is_target = (
+                        bool(target_acct)
+                        and bool(post_id)
+                        and post_id.lower().lstrip("@") in target_acct
+                    )
+                    if _is_target:
+                        self._log(f"  🎯 Target account post ('{post_id}') — forcing full engagement")
+                        # The target post's like button may be off-screen below.
+                        # Scroll until it appears, then scope it to the correct post
+                        # using row_feed_profile_header bottom-Y → nearest like button.
+                        _liked = False
+                        try:
+                            import re as _re
+
+                            def _bounds(el):
+                                b = el.get_attribute("bounds") or ""
+                                m = _re.findall(r'\[(\d+),(\d+)\]', b)
+                                if len(m) >= 2:
+                                    return int(m[0][1]), int(m[1][1])  # top_y, bottom_y
+                                return None, None
+
+                            # Scroll until target's like button is on screen (up to 6 scrolls)
+                            for _sc in range(6):
+                                _headers = driver.find_elements(
+                                    AppiumBy.ID,
+                                    "com.instagram.android:id/row_feed_profile_header",
+                                )
+                                _like_btns = driver.find_elements(
+                                    AppiumBy.XPATH,
+                                    '//*[@resource-id="com.instagram.android:id/row_feed_button_like" '
+                                    'and @content-desc="Like"]',
+                                )
+
+                                # Find target header bottom-Y
+                                _hdr_bottom = None
+                                for _hdr in _headers:
+                                    _d = (_hdr.get_attribute("content-desc") or "").lower()
+                                    _m = _re.match(r'^([\w.\-_]+)\s+posted', _d)
+                                    if _m and _m.group(1) in target_acct:
+                                        _, _hdr_bottom = _bounds(_hdr)
+                                        break
+
+                                if _hdr_bottom is None:
+                                    # Header scrolled off top — target post is above, scroll back up isn't needed
+                                    # Use fallback generic like
+                                    break
+
+                                # Find like button closest below the header
+                                _best_btn = None
+                                _best_dist = 99999
+                                for _btn in _like_btns:
+                                    _btn_top, _ = _bounds(_btn)
+                                    if _btn_top is not None:
+                                        _dist = _btn_top - _hdr_bottom
+                                        if 0 <= _dist < _best_dist:
+                                            _best_dist = _dist
+                                            _best_btn = _btn
+
+                                if _best_btn is not None:
+                                    # Like button is on screen and scoped to target post
+                                    _best_btn.click()
+                                    self._sleep(0.5)
+                                    self._log("  ❤️ Liked a feed post.")
+                                    _liked = True
+                                    break
+
+                                # Like button not yet on screen — scroll down a bit
+                                self._feed_scroll(driver)
+                                self._sleep(0.8)
+
+                            if not _liked:
+                                self._feed_like_visible(driver)
+                        except Exception:
+                            self._feed_like_visible(driver)
                         self._feed_comment_visible(driver, spintax_pool, openai_key, reply_cfg)
+                    else:
+                        if like_on and random.random() < like_pct:
+                            self._feed_like_visible(driver)
+                        if comment_on and random.random() < comment_pct:
+                            self._feed_comment_visible(driver, spintax_pool, openai_key, reply_cfg)
 
                 self._feed_scroll(driver)
                 self._sleep(random.uniform(scroll_min, scroll_max))
@@ -1790,7 +2229,10 @@ class MainAccountWorker(QThread):
     # ── Reels ──────────────────────────────────────────────────────────────────
 
     def _do_reels(self, driver, reels_cfg: dict, reply_cfg: dict,
-                  openai_key: str, spintax_pool: list):
+                  openai_key: str, spintax_pool: list, target_acct: set = None,
+                  dl_active_today: float = 0.0, dl_seconds: float = 0, dl_t0: float = None):
+        if target_acct is None:
+            target_acct = set()
         try:
             self._go_reels(driver)
             self._sleep(2)
@@ -1806,8 +2248,16 @@ class MainAccountWorker(QThread):
             comment_pct = float(reels_cfg.get("comment_pct", 5)) / 100.0
 
             reels_watched = 0
+            _dl_t0 = dl_t0 if dl_t0 is not None else time.monotonic()
+
+            def _reels_limit_hit() -> bool:
+                """True if daily limit exceeded using live elapsed time."""
+                if not dl_seconds:
+                    return False
+                return (dl_active_today + (time.monotonic() - _dl_t0)) >= dl_seconds
+
             for i in range(num_reels):
-                if self._stop_flag:
+                if self._stop_flag or self._window_ended or self._daily_limit_hit or _reels_limit_hit():
                     break
                 # Verify we are still on the Reels tab every iteration.
                 if not self._is_on_reels(driver):
@@ -1817,10 +2267,56 @@ class MainAccountWorker(QThread):
                 watch_s = random.uniform(watch_min, watch_max)
                 self._log(f"  🎬 Reel {i+1}/{num_reels} — watching {watch_s:.1f}s")
                 self._sleep(watch_s)
-                if like_on and random.random() < like_pct:
+                # Check if this reel belongs to the target account.
+                # Source confirmed from XML: clips_video_container content-desc =
+                # "Reel by USERNAME. Double tap to play or pause."
+                # Fallback: "Profile picture of USERNAME" image node.
+                _reel_owner = ""
+                if target_acct:
+                    try:
+                        import re as _re
+                        from appium.webdriver.common.appiumby import AppiumBy
+                        # Primary: clips_video_container content-desc
+                        _els = driver.find_elements(
+                            AppiumBy.ID,
+                            "com.instagram.android:id/clips_video_container",
+                        )
+                        for _el in _els:
+                            _desc = _el.get_attribute("content-desc") or ""
+                            # content-desc = "Reel by USERNAME. Double tap to play or pause."
+                            # USERNAME can contain dots (e.g. trio.shop, made.by.kagan)
+                            # Stop at ". " (period+space) not any period.
+                            _m = _re.search(r'Reel by (.+?)\.\s', _desc)
+                            if _m:
+                                _reel_owner = _m.group(1).strip().lower()
+                                break
+                        # Fallback: profile picture node
+                        if not _reel_owner:
+                            _els2 = driver.find_elements(
+                                AppiumBy.XPATH,
+                                '//*[starts-with(@content-desc,"Profile picture of ")]',
+                            )
+                            if _els2:
+                                _desc2 = _els2[0].get_attribute("content-desc") or ""
+                                _m2 = _re.search(r'Profile picture of (.+)', _desc2)
+                                if _m2:
+                                    _reel_owner = _m2.group(1).strip().lower()
+                    except Exception:
+                        pass
+                _is_target = (
+                    bool(target_acct)
+                    and bool(_reel_owner)
+                    and _reel_owner.lower().lstrip("@") in target_acct
+                )
+                if _is_target:
+                    self._log(f"  🎯 Target account reel ('{_reel_owner}') — forcing full engagement")
                     self._reel_like(driver)
-                if comment_on and random.random() < comment_pct:
                     self._reel_comment(driver, spintax_pool, openai_key, reply_cfg)
+                else:
+                    if like_on and random.random() < like_pct:
+                        self._reel_like(driver)
+                    if comment_on and random.random() < comment_pct:
+                        self._reel_comment(driver, spintax_pool, openai_key, reply_cfg)
                 # Swipe up to next reel
                 self._feed_scroll(driver)
                 self._sleep(random.uniform(0.5, 1.5))
