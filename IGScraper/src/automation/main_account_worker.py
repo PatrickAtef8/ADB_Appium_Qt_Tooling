@@ -371,6 +371,26 @@ class MainAccountWorker(QThread):
         current_account = ""
 
         try:
+            # ── Pre-session working hours gate ───────────────────────────────
+            # Block here (before opening Appium or Instagram) if we are
+            # currently outside the configured working hours window.  This
+            # ensures the MA never opens Instagram ahead of schedule.
+            if _schedule.get("enabled") and not _in_schedule_window(_schedule):
+                win_start = _next_schedule_window(_schedule)
+                secs_to_wait = max(0, (win_start - datetime.now()).total_seconds())
+                self._log(
+                    f"⏰ Outside working hours — waiting before starting. "
+                    f"Next window: {win_start.strftime('%a %I:%M %p')} "
+                    f"({max(0, int(secs_to_wait // 60))}m away)…"
+                )
+                self._status("waiting for window")
+                while not self._stop_flag and not _in_schedule_window(_schedule):
+                    time.sleep(min(60, max(1,
+                        (_next_schedule_window(_schedule) - datetime.now()).total_seconds())))
+                if self._stop_flag:
+                    return
+                self._log("⏰ Working hours window reached — starting session now.")
+
             ip_rotator = None
             if sw_enabled:
                 try:
@@ -1746,6 +1766,174 @@ class MainAccountWorker(QThread):
 
         return ""
 
+    def _get_feed_ad_username(self, driver) -> str:
+        """
+        If a sponsored (ad) post is visible anywhere on screen, return its
+        lowercase username string.  Returns '' if no ad is detected.
+
+        Uses secondary_label resource-id as the ANCHOR — this is the dedicated
+        Instagram view that shows the 'Sponsored' text beneath the poster's
+        name in the feed header row.  Confirmed from XML:
+          resource-id: com.instagram.android:id/secondary_label
+          text:        'Sponsored'
+          bounds:      [188,1941][450,2014]  (example — sits under username)
+
+        Because secondary_label is a dedicated resource-id (not a generic text
+        node), it cannot be confused with the word 'Sponsored' appearing in a
+        caption or comment.
+
+        Once the label is confirmed, we walk UP to the nearest
+        row_feed_profile_header ancestor (or use row_feed_photo_profile_name
+        inside the same header block) to extract the username — the same stable
+        identifier used by _get_current_post_id.  This gives us a username we
+        can track in a skip-set across scroll iterations.
+
+        Also checks media_group content-desc prefix 'Sponsored Photo/Video by'
+        as a secondary signal (confirmed from XML:
+        content-desc='Sponsored Photo by Mōko, 654 likes').
+        """
+        import re
+        from appium.webdriver.common.appiumby import AppiumBy
+        try:
+            src = driver.page_source
+
+            # Fast path — none of the markers present
+            if (
+                'secondary_label' not in src
+                and 'Sponsored Photo by' not in src
+                and 'Sponsored Video by' not in src
+                and 'Sponsored Reel by' not in src
+            ):
+                return ''
+
+            # Primary: secondary_label with text="Sponsored" — most reliable
+            if 'secondary_label' in src:
+                label_els = driver.find_elements(
+                    AppiumBy.XPATH,
+                    '//*[@resource-id="com.instagram.android:id/secondary_label"'
+                    ' and @text="Sponsored"]',
+                )
+                if label_els:
+                    # Extract username from row_feed_photo_profile_name
+                    # which always lives in the same header block as secondary_label
+                    name_els = driver.find_elements(
+                        AppiumBy.ID,
+                        'com.instagram.android:id/row_feed_photo_profile_name',
+                    )
+                    if name_els:
+                        uname = (name_els[0].get_attribute('text') or '').strip().lower()
+                        if uname:
+                            return uname
+                    # Fallback: row_feed_profile_header content-desc
+                    hdr_els = driver.find_elements(
+                        AppiumBy.ID,
+                        'com.instagram.android:id/row_feed_profile_header',
+                    )
+                    for hdr in hdr_els:
+                        desc = hdr.get_attribute('content-desc') or ''
+                        m = re.match(r'^([\w.\-_]+)\s+posted', desc)
+                        if m:
+                            return m.group(1).lower()
+                    # Last resort: return a sentinel so the caller still skips
+                    return '__sponsored__'
+
+            # Secondary: media_group content-desc starts with "Sponsored X by"
+            for prefix in ('Sponsored Photo by', 'Sponsored Video by', 'Sponsored Reel by'):
+                if prefix in src:
+                    mg_els = driver.find_elements(
+                        AppiumBy.XPATH,
+                        f'//*[@resource-id="com.instagram.android:id/media_group"'
+                        f' and starts-with(@content-desc,"{prefix}")]',
+                    )
+                    if mg_els:
+                        desc = mg_els[0].get_attribute('content-desc') or ''
+                        m = re.search(r'\bby\s+([^,]+)', desc, re.IGNORECASE)
+                        if m:
+                            return m.group(1).strip().lower()
+                        return '__sponsored__'
+
+        except Exception:
+            pass
+        return ''
+
+    def _is_feed_post_ad(self, driver) -> bool:
+        """Bool wrapper around _get_feed_ad_username for callers that only need
+        a yes/no answer."""
+        return bool(self._get_feed_ad_username(driver))
+
+
+
+    def _is_reel_ad(self, driver) -> bool:
+        """
+        Return True if the reel currently on screen is a sponsored (ad) reel.
+
+        Instagram labels sponsored reels in two confirmed ways (from XML dump):
+          1. reels_sponsored_label node with content-desc="Sponsored"
+             (resource-id: com.instagram.android:id/reels_sponsored_label)
+          2. clips_video_container content-desc starts with "Sponsored Reel by"
+             (resource-id: com.instagram.android:id/clips_video_container)
+          3. text="Sponsored" overlay (older Instagram versions)
+          4. Paid-partnership reels: inline_insight_account_name_view visible
+
+        NOTE: The reels_sponsored_label uses content-desc="Sponsored", NOT
+        text="Sponsored", so checking only text= misses sponsored reels entirely.
+        The clips_video_container content-desc for sponsored reels reads
+        "Sponsored Reel by USERNAME. Double tap to play or pause." — distinct
+        from organic reels which read "Reel by USERNAME. Double tap...".
+
+        Detection strategy (fast path first):
+          1. page_source scan — if none of the markers appear, return False
+             immediately (one round-trip).
+          2. Confirm with find_elements to avoid false positives from captions.
+        """
+        from appium.webdriver.common.appiumby import AppiumBy
+        try:
+            src = driver.page_source
+            # Fast-path: none of the known markers present → not an ad
+            if (
+                'reels_sponsored_label' not in src
+                and 'Sponsored Reel by' not in src
+                and 'text="Sponsored"' not in src
+                and "Paid partnership" not in src
+            ):
+                return False
+
+            # Check 1: reels_sponsored_label with content-desc="Sponsored"
+            # This is the primary indicator confirmed from XML.
+            if 'reels_sponsored_label' in src:
+                if driver.find_elements(
+                    AppiumBy.ID,
+                    "com.instagram.android:id/reels_sponsored_label",
+                ):
+                    return True
+
+            # Check 2: clips_video_container content-desc contains "Sponsored Reel by"
+            # Confirmed from XML: content-desc="Sponsored Reel by USERNAME. Double tap..."
+            if 'Sponsored Reel by' in src:
+                _els = driver.find_elements(
+                    AppiumBy.XPATH,
+                    '//*[@resource-id="com.instagram.android:id/clips_video_container" '
+                    'and starts-with(@content-desc,"Sponsored Reel by")]',
+                )
+                if _els:
+                    return True
+
+            # Check 3: text="Sponsored" overlay (older IG versions / fallback)
+            if 'text="Sponsored"' in src:
+                if driver.find_elements(AppiumBy.XPATH, '//*[@text="Sponsored"]'):
+                    return True
+
+            # Check 4: Paid-partnership label
+            if "Paid partnership" in src:
+                if driver.find_elements(
+                    AppiumBy.ID,
+                    "com.instagram.android:id/inline_insight_account_name_view",
+                ):
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _feed_action_bar_visible(self, driver) -> bool:
         """
         Return True only if the post action bar (like + comment buttons) is
@@ -1814,6 +2002,46 @@ class MainAccountWorker(QThread):
                 if post_id and post_id in engaged_posts:
                     # Same post still on screen — scroll only, no re-engagement
                     self._feed_scroll(driver)
+                    self._sleep(random.uniform(scroll_min, scroll_max))
+                    scrolls_done += 1
+                    continue
+
+                # ── Sponsored-post guard ─────────────────────────────────
+                # Uses secondary_label resource-id as the anchor — the dedicated
+                # Instagram view that shows 'Sponsored' under the poster's name.
+                # Immune to false positives from captions or comments.
+                #
+                # Exit condition: scroll until secondary_label is fully gone from
+                # the screen hierarchy (not until post_id changes).
+                #
+                # Why post_id is unreliable as exit condition:
+                #   When a sponsored post appears at the bottom of screen, the
+                #   organic post above it (e.g. a reel preview) may have NO
+                #   row_feed_photo_profile_name node — so _get_current_post_id
+                #   falls through to row_feed_photo_profile_name of the sponsored
+                #   post's header, which IS in the hierarchy.  The skip loop then
+                #   sees post_id == sponsored_username and keeps scrolling, blowing
+                #   past the perfectly valid organic post above.
+                #
+                # Correct exit condition: the secondary_label node disappears from
+                #   page_source once the sponsored post header scrolls off the top.
+                #   At that point the sponsored post is gone and any visible action
+                #   bar belongs to the next organic post — safe to engage.
+                _ad_username = self._get_feed_ad_username(driver)
+                if _ad_username:
+                    self._log(f"  ⏭️ Sponsored (ad) post — skipping")
+                    _skip_attempts = 0
+                    while _skip_attempts < 8 and not self._stop_flag:
+                        self._feed_scroll(driver)
+                        self._sleep(0.5)
+                        _skip_attempts += 1
+                        # Stop as soon as the secondary_label is gone from the DOM.
+                        # That means the sponsored post header has fully scrolled
+                        # off the top — the ad is no longer on screen at all.
+                        if not self._is_feed_post_ad(driver):
+                            break
+                        # If a new sponsored post appeared immediately after,
+                        # keep looping — the while condition will catch it.
                     self._sleep(random.uniform(scroll_min, scroll_max))
                     scrolls_done += 1
                     continue
@@ -2267,6 +2495,15 @@ class MainAccountWorker(QThread):
                 watch_s = random.uniform(watch_min, watch_max)
                 self._log(f"  🎬 Reel {i+1}/{num_reels} — watching {watch_s:.1f}s")
                 self._sleep(watch_s)
+
+                # Skip sponsored / ad reels — do not like or comment on them.
+                if self._is_reel_ad(driver):
+                    self._log("  ⏭️ Sponsored (ad) reel — skipping engagement")
+                    self._feed_scroll(driver)
+                    self._sleep(random.uniform(0.5, 1.5))
+                    reels_watched += 1
+                    continue
+
                 # Check if this reel belongs to the target account.
                 # Source confirmed from XML: clips_video_container content-desc =
                 # "Reel by USERNAME. Double tap to play or pause."

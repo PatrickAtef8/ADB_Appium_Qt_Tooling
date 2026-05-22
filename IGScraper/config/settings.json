@@ -22,16 +22,15 @@
     "rest_min_seconds": 1800,
     "rest_max_seconds": 3600,
     "session_break_every": 100,
-    "switch_mode": "hours",
+    "switch_mode": "profiles",
     "switch_hours": 1
   },
   "schedule": {
     "enabled": false,
-    "start_hour": 16,
+    "start_hour": 9,
     "start_minute": 0,
-    "end_hour": 18,
-    "end_minute": 0,
-    "saved_at": "2026-05-09T01:09:47.927787"
+    "end_hour": 19,
+    "end_minute": 0
   },
   "appium": {
     "host": "127.0.0.1",
@@ -72,11 +71,13 @@
   "target_list": [],
   "blacklist": [],
   "last_target": "",
-  "last_mode": "following",
+  "last_mode": "followers",
   "last_count": 100,
   "last_device": "",
   "targets_per_phone": [
-    [],
+    [
+      "nike"
+    ],
     [],
     [],
     [],
@@ -87,77 +88,6 @@
     [],
     []
   ],
-  "sheets_enabled": false,
-  "mirror_width": 643,
-  "ip_rotation": {
-    "enabled": false,
-    "interval_min_minutes": 5.0,
-    "interval_max_minutes": 15.0
-  },
-  "main_account": {
-    "enabled": false,
-    "phone_slot": 0,
-    "target_account": [],
-    "daily_limit": {
-      "enabled": true,
-      "hours": 1,
-      "minutes": 0
-    },
-    "stories": {
-      "enabled": true,
-      "watch_min": 10,
-      "watch_max": 15,
-      "rest_short_min": 10.0,
-      "rest_short_max": 30.0,
-      "short_cycles_min": 1,
-      "short_cycles_max": 2,
-      "rest_long_min": 30.0,
-      "rest_long_max": 60.0,
-      "watch_seconds_min": 6.0,
-      "watch_seconds_max": 10.0,
-      "like_enabled": true,
-      "like_pct": 30,
-      "react_enabled": true,
-      "react_pct": 50,
-      "comment_enabled": false,
-      "comment_pct": 5
-    },
-    "feed": {
-      "enabled": true,
-      "num_scrolls_min": 15,
-      "num_scrolls_max": 22,
-      "scroll_min": 2.0,
-      "scroll_max": 4.0,
-      "like_enabled": false,
-      "like_pct": 100,
-      "comment_enabled": false,
-      "comment_pct": 100
-    },
-    "reels": {
-      "enabled": true,
-      "num_reels_min": 10,
-      "num_reels_max": 15,
-      "watch_seconds_min": 5.0,
-      "watch_seconds_max": 7.0,
-      "like_enabled": false,
-      "like_pct": 30,
-      "comment_enabled": true,
-      "comment_pct": 5
-    },
-    "cycle_rest": {
-      "enabled": true,
-      "min": 60.0,
-      "max": 120.0
-    },
-    "account_switching": {
-      "enabled": true
-    },
-    "replies": {
-      "spintax_templates": [],
-      "openai_api_key": "",
-      "openai_context": "Write a short friendly reply to this Instagram story."
-    }
-  },
   "phone_nicknames": [
     "",
     "",
@@ -175,37 +105,25 @@
       "enabled": false,
       "windows": [
         {
-          "start_hour": 8,
+          "start_hour": 20,
           "start_minute": 0,
           "end_hour": 20,
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111573"
+      "saved_at": "2026-05-22T14:07:19.556011"
     },
     {
-      "enabled": false,
+      "enabled": true,
       "windows": [
         {
-          "start_hour": 8,
-          "start_minute": 0,
-          "end_hour": 8,
-          "end_minute": 0
+          "start_hour": 14,
+          "start_minute": 5,
+          "end_hour": 14,
+          "end_minute": 15
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111599"
-    },
-    {
-      "enabled": false,
-      "windows": [
-        {
-          "start_hour": 8,
-          "start_minute": 0,
-          "end_hour": 20,
-          "end_minute": 0
-        }
-      ],
-      "saved_at": "2026-05-20T09:41:31.111608"
+      "saved_at": "2026-05-22T14:07:19.556044"
     },
     {
       "enabled": false,
@@ -217,7 +135,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111616"
+      "saved_at": "2026-05-22T14:07:19.556054"
     },
     {
       "enabled": false,
@@ -229,7 +147,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111624"
+      "saved_at": "2026-05-22T14:07:19.556064"
     },
     {
       "enabled": false,
@@ -241,7 +159,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111632"
+      "saved_at": "2026-05-22T14:07:19.556074"
     },
     {
       "enabled": false,
@@ -253,7 +171,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111639"
+      "saved_at": "2026-05-22T14:07:19.556084"
     },
     {
       "enabled": false,
@@ -265,7 +183,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111647"
+      "saved_at": "2026-05-22T14:07:19.556093"
     },
     {
       "enabled": false,
@@ -277,7 +195,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111655"
+      "saved_at": "2026-05-22T14:07:19.556103"
     },
     {
       "enabled": false,
@@ -289,7 +207,90 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-05-20T09:41:31.111662"
+      "saved_at": "2026-05-22T14:07:19.556113"
+    },
+    {
+      "enabled": false,
+      "windows": [
+        {
+          "start_hour": 8,
+          "start_minute": 0,
+          "end_hour": 20,
+          "end_minute": 0
+        }
+      ],
+      "saved_at": "2026-05-22T14:07:19.556124"
     }
-  ]
+  ],
+  "sheets_enabled": false,
+  "ip_rotation": {
+    "enabled": false,
+    "interval_min_minutes": 5.0,
+    "interval_max_minutes": 15.0
+  },
+  "main_account": {
+    "enabled": false,
+    "phone_slot": 0,
+    "target_account": [],
+    "daily_limit": {
+      "enabled": true,
+      "hours": 4,
+      "minutes": 0
+    },
+    "stories": {
+      "enabled": true,
+      "watch_min": 3,
+      "watch_max": 7,
+      "rest_short_min": 10.0,
+      "rest_short_max": 30.0,
+      "short_cycles_min": 3,
+      "short_cycles_max": 6,
+      "rest_long_min": 120.0,
+      "rest_long_max": 300.0,
+      "watch_seconds_min": 3.0,
+      "watch_seconds_max": 8.0,
+      "like_enabled": false,
+      "like_pct": 30,
+      "react_enabled": false,
+      "react_pct": 20,
+      "comment_enabled": false,
+      "comment_pct": 10
+    },
+    "feed": {
+      "enabled": true,
+      "num_scrolls_min": 5,
+      "num_scrolls_max": 10,
+      "scroll_min": 1.5,
+      "scroll_max": 4.0,
+      "like_enabled": false,
+      "like_pct": 40,
+      "comment_enabled": false,
+      "comment_pct": 5
+    },
+    "reels": {
+      "enabled": true,
+      "num_reels_min": 5,
+      "num_reels_max": 10,
+      "watch_seconds_min": 5.0,
+      "watch_seconds_max": 15.0,
+      "like_enabled": false,
+      "like_pct": 30,
+      "comment_enabled": false,
+      "comment_pct": 5
+    },
+    "cycle_rest": {
+      "enabled": true,
+      "min": 60.0,
+      "max": 300.0
+    },
+    "account_switching": {
+      "enabled": false
+    },
+    "replies": {
+      "spintax_templates": [],
+      "openai_api_key": "",
+      "openai_context": ""
+    }
+  },
+  "mirror_width": 500
 }

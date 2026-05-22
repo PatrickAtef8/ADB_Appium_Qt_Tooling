@@ -643,8 +643,13 @@ class PhoneWorker(QThread):
                     # Don't advance target_idx — loop back to wait
                 else:
                     self._log(f"✅ @{target} done — {count} this run, {total_collected} total")
-                    self.signals.target_done.emit(self.phone_index, target)   # notify UI
-                    target_idx += 1   # advance to next target
+                    # Only remove the target from the UI when it genuinely
+                    # completed.  If the user pressed Stop mid-target,
+                    # _stop_flag is True — skip the signal so the target stays
+                    # in the list for the next run.
+                    if not self._stop_flag:
+                        self.signals.target_done.emit(self.phone_index, target)   # notify UI
+                    target_idx += 1   # advance index regardless so we don't re-run on restart
 
                     if self._stop_flag:
                         break
@@ -1697,25 +1702,29 @@ class WorkingHoursPage(PageWidget):
 
             intervals.append((prev_start, prev_end, next_start, next_end, wd))
 
-        # ── Detect overlaps (daily repeat — compare over a 48-hour horizon) ──
-        # Two daily-repeating windows A and B overlap if, within any 48-hour
-        # sliding view, any copy of A intersects any copy of B.
-        # Simpler approach: for each pair compare all four shifted copies.
+        # ── Detect overlaps (daily repeat) ───────────────────────────────────
+        # Two daily-repeating windows A and B overlap if either:
+        #   (a) their same-day copies intersect, OR
+        #   (b) one window wraps past midnight into the next day and overlaps
+        #       the other window's next-day copy.
+        # We compare only two combinations per pair:
+        #   • A(day 0) vs B(day 0)  — same-day direct overlap
+        #   • A(day 0) vs B(day 1)  — A overlaps the next occurrence of B
+        # This avoids the false positives produced by also checking
+        #   A(day 1) vs B(day 0) and A(day 1) vs B(day 1), which would flag
+        #   non-overlapping windows like 08:00–10:00 and 14:00–16:00.
         overlap_indices: set = set()
         for i in range(len(intervals)):
             for j in range(i + 1, len(intervals)):
                 a_start, a_end = intervals[i][0], intervals[i][1]
                 b_start, b_end = intervals[j][0], intervals[j][1]
-                # Check current-day copies and one shifted by 1 day
-                for da in (0, 1):
-                    for db in (0, 1):
-                        as_ = a_start + _td(days=da)
-                        ae_ = a_end   + _td(days=da)
-                        bs_ = b_start + _td(days=db)
-                        be_ = b_end   + _td(days=db)
-                        if as_ < be_ and ae_ > bs_:
-                            overlap_indices.add(i)
-                            overlap_indices.add(j)
+                # Only check: A vs B same-day, and A vs B shifted +1 day
+                for db in (0, 1):
+                    bs_ = b_start + _td(days=db)
+                    be_ = b_end   + _td(days=db)
+                    if a_start < be_ and a_end > bs_:
+                        overlap_indices.add(i)
+                        overlap_indices.add(j)
 
         # ── Update each window's preview label ───────────────────────────────
         for idx, (prev_start, prev_end, next_start, next_end, wd) in enumerate(intervals):
@@ -4129,11 +4138,13 @@ class MainWindow(FluentWindow):
                     pass
                 btn.clicked.connect(lambda _, idx=row_idx: self._stop_single_phone(idx))
 
-            # Stagger worker starts by 5 s each so Appium bootstrap + account
-            # detection never all hit the ADB daemon at the same instant.
-            # worker_number is 0-based position in the workers list.
+            # Stagger worker starts by 12 s each so Appium bootstrap +
+            # UiAutomator2 server negotiation for phone N fully completes
+            # before phone N+1 begins.  5 s was not enough when 3+ phones
+            # start simultaneously — the ADB daemon queues up and sessions
+            # time-out, causing InvalidSessionIdException on startup.
             worker_number = len(self._workers) - 1
-            delay_ms = worker_number * 5000
+            delay_ms = worker_number * 12_000
             if delay_ms == 0:
                 worker.start()
             else:
