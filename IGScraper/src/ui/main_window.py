@@ -1713,11 +1713,33 @@ class WorkingHoursPage(PageWidget):
         # This avoids the false positives produced by also checking
         #   A(day 1) vs B(day 0) and A(day 1) vs B(day 1), which would flag
         #   non-overlapping windows like 08:00–10:00 and 14:00–16:00.
+        #
+        # IMPORTANT: use a fixed same-day anchor for ALL windows, not
+        # prev_start/prev_end.  prev_start shifts a window to *yesterday*
+        # when it hasn't occurred yet today, so comparing a future window
+        # (anchored yesterday) against a past window (anchored today) produces
+        # a false negative — the two intervals no longer look like they overlap
+        # even though they do every day.  By anchoring everything to today we
+        # get a time-of-day-independent result.
+        today_anchor = now.replace(hour=0, minute=0, second=0, microsecond=0)
         overlap_indices: set = set()
         for i in range(len(intervals)):
             for j in range(i + 1, len(intervals)):
-                a_start, a_end = intervals[i][0], intervals[i][1]
-                b_start, b_end = intervals[j][0], intervals[j][1]
+                # Re-derive start/end from the stored wd time-edits so we
+                # always use a consistent same-day base regardless of now.
+                def _fixed(wd_entry):
+                    ts = wd_entry[4]["te_start"].time()
+                    te = wd_entry[4]["te_end"].time()
+                    sh, sm = ts.hour(), ts.minute()
+                    eh, em = te.hour(), te.minute()
+                    s = today_anchor + _td(hours=sh, minutes=sm)
+                    if dtime(eh, em) > dtime(sh, sm):
+                        e = today_anchor + _td(hours=eh, minutes=em)
+                    else:
+                        e = today_anchor + _td(days=1, hours=eh, minutes=em)
+                    return s, e
+                a_start, a_end = _fixed(intervals[i])
+                b_start, b_end = _fixed(intervals[j])
                 # Only check: A vs B same-day, and A vs B shifted +1 day
                 for db in (0, 1):
                     bs_ = b_start + _td(days=db)
