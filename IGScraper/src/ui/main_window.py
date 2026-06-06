@@ -760,6 +760,15 @@ class PhoneWorker(QThread):
                     if self._controller and self._controller.driver:
                         self._controller.driver.press_keycode(3)   # Home (graceful)
                         ig_closed = True
+                    else:
+                        # Appium session not yet started (e.g. worker entered
+                        # _wait_for_schedule before start_session ran) — send
+                        # Home via raw ADB so Instagram doesn't stay open.
+                        subprocess.run(
+                            ["adb", "-s", self.serial, "shell", "input", "keyevent", "3"],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        ig_closed = True
                 except Exception:
                     pass
             self._sleep(60)
@@ -4160,13 +4169,14 @@ class MainWindow(FluentWindow):
                     pass
                 btn.clicked.connect(lambda _, idx=row_idx: self._stop_single_phone(idx))
 
-            # Stagger worker starts by 12 s each so Appium bootstrap +
+            # Stagger worker starts by 20 s each so Appium bootstrap +
             # UiAutomator2 server negotiation for phone N fully completes
-            # before phone N+1 begins.  5 s was not enough when 3+ phones
-            # start simultaneously — the ADB daemon queues up and sessions
-            # time-out, causing InvalidSessionIdException on startup.
+            # before phone N+1 begins.  12 s was not enough when 4+ phones
+            # start simultaneously — the ADB daemon queues up, systemPort
+            # binding races occur, and sessions time-out causing
+            # InvalidSessionIdException on startup.
             worker_number = len(self._workers) - 1
-            delay_ms = worker_number * 12_000
+            delay_ms = worker_number * 20_000
             if delay_ms == 0:
                 worker.start()
             else:

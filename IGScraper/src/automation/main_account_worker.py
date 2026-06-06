@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import random
 import re
+import subprocess
 import time
 import traceback
 from datetime import datetime, time as dtime, timedelta
@@ -384,6 +385,16 @@ class MainAccountWorker(QThread):
                     f"({max(0, int(secs_to_wait // 60))}m away)…"
                 )
                 self._status("waiting for window")
+                # Appium / driver not started yet — send Home via raw ADB
+                # so Instagram (opened by get_instagram_accounts during
+                # detection) doesn't stay in the foreground while waiting.
+                try:
+                    subprocess.run(
+                        ["adb", "-s", self.serial, "shell", "input", "keyevent", "3"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                except Exception:
+                    pass
                 while not self._stop_flag and not _in_schedule_window(_schedule):
                     time.sleep(min(60, max(1,
                         (_next_schedule_window(_schedule) - datetime.now()).total_seconds())))

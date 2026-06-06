@@ -1013,6 +1013,18 @@ class AppiumController:
         options.set_capability("appium:skipServerInstallation",    False)
         options.set_capability("appium:disableWindowAnimation",    False)
 
+        # ── Per-device port isolation (critical for 2+ phones) ──────────────
+        # UiAutomator2 binds a systemPort on the host for its instrumentation
+        # channel (default 8200) and a mjpegServerPort for screen streaming
+        # (default 7810).  Without explicit per-device ports every session
+        # tries to bind the same default, causing "address already in use"
+        # crashes that look like random disconnects.  Derive both from the
+        # Appium port offset so phone 0 (port 4723) → 8200/7810,
+        # phone 1 (4724) → 8201/7811, etc.
+        _port_offset = self.port - 4723
+        options.set_capability("appium:systemPort",      8200 + _port_offset)
+        options.set_capability("appium:mjpegServerPort", 7810 + _port_offset)
+
         url = f"http://{self.host}:{self.port}"
         self.driver = webdriver.Remote(url, options=options)
 
