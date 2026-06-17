@@ -121,6 +121,7 @@ class InstagramScraper:
         self._need_reopen_list = False   # set True after account switch to force re-navigation
         self._session_dead = False        # set True when device is lost mid-scrape (unrecoverable)
         self._list_exhausted = False      # set True only when the list is genuinely fully scraped
+        self._list_is_restricted = False  # set True when Instagram shows restricted-list banner
 
     def stop(self):
         self._stop_flag = True
@@ -830,6 +831,41 @@ class InstagramScraper:
                     self._hit_suggested_boundary = True  # tell run() the boundary was seen
                     # Do NOT return yet — fall through so real accounts above
                     # the suggested header are collected by the row loop.
+        except Exception:
+            pass
+
+        # ── Guard: detect restricted/private account wall ────────────────────
+        # Instagram shows two different row_text_textview elements for restricted lists:
+        #
+        #   1. "Only <username> can see all followers."
+        #      → Appears at the TOP of the list as a permanent info banner.
+        #      → Does NOT mean the end — Instagram still shows mutual/preview
+        #        accounts below it. We must keep scrolling and collecting.
+        #      → IGNORE this one entirely.
+        #
+        #   2. "And N others" (e.g. "And 948K others")
+        #      → Appears at the BOTTOM after the last visible account row.
+        #      → This IS the hard wall — no more accounts can be loaded.
+        #      → Treat exactly like "Suggested for you": collect whatever real
+        #        accounts are still on screen above it, then stop.
+        #
+        # We distinguish them by checking if the text starts with "And " (case-
+        # insensitive) — that pattern is unique to the bottom wall element.
+        try:
+            wall_elements = driver.find_elements(
+                AppiumBy.ID, "com.instagram.android:id/row_text_textview"
+            )
+            for _wel in wall_elements:
+                _wtxt = (_wel.text or "").strip()
+                if _wtxt.lower().startswith("and ") and "others" in _wtxt.lower():
+                    self._hit_suggested_boundary = True  # reuse flag — same stop behaviour
+                    self._log("🏁 Reached the end of the list (restricted account wall).")
+                    break
+                # "Only X can see all followers." — info banner.
+                # Keep scrolling (don't stop), but mark the list as restricted
+                # so run() knows profile taps are disabled for this target.
+                elif _wtxt.lower().startswith("only ") and "can see all" in _wtxt.lower():
+                    self._list_is_restricted = True
         except Exception:
             pass
 
@@ -2147,6 +2183,7 @@ class InstagramScraper:
         self._session_dead = False
         self._list_exhausted = False
         self._hit_suggested_boundary = False  # set by _extract_visible_accounts when boundary seen
+        self._list_is_restricted = False      # set when Instagram's restricted-list banner is detected
         collected = 0
         seen_usernames = set()
         serial = self.ctrl._device_serial or ""
@@ -2694,6 +2731,16 @@ class InstagramScraper:
             # In keyword-pool mode there is no scrolling — we drain the pool.
             if batch_new == 0:
                 _consec_all_skipped += 1
+                # Hard ceiling: if we've seen N consecutive batches where
+                # every account was already known (seen/blacklisted) and the
+                # screen still isn't empty, we've hit the real end of what's
+                # available — e.g. a restricted list with only a handful of
+                # preview accounts. Stop cleanly instead of looping forever.
+                _ALL_SKIPPED_LIMIT = 10
+                if _consec_all_skipped >= _ALL_SKIPPED_LIMIT:
+                    self._log("🏁 Reached the end of the list (no new accounts after repeated scrolls).")
+                    self._list_exhausted = True
+                    break
             else:
                 _consec_all_skipped = 0
 
