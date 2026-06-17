@@ -120,6 +120,7 @@ class InstagramScraper:
         self._hours_interrupted = False   # set True by PhoneWorker when schedule end fires
         self._need_reopen_list = False   # set True after account switch to force re-navigation
         self._session_dead = False        # set True when device is lost mid-scrape (unrecoverable)
+        self._list_exhausted = False      # set True only when the list is genuinely fully scraped
 
     def stop(self):
         self._stop_flag = True
@@ -178,25 +179,41 @@ class InstagramScraper:
             pass
         self.ctrl.driver = None
 
-        # Give the device a moment to release the accessibility lock
-        time.sleep(3.0)
+        # Retry up to 3 times with increasing delays.
+        # A single failed attempt is often a transient ADB/UiAutomator2 blip
+        # (OS killed the instrumentation process momentarily) — waiting longer
+        # before the next attempt gives Android time to release the lock.
+        _delays = [3.0, 8.0, 15.0]
+        for attempt, wait in enumerate(_delays, start=1):
+            self._log(f"🔁 Session restart attempt {attempt}/3 (waiting {int(wait)}s)...")
+            time.sleep(wait)
+            try:
+                success = self.ctrl.start_session(serial)
+                if success:
+                    self._log(f"✅ Appium session restarted successfully (attempt {attempt}).")
+                    return True
+                else:
+                    self._log(f"⚠️ Session restart attempt {attempt} returned False.")
+            except Exception as e:
+                self._log(f"⚠️ Session restart attempt {attempt} failed: {e}")
 
-        try:
-            success = self.ctrl.start_session(serial)
-            if success:
-                self._log("✅ Appium session restarted successfully.")
-            else:
-                self._log("❌ Appium session restart returned False.")
-            return success
-        except Exception as e:
-            self._log(f"❌ Appium session restart failed: {e}")
-            return False
+        self._log("❌ All 3 session restart attempts failed — giving up.")
+        return False
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def navigate_to_profile(self, username: str) -> bool:
         """Navigate to a profile via the Search tab (safe, human-like).
         Falls back to ADB deep link only if search fails entirely."""
+        # Guard: if the session died between the caller's last action and now,
+        # restart it before attempting any driver calls — otherwise the first
+        # find_element raises InvalidSessionIdException uncaught.
+        if not self._is_session_alive():
+            self._log("⚠️ Session dead before navigate_to_profile — attempting restart...")
+            if not self._restart_appium_session():
+                self._log("❌ Could not revive session in navigate_to_profile.")
+                return False
+
         driver = self.ctrl.driver
         self._log(f"Looking up @{username}...")
 
@@ -787,15 +804,21 @@ class InstagramScraper:
 
         # ── Guard: detect if "Suggested for you" is visible on screen ────────
         # When the real followers list ends, IG injects a "Suggested for you"
-        # section. If that header is already on screen, the follower list is
-        # exhausted — signal end-of-list by returning an empty list so the
-        # caller's consecutive_empty counter triggers a clean stop.
+        # section. We must NOT return [] immediately here, because real follower
+        # rows can still be visible ABOVE the suggested header on the same screen.
+        # Instead we only bail out (return []) when there are zero IG_USER_ROW
+        # elements on screen — meaning the visible area is fully taken over by
+        # the suggested section and there is nothing left to collect.
+        # The row-by-row loop below already handles the mixed case correctly: it
+        # collects accounts until it hits a suggested row, then returns whatever
+        # it gathered so far — so accounts above the marker are never lost.
         SUGGESTED_MARKERS = (
             "Suggested for you",
             "Suggested For You",
             "suggested for you",
             "People you might know",
         )
+        _suggested_visible = False
         try:
             all_tvs_check = driver.find_elements(AppiumBy.CLASS_NAME, "android.widget.TextView")
             for tv in all_tvs_check:
@@ -803,10 +826,24 @@ class InstagramScraper:
                 if txt_check in NO_RESULT_TEXTS:
                     return []   # no keyword matches — stop immediately
                 if txt_check in SUGGESTED_MARKERS:
-                    self._log("🏁 Reached the end of the list.")
-                    return []   # empty → consecutive_empty counter → clean stop
+                    _suggested_visible = True
+                    self._hit_suggested_boundary = True  # tell run() the boundary was seen
+                    # Do NOT return yet — fall through so real accounts above
+                    # the suggested header are collected by the row loop.
         except Exception:
             pass
+
+        # Only bail out here when there are no user rows at all — i.e. the
+        # entire visible area is the suggested section, nothing left to scrape.
+        if _suggested_visible:
+            try:
+                _rows_check = driver.find_elements(AppiumBy.ID, IG_USER_ROW)
+                if not _rows_check:
+                    self._log("🏁 Reached the end of the list.")
+                    return []   # empty → consecutive_empty counter → clean stop
+            except Exception:
+                self._log("🏁 Reached the end of the list.")
+                return []
 
         # ── Fallback TextView excluded terms (used below) ─────────────────────
         # Any text that must never be treated as a username, including all
@@ -830,7 +867,7 @@ class InstagramScraper:
                         row_texts = [el.text for el in row.find_elements(
                             AppiumBy.CLASS_NAME, "android.widget.TextView")]
                         if any("suggested" in (t or "").lower() for t in row_texts):
-                            
+                            self._hit_suggested_boundary = True  # tell run() the boundary was seen
                             return accounts   # return what we have so far, stop here
                     except Exception:
                         pass
@@ -2108,6 +2145,8 @@ class InstagramScraper:
         self._hours_interrupted = False
         self._need_reopen_list = False
         self._session_dead = False
+        self._list_exhausted = False
+        self._hit_suggested_boundary = False  # set by _extract_visible_accounts when boundary seen
         collected = 0
         seen_usernames = set()
         serial = self.ctrl._device_serial or ""
@@ -2123,13 +2162,15 @@ class InstagramScraper:
         _FAST_SCROLL_DELAY     = 0.3    # seconds between scrolls in fast mode
         _consec_all_skipped    = 0      # counter reset whenever a new account is processed
 
-        # ── Already on the list? ────────────────────────────────────────────
-        # If the app is already sitting on the correct list (e.g. launched
-        # with it open), skip navigation entirely — open_list() will confirm.
-        if not self._verify_on_list():
-            if not self.navigate_to_profile(target_username):
-                self._log(f"❌ Could not open @{target_username}'s profile")
-                return 0
+        # ── Navigate to the target profile ──────────────────────────────────
+        # Always navigate to the target profile by username — we must never
+        # rely on _verify_on_list() alone here, because when switching targets
+        # the app may still be showing the PREVIOUS target's followers list,
+        # causing _verify_on_list() to return True and skip navigation entirely,
+        # which would then scrape the wrong (already-exhausted) list.
+        if not self.navigate_to_profile(target_username):
+            self._log(f"❌ Could not open @{target_username}'s profile")
+            return 0
 
         if not self.open_list(mode):
             self._log(f"❌ Could not open {mode} list for @{target_username}")
@@ -2416,6 +2457,7 @@ class InstagramScraper:
                     pass
 
             self._log(f"✅ @{target_username} done — {collected} this run, {collected} total")
+            self._list_exhausted = True   # keyword pool fully processed
             return collected
         else:
             keyword_blacklist = None
@@ -2512,6 +2554,7 @@ class InstagramScraper:
                         "suggested for you", "People you might know"
                     ) for tv in driver_tvs):
                         self._log("🏁 Reached the end of the list.")
+                        self._list_exhausted = True
                         break
                 except Exception:
                     pass
@@ -2519,6 +2562,7 @@ class InstagramScraper:
                 consecutive_empty += 1
                 if consecutive_empty >= 5:
                     self._log("⚠️ No more accounts found — reached end of list")
+                    self._list_exhausted = True
                     break
                 self.scroll_list()
                 time.sleep(_rand(scroll_delay_min, scroll_delay_max))
@@ -2653,6 +2697,14 @@ class InstagramScraper:
             else:
                 _consec_all_skipped = 0
 
+            # If _extract_visible_accounts() signalled the suggested boundary
+            # was already on screen this iteration, stop now — do NOT scroll
+            # further into the suggested section.
+            if self._hit_suggested_boundary:
+                self._log("🏁 Reached the end of the list.")
+                self._list_exhausted = True
+                break
+
             if not self._need_reopen_list and not mid_batch_recovered:
                 self.scroll_list()
                 if _consec_all_skipped >= _FAST_SCROLL_THRESHOLD:
@@ -2661,5 +2713,9 @@ class InstagramScraper:
                     time.sleep(_rand(scroll_delay_min, scroll_delay_max))
             mid_batch_recovered = False
 
+        # If the while loop exited because max_count was reached (not a stop/error),
+        # that also counts as a genuine completion — the target was fully worked.
+        if not self._stop_flag and not self._session_dead and collected >= max_count:
+            self._list_exhausted = True
         self._log(f"🏁 All done! Collected {collected} account(s).")
         return collected

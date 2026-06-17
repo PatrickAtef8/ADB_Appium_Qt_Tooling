@@ -643,11 +643,14 @@ class PhoneWorker(QThread):
                     # Don't advance target_idx — loop back to wait
                 else:
                     self._log(f"✅ @{target} done — {count} this run, {total_collected} total")
-                    # Only remove the target from the UI when it genuinely
-                    # completed.  If the user pressed Stop mid-target,
-                    # _stop_flag is True — skip the signal so the target stays
-                    # in the list for the next run.
-                    if not self._stop_flag:
+                    # Only remove the target from the UI when the scraper
+                    # genuinely exhausted the list (end-of-list signal, max
+                    # count reached, or keyword pool done). If the user pressed
+                    # Stop, or the session died, or the list open failed (count==0
+                    # with no exhaustion), keep the target in the UI so it can
+                    # be retried on the next run.
+                    list_exhausted = getattr(self._scraper, "_list_exhausted", False)
+                    if not self._stop_flag and list_exhausted:
                         self.signals.target_done.emit(self.phone_index, target)   # notify UI
                     target_idx += 1   # advance index regardless so we don't re-run on restart
 

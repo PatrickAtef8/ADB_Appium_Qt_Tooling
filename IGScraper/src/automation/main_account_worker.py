@@ -545,6 +545,11 @@ class MainAccountWorker(QThread):
                     # No switching — wait until midnight then resume
                     self._log("Waiting until midnight to resume…")
                     self._status("daily limit reached")
+                    # Background Instagram while waiting — no need to keep it open
+                    try:
+                        driver.press_keycode(3)   # Home (graceful)
+                    except Exception:
+                        pass
                     while not self._stop_flag and not self._window_ended:
                         now = datetime.now()
                         midnight = (now + timedelta(days=1)).replace(
@@ -1331,17 +1336,22 @@ class MainAccountWorker(QThread):
         Returns True if reconnection succeeded.
         """
         self._log("🔄 Appium connection lost — attempting reconnect…")
-        try:
-            from src.automation.appium_manager import AppiumManager
-            mgr = AppiumManager()
-            mgr._ensure_server(self.appium_port, log_callback=self._log)
-            self._sleep(3)
-            self._controller.start_session(self.serial)
-            self._log("✅ Appium reconnected.")
-            return True
-        except Exception as e:
-            self._log(f"❌ Reconnect failed: {e}")
-            return False
+        _delays = [3.0, 8.0, 15.0]
+        for attempt, wait in enumerate(_delays, start=1):
+            self._log(f"🔄 Reconnect attempt {attempt}/3 (waiting {int(wait)}s)...")
+            try:
+                from src.automation.appium_manager import AppiumManager
+                mgr = AppiumManager()
+                mgr._ensure_server(self.appium_port, log_callback=self._log)
+                self._sleep(wait)
+                self._controller.start_session(self.serial)
+                self._log(f"✅ Appium reconnected (attempt {attempt}).")
+                return True
+            except Exception as e:
+                self._log(f"⚠️ Reconnect attempt {attempt} failed: {e}")
+
+        self._log("❌ All 3 reconnect attempts failed — giving up.")
+        return False
 
     def _recover_to_home(self, driver):
         """Press Back up to 5 times until home feed is confirmed."""

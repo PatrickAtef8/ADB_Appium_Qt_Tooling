@@ -19,8 +19,8 @@
     "between_profiles_max": 4.0,
     "between_scrolls_min": 1.0,
     "between_scrolls_max": 3.0,
-    "rest_min_seconds": 1800,
-    "rest_max_seconds": 3600,
+    "rest_min_seconds": 10,
+    "rest_max_seconds": 20,
     "session_break_every": 100,
     "switch_mode": "hours",
     "switch_hours": 1
@@ -181,7 +181,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768734"
+      "saved_at": "2026-06-17T16:49:48.365198"
     },
     {
       "enabled": false,
@@ -193,7 +193,7 @@
           "end_minute": 30
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768767"
+      "saved_at": "2026-06-17T16:49:48.365261"
     },
     {
       "enabled": false,
@@ -205,7 +205,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768779"
+      "saved_at": "2026-06-17T16:49:48.365297"
     },
     {
       "enabled": false,
@@ -217,7 +217,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768790"
+      "saved_at": "2026-06-17T16:49:48.365323"
     },
     {
       "enabled": false,
@@ -229,7 +229,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768800"
+      "saved_at": "2026-06-17T16:49:48.365345"
     },
     {
       "enabled": false,
@@ -241,7 +241,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768811"
+      "saved_at": "2026-06-17T16:49:48.365368"
     },
     {
       "enabled": false,
@@ -253,7 +253,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768822"
+      "saved_at": "2026-06-17T16:49:48.365391"
     },
     {
       "enabled": false,
@@ -265,7 +265,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768833"
+      "saved_at": "2026-06-17T16:49:48.365413"
     },
     {
       "enabled": false,
@@ -277,7 +277,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768845"
+      "saved_at": "2026-06-17T16:49:48.365434"
     },
     {
       "enabled": false,
@@ -289,7 +289,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-07T00:14:23.768856"
+      "saved_at": "2026-06-17T16:49:48.365456"
     }
   ]
 }
