@@ -121,7 +121,6 @@ class InstagramScraper:
         self._need_reopen_list = False   # set True after account switch to force re-navigation
         self._session_dead = False        # set True when device is lost mid-scrape (unrecoverable)
         self._list_exhausted = False      # set True only when the list is genuinely fully scraped
-        self._list_is_restricted = False  # set True when Instagram shows restricted-list banner
 
     def stop(self):
         self._stop_flag = True
@@ -217,6 +216,19 @@ class InstagramScraper:
 
         driver = self.ctrl.driver
         self._log(f"Looking up @{username}...")
+
+        # ── Ensure Instagram is in the foreground ─────────────────────────
+        # If the emulator is on the home screen or another app, the search
+        # tab click will hit a random element (e.g. Google search bar).
+        # Launch Instagram explicitly if it's not the current app.
+        try:
+            current_pkg = driver.current_package
+            if current_pkg != "com.instagram.android":
+                self._log("📱 Instagram not in foreground — launching...")
+                driver.activate_app("com.instagram.android")
+                time.sleep(3)
+        except Exception:
+            pass
 
         # Strategy 1: Search tab (primary — avoids detectable deep-link jumps)
         self._log("Opening search...")
@@ -861,11 +873,7 @@ class InstagramScraper:
                     self._hit_suggested_boundary = True  # reuse flag — same stop behaviour
                     self._log("🏁 Reached the end of the list (restricted account wall).")
                     break
-                # "Only X can see all followers." — info banner.
-                # Keep scrolling (don't stop), but mark the list as restricted
-                # so run() knows profile taps are disabled for this target.
-                elif _wtxt.lower().startswith("only ") and "can see all" in _wtxt.lower():
-                    self._list_is_restricted = True
+                # "Only X can see all followers." — info banner only, keep scrolling.
         except Exception:
             pass
 
@@ -999,7 +1007,12 @@ class InstagramScraper:
                 "com.instagram.android:id/follow_list_username",
                 "com.instagram.android:id/row_user_primary_text",
             ]
+            # Use cached screen dimensions — avoids stressing the Appium session
+            _screen_h = getattr(self, "_cached_screen_h", 1920)
+            _NAV_BAR_TOP = int(_screen_h * 0.88)  # bottom 12% = nav bar zone
+
             tapped = False
+            _nav_scroll_done = False  # only scroll once to avoid thrashing
             for row_id in FOLLOW_ROW_IDS:
                 if tapped:
                     break
@@ -1009,16 +1022,67 @@ class InstagramScraper:
                         for uid in USERNAME_IDS:
                             try:
                                 u_el = row.find_element(AppiumBy.ID, uid)
-                                if u_el.text.strip().lower() == username.lower():
-                                    u_el.click()
-                                    tapped = True
-                                    break
+                                if u_el.text.strip().lower() != username.lower():
+                                    continue
+                                # Safety check: if the element sits in the bottom
+                                # nav bar zone, its tap would hit the + button.
+                                # Scroll up slightly ONCE, then restart the entire
+                                # element search so we use fresh coordinates —
+                                # never tap a pre-found element after any delay.
+                                try:
+                                    el_y = u_el.location["y"]
+                                    if el_y >= _NAV_BAR_TOP and not _nav_scroll_done:
+                                        serial = self.ctrl._device_serial or ""
+                                        _run_hidden([
+                                            "adb", "-s", serial, "shell", "input",
+                                            "swipe",
+                                            str(_screen_h // 2), str(int(_screen_h * 0.55)),
+                                            str(_screen_h // 2), str(int(_screen_h * 0.75)),
+                                            "400"
+                                        ], capture_output=True)
+                                        time.sleep(0.8)
+                                        _nav_scroll_done = True
+                                        # Break out and restart the search with fresh elements
+                                        raise StopIteration
+                                except StopIteration:
+                                    raise  # propagate to restart search
+                                except Exception:
+                                    pass
+                                u_el.click()
+                                tapped = True
+                                break
+                            except StopIteration:
+                                raise  # propagate
                             except Exception:
                                 continue
                         if tapped:
                             break
+                except StopIteration:
+                    break  # exit loop to restart search from top
                 except Exception:
                     continue
+
+            # If we scrolled to escape the nav bar, restart the search once with fresh elements
+            if _nav_scroll_done and not tapped:
+                for row_id in FOLLOW_ROW_IDS:
+                    if tapped:
+                        break
+                    try:
+                        rows = driver.find_elements(AppiumBy.ID, row_id)
+                        for row in rows:
+                            for uid in USERNAME_IDS:
+                                try:
+                                    u_el = row.find_element(AppiumBy.ID, uid)
+                                    if u_el.text.strip().lower() == username.lower():
+                                        u_el.click()
+                                        tapped = True
+                                        break
+                                except Exception:
+                                    continue
+                            if tapped:
+                                break
+                    except Exception:
+                        continue
 
             # Fallback: find the TextView with exactly this text, but only
             # if it is NOT inside a story/reel/highlight element.
@@ -1046,8 +1110,51 @@ class InstagramScraper:
             if not tapped:
                 return details   # could not find username row — stay on list
 
+            # ── Verify we landed on a profile, not a story viewer ────────
+            # When an account has a story ring, the tap can accidentally
+            # land on the ring and open the story viewer instead of the
+            # profile. Detect this immediately and press Back to escape
+            # cleanly — this prevents the mid-batch drift guard from
+            # firing and avoids the expensive recovery flow.
+            time.sleep(2)
+            STORY_VIEWER_IDS = (
+                "com.instagram.android:id/reel_viewer_root",
+                "com.instagram.android:id/story_progress_container",
+                "com.instagram.android:id/reel_viewer_progress_container",
+            )
+            for _sv_id in STORY_VIEWER_IDS:
+                try:
+                    driver.find_element(AppiumBy.ID, _sv_id)
+                    # We're in the story viewer — escape immediately
+                    self._log(f"🔙 Tap landed on story viewer for @{username} — escaping...")
+                    driver.back()
+                    time.sleep(1.5)
+                    return details   # _navigated_in stays False → no back-press in run()
+                except Exception:
+                    pass
+
             details["_navigated_in"] = True
-            time.sleep(3)
+            time.sleep(1)  # already waited 2s above
+
+            # ── Verify we landed on the RIGHT profile ───────────────────
+            # The list can shift position between find_elements() and
+            # click(), causing the tap to land on a different account.
+            # Check the profile header username to confirm we're on the
+            # right account. If not, press Back and return without setting
+            # _navigated_in so run() won't press Back again.
+            try:
+                # Single fast check — action_bar_title is always the username on profile pages
+                _landed_username = driver.find_element(
+                    AppiumBy.ID, "com.instagram.android:id/action_bar_title"
+                ).text.strip().lower().lstrip("@")
+                if _landed_username and _landed_username != username.lower().lstrip("@"):
+                    self._log(f"⚠️ Tap landed on @{_landed_username} instead of @{username} (list shifted mid-click) — going back.")
+                    driver.back()
+                    time.sleep(1.5)
+                    details["_navigated_in"] = False  # don't press Back again in run()
+                    return details
+            except Exception:
+                pass
 
             try:
                 driver.find_element(AppiumBy.ID, "com.instagram.android:id/reel_ring")
@@ -1066,16 +1173,32 @@ class InstagramScraper:
             try:
                 bio_el  = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_bio_text")
                 bio_raw = bio_el.text.strip()
-                # If bio is truncated Instagram appends "… more" or "... more".
-                # Clicking the bio element expands it to the full text.
+                # If bio is truncated (ends with "… more"), expand it by tapping
+                # the bottom-right corner of the bio element — that's where
+                # Instagram always renders the "more" word. Tapping there avoids
+                # links and @mentions which appear earlier in the text (top-left).
+                # There is no separate 'more' button element — it's all one TextView.
                 if bio_raw.endswith("more") and ("…" in bio_raw or "..." in bio_raw):
                     try:
-                        bio_el.click()
-                        time.sleep(1)
-                        bio_el  = driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_bio_text")
+                        _loc  = bio_el.location
+                        _size = bio_el.size
+                        # Tap at 95% x, 90% y — bottom-right where 'more' is
+                        _tap_x = int(_loc["x"] + _size["width"]  * 0.95)
+                        _tap_y = int(_loc["y"] + _size["height"] * 0.90)
+                        _serial = self.ctrl._device_serial or ""
+                        _run_hidden([
+                            "adb", "-s", _serial, "shell", "input",
+                            "tap", str(_tap_x), str(_tap_y)
+                        ], capture_output=True)
+                        time.sleep(0.8)
+                        bio_el  = driver.find_element(
+                            AppiumBy.ID,
+                            "com.instagram.android:id/profile_header_bio_text"
+                        )
                         bio_raw = bio_el.text.strip()
                     except Exception:
-                        pass
+                        # If tap fails, keep truncated text — safe fallback
+                        bio_raw = bio_raw.rsplit("…", 1)[0].rsplit("...", 1)[0].strip()
                 details["bio"] = bio_raw
             except: pass
 
@@ -1535,13 +1658,37 @@ class InstagramScraper:
                                 post_el.click()
                             except:
                                 # Final fallback: Coordinate-based click if element click fails
-                                
                                 loc = post_el.location
                                 size = post_el.size
                                 cx, cy = loc['x'] + size['width'] // 2, loc['y'] + size['height'] // 2
                                 _run_hidden(["adb", "-s", self.ctrl._device_serial or "", "shell", "input", "tap", str(cx), str(cy)])
                             
-                            time.sleep(3.0)
+                            time.sleep(2.5)
+
+                            # ── Verify we landed on a post, not a profile ────────────
+                            # The fallback selector can accidentally pick a suggested
+                            # account thumbnail instead of a grid post. If that happens,
+                            # tapping it navigates to that account's profile, which adds
+                            # an extra entry to the back stack and causes drift.
+                            # Detect this by checking for profile-page elements that
+                            # should NOT exist on a post viewer.
+                            _landed_on_profile = False
+                            try:
+                                driver.find_element(AppiumBy.ID, "com.instagram.android:id/profile_header_avatar_container")
+                                _landed_on_profile = True
+                            except Exception:
+                                pass
+                            if _landed_on_profile:
+                                self._log(f"⚠️ Post tap landed on a profile page — escaping back to @{username}")
+                                driver.back()
+                                time.sleep(1.5)
+                                # Skip post date check for this account — treat as unknown
+                                details["has_recent_post"] = True
+                                details["latest_post_date_text"] = ""
+                                post_el = None  # skip the date-reading block below
+
+                            if post_el:
+                                time.sleep(0.5)
 
                             # ── Guard: detect accidental highlight / story viewer ──────────
                             # If we tapped a highlight bubble instead of a grid post, the UI
@@ -2183,7 +2330,6 @@ class InstagramScraper:
         self._session_dead = False
         self._list_exhausted = False
         self._hit_suggested_boundary = False  # set by _extract_visible_accounts when boundary seen
-        self._list_is_restricted = False      # set when Instagram's restricted-list banner is detected
         collected = 0
         seen_usernames = set()
         serial = self.ctrl._device_serial or ""
@@ -2198,6 +2344,16 @@ class InstagramScraper:
         _FAST_SCROLL_THRESHOLD = 3      # batches in a row before speeding up
         _FAST_SCROLL_DELAY     = 0.3    # seconds between scrolls in fast mode
         _consec_all_skipped    = 0      # counter reset whenever a new account is processed
+
+        # Cache screen dimensions once per run — avoids repeated get_window_size()
+        # calls inside open_profile_details() which stress the Appium session.
+        try:
+            _wsize = self.ctrl.driver.get_window_size()
+            self._cached_screen_w = _wsize["width"]
+            self._cached_screen_h = _wsize["height"]
+        except Exception:
+            self._cached_screen_w = 1080
+            self._cached_screen_h = 1920
 
         # ── Navigate to the target profile ──────────────────────────────────
         # Always navigate to the target profile by username — we must never
@@ -2597,10 +2753,16 @@ class InstagramScraper:
                     pass
 
                 consecutive_empty += 1
-                if consecutive_empty >= 5:
-                    self._log("⚠️ No more accounts found — reached end of list")
-                    self._list_exhausted = True
-                    break
+                # After many consecutive empty screens, stop the current run
+                # but do NOT mark _list_exhausted — empty screens can mean a
+                # slow network or a temporary Instagram glitch, NOT end of list.
+                # The ONLY valid end-of-list signals are 'Suggested for you'
+                # and 'And N others'. This is just a safety net to avoid an
+                # infinite loop — the target will be retried on next run.
+                if consecutive_empty >= 20:
+                    self._log("⚠️ Too many empty screens — pausing and will retry next run.")
+                    break  # _list_exhausted stays False → target not removed from UI
+                time.sleep(3.0)  # give Instagram time to load before retrying
                 self.scroll_list()
                 time.sleep(_rand(scroll_delay_min, scroll_delay_max))
                 continue
@@ -2673,6 +2835,17 @@ class InstagramScraper:
                     # batch. If we drifted (story viewer, Reels, accidental tap)
                     # recover now instead of silently skipping the remaining
                     # accounts in the batch.
+                    #
+                    # Give Instagram extra time to finish the back-animation and
+                    # re-render the list rows before checking. Without this, the
+                    # check fires during the transition and finds no rows, which
+                    # causes a false drift detection and unnecessary recovery.
+                    _list_check_attempts = 3
+                    for _lca in range(_list_check_attempts):
+                        if self._verify_on_list():
+                            break
+                        if _lca < _list_check_attempts - 1:
+                            time.sleep(1.5)  # wait for back-animation to complete
                     if not self._verify_on_list():
                         self._log("🔍 Mid-batch drift — recovering before continuing...")
                         if self._recover_to_list(target_username, mode):
@@ -2731,16 +2904,6 @@ class InstagramScraper:
             # In keyword-pool mode there is no scrolling — we drain the pool.
             if batch_new == 0:
                 _consec_all_skipped += 1
-                # Hard ceiling: if we've seen N consecutive batches where
-                # every account was already known (seen/blacklisted) and the
-                # screen still isn't empty, we've hit the real end of what's
-                # available — e.g. a restricted list with only a handful of
-                # preview accounts. Stop cleanly instead of looping forever.
-                _ALL_SKIPPED_LIMIT = 10
-                if _consec_all_skipped >= _ALL_SKIPPED_LIMIT:
-                    self._log("🏁 Reached the end of the list (no new accounts after repeated scrolls).")
-                    self._list_exhausted = True
-                    break
             else:
                 _consec_all_skipped = 0
 
