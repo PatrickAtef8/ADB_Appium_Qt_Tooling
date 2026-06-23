@@ -2702,7 +2702,16 @@ class InstagramScraper:
                     self._log("❌ Account switch failed — stopping")
                     self._session_dead = True
                     break
-                if not self.open_list(mode):
+                # Retry open_list up to 3 times — after an account switch
+                # the list can be slow to load (especially large accounts).
+                _switch_list_opened = False
+                for _switch_attempt in range(3):
+                    if self.open_list(mode):
+                        _switch_list_opened = True
+                        break
+                    self._log(f"⏳ List slow to load after switch — retrying ({_switch_attempt + 1}/3)...")
+                    time.sleep(5)
+                if not _switch_list_opened:
                     self._log("❌ Could not reopen list after account switch — stopping")
                     self._session_dead = True
                     break
