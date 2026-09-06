@@ -1,14 +1,12 @@
-# Instagram Scraper Pro
+# Instagram Scraper
 
-A Windows desktop application that collects publicly visible Instagram profile data
-(username, email, phone, country, posts, etc.) from followers/following lists
-and exports to Google Sheets + optional webhook.
+A desktop app that automates Instagram profile scraping using Appium + ADB across up to 10 USB-connected Android phones. Rotates accounts per device, runs on schedules with human-like delays, and extracts profile data (email, phone, country, bio, followers). Exports to Google Sheets, webhooks, or CSV. Includes smart filters, blacklist management, scrcpy device viewer, and GitHub Actions CI/CD for auto-building Windows executables. Also features automated main-account engagement for posts, reels, and stories.
 
 ---
 
 ## Features
 
-- **Multi-phone support** — up to 3 Android phones via USB
+- **Multi-phone support** — up to 10 Android phones via USB
 - **Account switching** — automatically rotates Instagram accounts on each phone
 - **Working hours scheduler** — only runs between configurable hours (e.g. 09:00–19:00)
 - **Randomized intervals** — every delay has MIN/MAX bounds for human-like behavior

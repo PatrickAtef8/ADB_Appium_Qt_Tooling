@@ -1,5 +1,5 @@
 {
-  "sheet_id": "",
+  "sheet_id": "1iUlc41DA_hfbhwBNjPzW5pKgCGyfYwDzEPRRYI9iJCQ",
   "sheet_tab": "Sheet1",
   "credentials_path": "assets/credentials.json",
   "webhook_url": "",
@@ -39,7 +39,7 @@
   },
   "devices": [
     {
-      "serial": null
+      "serial": "emulator-5554"
     },
     {
       "serial": null
@@ -76,7 +76,9 @@
   "last_count": 9999,
   "last_device": "",
   "targets_per_phone": [
-    [],
+    [
+      "12petalosonline"
+    ],
     [],
     [],
     [],
@@ -87,7 +89,7 @@
     [],
     []
   ],
-  "sheets_enabled": false,
+  "sheets_enabled": true,
   "mirror_width": 640,
   "ip_rotation": {
     "enabled": false,
@@ -159,7 +161,7 @@
     }
   },
   "phone_nicknames": [
-    "",
+    "p2phone",
     "",
     "",
     "",
@@ -181,7 +183,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643022"
+      "saved_at": "2026-09-06T17:59:55.628922"
     },
     {
       "enabled": false,
@@ -193,7 +195,7 @@
           "end_minute": 30
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643048"
+      "saved_at": "2026-09-06T17:59:55.628961"
     },
     {
       "enabled": false,
@@ -205,7 +207,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643063"
+      "saved_at": "2026-09-06T17:59:55.628978"
     },
     {
       "enabled": false,
@@ -217,7 +219,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643070"
+      "saved_at": "2026-09-06T17:59:55.628992"
     },
     {
       "enabled": false,
@@ -229,7 +231,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643077"
+      "saved_at": "2026-09-06T17:59:55.629007"
     },
     {
       "enabled": false,
@@ -241,7 +243,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643084"
+      "saved_at": "2026-09-06T17:59:55.629022"
     },
     {
       "enabled": false,
@@ -253,7 +255,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643091"
+      "saved_at": "2026-09-06T17:59:55.629037"
     },
     {
       "enabled": false,
@@ -265,7 +267,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643099"
+      "saved_at": "2026-09-06T17:59:55.629051"
     },
     {
       "enabled": false,
@@ -277,7 +279,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643106"
+      "saved_at": "2026-09-06T17:59:55.629065"
     },
     {
       "enabled": false,
@@ -289,7 +291,7 @@
           "end_minute": 0
         }
       ],
-      "saved_at": "2026-06-23T07:06:15.643113"
+      "saved_at": "2026-09-06T17:59:55.629080"
     }
   ]
 }

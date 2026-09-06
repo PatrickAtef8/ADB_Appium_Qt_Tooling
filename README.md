@@ -1,9 +1,6 @@
 # IGScraper
 
-A desktop application for collecting publicly visible Instagram profile data
-from followers and following lists, with multi-device Android automation, a live
-screen mirror, and export to Google Sheets, webhook, and CSV.
-
+A desktop app that automates Instagram profile scraping using Appium + ADB across up to 10 USB-connected Android phones. Rotates accounts per device, runs on schedules with human-like delays, and extracts profile data (email, phone, country, bio, followers). Exports to Google Sheets, webhooks, or CSV. Includes smart filters, blacklist management, scrcpy device viewer, and GitHub Actions CI/CD for auto-building Windows executables. Also features automated main-account engagement for posts, reels, and stories.
 ---
 
 ## Screenshots
